@@ -1,0 +1,72 @@
+name: Sports Data Pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "11 */2 * * *"
+
+env:
+  PYTHON_VERSION: "3.11"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Source Diagnostics
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python source_diagnostics.py
+
+      - name: Run ETL Pipeline
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # FIX: исправлена опечатка COMPLETENCE -> COMPLETENESS (был mismatch с search_module.py)
+          SEARCH_MIN_COMPLETENESS: "0.25"
+          # FIX: добавлен порог value bet (теперь используется в search_module.py после фикса)
+          VALUE_BET_THRESHOLD: "0.03"
+          # FIX: убран "unknown" — фильтр источников снова работает
+          GATEKEEPER_VERIFIED_SOURCES: "SharpAPI,api_football,opta,betfair,bzzoiro,odds_api,oddsapi"
+        run: |
+          python main.py
+          
