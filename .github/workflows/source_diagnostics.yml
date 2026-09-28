@@ -1,0 +1,65 @@
+name: Source Diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим диагностики"
+        required: false
+        type: choice
+        options:
+          - full
+          - sources
+          - redis
+          - matches
+          - errors
+        default: full
+
+env:
+  PYTHON_VERSION: "3.11"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
+jobs:
+  run-diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Diagnostics
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          MODE="${{ inputs.mode }}"
+          if [ "$MODE" = "full" ] || [ -z "$MODE" ]; then
+            python source_diagnostics.py
+          else
+            python source_diagnostics.py --${MODE}
+          fi
