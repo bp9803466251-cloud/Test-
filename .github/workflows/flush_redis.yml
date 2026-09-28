@@ -3,12 +3,20 @@ name: Flush Redis
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Режим запуска'
+        type: choice
+        options:
+          - diagnostics
+          - history
+          - flush
+        default: diagnostics
       confirm:
-        description: 'Type "yes" to confirm flush'
-        required: true
+        description: 'Type "yes" to confirm flush (только для mode=flush)'
+        required: false
         default: 'no'
       hard:
-        description: 'Type "yes" for hard flush (wipe ALL match:* keys including orphans)'
+        description: 'Type "yes" for hard flush (только для mode=flush)'
         required: false
         default: 'no'
 
@@ -45,22 +53,40 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Diagnostics before flush
-        run: python redis_diagnostics.py
-
-      - name: Flush Redis
-        if: ${{ inputs.confirm == 'yes' }}
+      - name: Run mode
         run: |
-          HARD="${{ inputs.hard }}"
-          if [ "${HARD,,}" = "yes" ]; then
-            echo "[WORKFLOW] HARD flush requested"
-            python redis_diagnostics.py --flush --hard --yes
+          MODE="${{ inputs.mode || 'diagnostics' }}"
+          echo "[WORKFLOW] Mode: $MODE"
+
+          if [ "$MODE" = "history" ]; then
+            echo "[WORKFLOW] Running history diagnostics..."
+            python redis_diagnostics.py --history
+
+          elif [ "$MODE" = "flush" ]; then
+            CONFIRM="${{ inputs.confirm }}"
+            HARD="${{ inputs.hard }}"
+            HARD_LOWER=$(echo "$HARD" | tr '[:upper:]' '[:lower:]')
+
+            if [ "$CONFIRM" != "yes" ]; then
+              echo "[WORKFLOW] Flush not confirmed (confirm != yes). Running diagnostics only."
+              python redis_diagnostics.py
+              exit 0
+            fi
+
+            if [ "$HARD_LOWER" = "yes" ]; then
+              echo "[WORKFLOW] HARD flush requested"
+              python redis_diagnostics.py --flush --hard --yes
+            else
+              echo "[WORKFLOW] SOFT flush requested"
+              python redis_diagnostics.py --flush --yes
+            fi
+
           else
-            echo "[WORKFLOW] SOFT flush requested"
-            python redis_diagnostics.py --flush --yes
+            echo "[WORKFLOW] Running standard diagnostics..."
+            python redis_diagnostics.py
           fi
 
       - name: Diagnostics after flush
-        if: ${{ inputs.confirm == 'yes' }}
+        if: ${{ inputs.mode == 'flush' && inputs.confirm == 'yes' }}
         run: python redis_diagnostics.py
         
