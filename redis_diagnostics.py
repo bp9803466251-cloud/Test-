@@ -5,7 +5,6 @@ import sys
 import json
 import time
 import traceback
-from datetime import datetime, timezone
 
 def _p(msg):
     print(msg, flush=True)
@@ -18,7 +17,12 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-# ─── Helpers ───
+try:
+    import gatekeeper_hub
+    _p("[DIAG] Import gatekeeper_hub: OK")
+except Exception as e:
+    _p(f"[WARN] Cannot import gatekeeper_hub: {e}")
+
 
 def _safe_json(val):
     if val is None:
@@ -32,18 +36,24 @@ def _safe_json(val):
             return val
     return val
 
+
+def _unwrap(raw):
+    """Extract payload from wrapper."""
+    if not isinstance(raw, dict):
+        return raw
+    if "payload" in raw and isinstance(raw["payload"], dict):
+        return raw["payload"]
+    return raw
+
+
 def _exec(cmd):
     try:
         return redis_hub._execute_upstash_cmd(cmd)
     except Exception as e:
         _p(f"[ERROR] _execute_upstash_cmd({cmd[0]}) failed: {e}")
+        traceback.print_exc()
         return None
 
-def _unwrap(raw):
-    """Extract payload from wrapper if present."""
-    if isinstance(raw, dict) and "payload" in raw and "version" in raw:
-        return raw["payload"]
-    return raw
 
 def load_all_fields():
     _p("[LOAD] Getting HKEYS...")
@@ -65,7 +75,7 @@ def load_all_fields():
     total = len(keys)
 
     for i in range(0, total, batch_size):
-        batch = keys[i:i+batch_size]
+        batch = keys[i:i + batch_size]
         bn = i // batch_size + 1
         tb = (total + batch_size - 1) // batch_size
 
@@ -93,123 +103,77 @@ def load_all_fields():
     _p(f"[LOAD] Done: {len(all_fields)} fields")
     return all_fields
 
+
 def _extract_date(payload):
-    """Extract date string from payload."""
+    if not isinstance(payload, dict):
+        return None
     d = payload.get("date_utc") or payload.get("utcDate") or payload.get("date")
-    return d
-
-def _extract_season(payload):
-    """Extract season from date_utc or key."""
-    d = _extract_date(payload)
-    if d and isinstance(d, str) and len(d) >= 4:
-        try:
-            year = int(d[:4])
-            month = int(d[5:7]) if len(d) >= 7 else 1
-            if month >= 7:
-                return f"{year}/{year+1}"
-            else:
-                return f"{year-1}/{year}"
-        except:
-            pass
+    if d:
+        return str(d)[:10]
     return None
 
-def _extract_season_from_key(key):
-    """Extract season from key like history:match:home__away__20241214."""
-    parts = key.split("__")
-    if parts:
-        last = parts[-1]
-        if len(last) >= 4 and last[:4].isdigit():
-            year = int(last[:4])
-            month = int(last[4:6]) if len(last) >= 6 else 1
-            if month >= 7:
-                return f"{year}/{year+1}"
-            else:
-                return f"{year-1}/{year}"
-    return None
 
-def _extract_league(payload):
-    """Extract league name from payload."""
-    lg = payload.get("competition") or payload.get("league")
-    if isinstance(lg, dict):
-        return lg.get("name") or lg.get("id") or "?"
-    return lg
-
-def _extract_score(payload):
-    """Extract score string from payload."""
-    sc = payload.get("score")
-    if not sc:
-        return None
-    if isinstance(sc, dict):
-        h = sc.get("home") or sc.get("homeTeam") or sc.get("fullTime", {}).get("homeTeam") if isinstance(sc.get("fullTime"), dict) else None
-        a = sc.get("away") or sc.get("awayTeam") or sc.get("fullTime", {}).get("awayTeam") if isinstance(sc.get("fullTime"), dict) else None
-        if h is not None and a is not None:
-            return f"{h}-{a}"
-    return None
-
-def _extract_canonical_id(payload, key):
-    """Extract canonical_id from payload or key."""
-    cid = payload.get("canonical_id")
-    if cid:
-        return cid
-    # Extract from key
-    if ":" in key:
-        parts = key.split(":")
-        if len(parts) >= 3:
-            return parts[2]
-    return key
-
-def _parse_payload(raw_val, key):
-    """Parse raw value and return payload dict."""
-    if isinstance(raw_val, str):
-        try:
-            raw_val = json.loads(raw_val)
-        except:
-            return None
-    if not isinstance(raw_val, dict):
-        return None
-    return _unwrap(raw_val)
-
-# ─── Main modes ───
-
-def run_test():
-    _p("=== TEST MODE ===")
-    _p("\n--- 1. PING ---")
-    r = _exec(["PING"])
-    _p(f"  Result: {r!r}")
-
-    _p("\n--- 2. HLEN ---")
-    r = _exec(["HLEN", "GatekeeperAI"])
-    _p(f"  Result: {r!r}")
-
-    _p("\n--- 3. HKEYS (first 10) ---")
-    r = _exec(["HKEYS", "GatekeeperAI"])
-    if r is None:
-        _p("  HKEYS returned None!")
-        return
-    if isinstance(r, str):
-        try:
-            r = json.loads(r)
-        except:
-            r = [r]
-    _p(f"  Total keys: {len(r)}")
-    _p(f"  First 10: {r[:10]}")
-
-    _p("\n--- 4. HGET (first key) ---")
-    if r:
-        first_key = r[0]
-        val = _exec(["HGET", "GatekeeperAI", first_key])
-        _p(f"  Key: {first_key}")
-        if isinstance(val, str):
-            _p(f"  Value (first 200 chars): {val[:200]}")
-
-    _p("\n--- 5. is_redis_available ---")
+def _get_season_from_date(date_str):
+    if not date_str or len(date_str) < 4:
+        return "?"
     try:
-        avail = redis_hub.is_redis_available()
-        _p(f"  Available: {avail}")
-    except Exception as e:
-        _p(f"  Error: {e}")
+        y = int(date_str[:4])
+        m = int(date_str[5:7]) if len(date_str) >= 7 else 0
+        if m >= 7:
+            return f"{y}/{y + 1}"
+        else:
+            return f"{y - 1}/{y}"
+    except:
+        return "?"
 
-    _p("\n=== TEST COMPLETE ===")
+
+def _get_season_from_key(key):
+    parts = key.split("__")
+    if len(parts) >= 3:
+        date_part = parts[-1]
+        if len(date_part) == 8 and date_part.isdigit():
+            ds = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}"
+            return _get_season_from_date(ds), ds
+    return None, None
+
+
+def _get_competition(payload):
+    if not isinstance(payload, dict):
+        return "?"
+    c = payload.get("competition")
+    if not c:
+        return "?"
+    if isinstance(c, dict):
+        return c.get("name") or c.get("id") or "?"
+    return str(c)
+
+
+def _get_score(payload):
+    if not isinstance(payload, dict):
+        return None, None
+    s = payload.get("score")
+    if not s or not isinstance(s, dict):
+        return None, None
+    h = s.get("home")
+    if h is None:
+        h = s.get("homeTeam") or s.get("fullTime", {}).get("homeTeam") if isinstance(s, dict) else None
+    a = s.get("away")
+    if a is None:
+        a = s.get("awayTeam") or s.get("fullTime", {}).get("awayTeam") if isinstance(s, dict) else None
+    return h, a
+
+
+def _get_sender(raw):
+    if not isinstance(raw, dict):
+        return "?"
+    return raw.get("sender_repo") or "?"
+
+
+def _get_status(payload):
+    if not isinstance(payload, dict):
+        return "?"
+    return payload.get("status") or "?"
+
 
 def run_history():
     _p("=== HISTORY MODE ===")
@@ -218,7 +182,7 @@ def run_history():
         _p("[FATAL] No fields loaded")
         return
 
-    # ── Key breakdown ──
+    # --- Key breakdown ---
     hist_keys = sorted([k for k in fields if k.startswith("history:match:")])
     match_keys = sorted([k for k in fields if k.startswith("match:") and not k.startswith("history:")])
     other_keys = sorted([k for k in fields if not k.startswith("history:match:") and not k.startswith("match:")])
@@ -228,224 +192,240 @@ def run_history():
     _p(f"  match:*         = {len(match_keys)}")
     _p(f"  other           = {len(other_keys)}")
 
-    # ── Parse history ──
-    hist_payloads = {}
+    # --- Parse history ---
+    hist_data = {}
     hist_errors = 0
     for key in hist_keys:
-        payload = _parse_payload(fields[key], key)
-        if payload is None:
+        raw = fields[key]
+        payload = _unwrap(raw)
+        if not isinstance(payload, dict):
             hist_errors += 1
             continue
-        hist_payloads[key] = payload
+        cid = payload.get("canonical_id") or key.replace("history:match:", "")
+        comp = _get_competition(payload)
+        date = _extract_date(payload)
+        if not date:
+            _, ds = _get_season_from_key(key)
+            if ds:
+                date = ds
+        season = _get_season_from_date(date) if date else "?"
+        h, a = _get_score(payload)
+        hist_data[cid] = {
+            "key": key,
+            "competition": comp,
+            "date": date,
+            "season": season,
+            "score_h": h,
+            "score_a": a,
+            "sender": _get_sender(raw),
+            "status": _get_status(payload),
+            "home": payload.get("home_team") or "?",
+            "away": payload.get("away_team") or "?",
+        }
 
     _p(f"\n--- History parse ---")
-    _p(f"  Parsed: {len(hist_payloads)}, Errors: {hist_errors}")
+    _p(f"  Parsed: {len(hist_data)}, Errors: {hist_errors}")
 
-    # ── Brief season summary ──
+    # --- By season ---
     seasons = {}
-    for key, p in hist_payloads.items():
-        s = _extract_season(p) or _extract_season_from_key(key) or "?"
+    for cid, d in hist_data.items():
+        s = d["season"]
         seasons[s] = seasons.get(s, 0) + 1
-
     _p(f"\n--- By season ({len(seasons)}) ---")
     for s in sorted(seasons.keys()):
         _p(f"  {s}: {seasons[s]}")
 
-    # ── Brief league summary ──
+    # --- By league ---
     leagues = {}
-    for key, p in hist_payloads.items():
-        lg = _extract_league(p) or "?"
+    for cid, d in hist_data.items():
+        lg = d["competition"]
         leagues[lg] = leagues.get(lg, 0) + 1
-
     _p(f"\n--- By league ({len(leagues)}) ---")
     for lg in sorted(leagues.keys(), key=lambda x: -leagues[x]):
         _p(f"  {lg}: {leagues[lg]}")
 
-    # ── Build canonical ID set for history ──
-    hist_cids = set()
-    for key, p in hist_payloads.items():
-        cid = _extract_canonical_id(p, key)
-        hist_cids.add(cid)
+    _p(f"\n  History canonical IDs: {len(hist_data)}")
 
-    _p(f"\n  History canonical IDs: {len(hist_cids)}")
-
-    # ── Parse match:* ──
-    match_payloads = {}
+    # --- Parse match:* ---
+    match_data = {}
     match_errors = 0
+    non_dict_payloads = []
     for key in match_keys:
-        payload = _parse_payload(fields[key], key)
-        if payload is None:
+        raw = fields[key]
+        payload = _unwrap(raw)
+        if not isinstance(payload, dict):
             match_errors += 1
+            non_dict_payloads.append((key, type(payload).__name__, str(payload)[:100]))
             continue
-        match_payloads[key] = payload
+        cid = payload.get("canonical_id") or key.replace("match:", "")
+        comp = _get_competition(payload)
+        date = _extract_date(payload)
+        if not date:
+            _, ds = _get_season_from_key(key)
+            if ds:
+                date = ds
+        season = _get_season_from_date(date) if date else "?"
+        h, a = _get_score(payload)
+        match_data[cid] = {
+            "key": key,
+            "competition": comp,
+            "date": date,
+            "season": season,
+            "score_h": h,
+            "score_a": a,
+            "sender": _get_sender(raw),
+            "status": _get_status(payload),
+            "home": payload.get("home_team") or "?",
+            "away": payload.get("away_team") or "?",
+        }
 
     _p(f"\n--- match:* parse ---")
-    _p(f"  Parsed: {len(match_payloads)}, Errors: {match_errors}")
+    _p(f"  Parsed: {len(match_data)}, Errors: {match_errors}")
+    if non_dict_payloads:
+        _p(f"  Non-dict payloads: {len(non_dict_payloads)}")
+        for k, t, v in non_dict_payloads[:5]:
+            _p(f"    {k}: type={t}, val={v}")
 
-    # ── Split match:* into past / future / unknown ──
-    now_utc = datetime.now(timezone.utc)
-    past_matches = {}
-    future_matches = {}
-    unknown_matches = {}
-
-    for key, p in match_payloads.items():
-        d = _extract_date(p)
-        if d and isinstance(d, str) and len(d) >= 10:
-            try:
-                dt = datetime.fromisoformat(d.replace("Z", "+00:00"))
-                if dt < now_utc:
-                    past_matches[key] = p
-                else:
-                    future_matches[key] = p
-            except:
-                # Try from key
-                s = _extract_season_from_key(key)
-                if s:
-                    past_matches[key] = p
-                else:
-                    unknown_matches[key] = p
+    # --- Split match:* into past / future / unknown ---
+    now_str = "2026-09-28"
+    past_match = {}
+    future_match = {}
+    unknown_match = {}
+    for cid, d in match_data.items():
+        if not d["date"] or d["date"] == "?":
+            unknown_match[cid] = d
+        elif d["date"] < now_str:
+            past_match[cid] = d
         else:
-            s = _extract_season_from_key(key)
-            if s:
-                # Check if season is in the past
-                try:
-                    year = int(s.split("/")[0])
-                    if year < now_utc.year or (year == now_utc.year and now_utc.month < 7):
-                        past_matches[key] = p
-                    else:
-                        unknown_matches[key] = p
-                except:
-                    unknown_matches[key] = p
-            else:
-                unknown_matches[key] = p
+            future_match[cid] = d
 
     _p(f"\n--- match:* split ---")
-    _p(f"  Past    = {len(past_matches)}")
-    _p(f"  Future  = {len(future_matches)}")
-    _p(f"  Unknown = {len(unknown_matches)}")
+    _p(f"  Past    = {len(past_match)}")
+    _p(f"  Future  = {len(future_match)}")
+    _p(f"  Unknown = {len(unknown_match)}")
 
-    # ── Past match:* by season ──
+    # --- Past match:* by season ---
     past_seasons = {}
-    for key, p in past_matches.items():
-        s = _extract_season(p) or _extract_season_from_key(key) or "?"
+    for cid, d in past_match.items():
+        s = d["season"]
         past_seasons[s] = past_seasons.get(s, 0) + 1
-
-    _p(f"\n--- Past match:* by season ---")
+    _p(f"\n--- Past match:* by season ({len(past_seasons)}) ---")
     for s in sorted(past_seasons.keys()):
         _p(f"  {s}: {past_seasons[s]}")
 
-    # ── Past match:* by league ──
+    # --- Past match:* by league ---
     past_leagues = {}
-    for key, p in past_matches.items():
-        lg = _extract_league(p) or "?"
+    for cid, d in past_match.items():
+        lg = d["competition"]
         past_leagues[lg] = past_leagues.get(lg, 0) + 1
-
-    _p(f"\n--- Past match:* by league ---")
+    _p(f"\n--- Past match:* by league ({len(past_leagues)}) ---")
     for lg in sorted(past_leagues.keys(), key=lambda x: -past_leagues[x]):
         _p(f"  {lg}: {past_leagues[lg]}")
 
-    # ── Find LOST matches: past match:* not in history ──
+    # --- LOST MATCHES ---
+    hist_cids = set(hist_data.keys())
     lost = {}
-    duplicates = 0
-    for key, p in past_matches.items():
-        cid = _extract_canonical_id(p, key)
-        if cid in hist_cids:
-            duplicates += 1
-        else:
-            lost[key] = p
+    for cid, d in past_match.items():
+        if cid not in hist_cids:
+            lost[cid] = d
 
-    _p(f"\n{'='*60}")
-    _p(f"  LOST MATCHES: {len(lost)}")
-    _p(f"  Duplicates (in both match:* and history:*): {duplicates}")
-    _p(f"{'='*60}")
+    _p(f"\n{'=' * 60}")
+    _p(f"=== LOST MATCHES: {len(lost)} ===")
+    _p(f"{'=' * 60}")
 
-    # ── Lost by season ──
-    lost_seasons = {}
-    for key, p in lost.items():
-        s = _extract_season(p) or _extract_season_from_key(key) or "?"
-        lost_seasons[s] = lost_seasons.get(s, 0) + 1
+    if not lost:
+        _p("  No lost matches found — all past match:* are in history:match:*")
+    else:
+        # Lost by season
+        lost_seasons = {}
+        for cid, d in lost.items():
+            s = d["season"]
+            lost_seasons[s] = lost_seasons.get(s, 0) + 1
+        _p(f"\n--- Lost by season ({len(lost_seasons)}) ---")
+        for s in sorted(lost_seasons.keys()):
+            _p(f"  {s}: {lost_seasons[s]}")
 
-    _p(f"\n--- Lost by season ---")
-    for s in sorted(lost_seasons.keys()):
-        _p(f"  {s}: {lost_seasons[s]}")
+        # Lost by league
+        lost_leagues = {}
+        for cid, d in lost.items():
+            lg = d["competition"]
+            lost_leagues[lg] = lost_leagues.get(lg, 0) + 1
+        _p(f"\n--- Lost by league ({len(lost_leagues)}) ---")
+        for lg in sorted(lost_leagues.keys(), key=lambda x: -lost_leagues[lg]):
+            _p(f"  {lg}: {lost_leagues[lg]}")
 
-    # ── Lost by league ──
-    lost_leagues = {}
-    for key, p in lost.items():
-        lg = _extract_league(p) or "?"
-        lost_leagues[lg] = lost_leagues.get(lg, 0) + 1
+        # Lost by season x league
+        lost_sl = {}
+        for cid, d in lost.items():
+            sl = f"{d['season']} | {d['competition']}"
+            lost_sl[sl] = lost_sl.get(sl, 0) + 1
+        _p(f"\n--- Lost by season x league (top 20) ---")
+        for sl in sorted(lost_sl.keys(), key=lambda x: -lost_sl[x])[:20]:
+            _p(f"  {sl}: {lost_sl[sl]}")
 
-    _p(f"\n--- Lost by league ---")
-    for lg in sorted(lost_leagues.keys(), key=lambda x: -lost_leagues[x]):
-        _p(f"  {lg}: {lost_leagues[lg]}")
+        # Lost by sender
+        lost_senders = {}
+        for cid, d in lost.items():
+            s = d["sender"]
+            lost_senders[s] = lost_senders.get(s, 0) + 1
+        _p(f"\n--- Lost by sender ---")
+        for s in sorted(lost_senders.keys()):
+            _p(f"  {s}: {lost_senders[s]}")
 
-    # ── Lost by season x league ──
-    lost_sl = {}
-    for key, p in lost.items():
-        s = _extract_season(p) or _extract_season_from_key(key) or "?"
-        lg = _extract_league(p) or "?"
-        sl = f"{s} | {lg}"
-        lost_sl[sl] = lost_sl.get(sl, 0) + 1
+        # Lost examples
+        _p(f"\n--- Lost examples (20) ---")
+        for i, (cid, d) in enumerate(sorted(lost.items(), key=lambda x: x[1]["date"] or "")[:20]):
+            _p(f"  {i + 1}. {d['home']} vs {d['away']} | {d['date']} | {d['competition']} | "
+                f"score: {d['score_h']}-{d['score_a']} | status: {d['status']} | sender: {d['sender']}")
+            _p(f"     key: {d['key']}")
 
-    _p(f"\n--- Lost by season x league (top 20) ---")
-    for sl in sorted(lost_sl.keys(), key=lambda x: -lost_sl[x])[:20]:
-        _p(f"  {sl}: {lost_sl[sl]}")
-
-    # ── Lost examples ──
-    _p(f"\n--- Lost examples (20) ---")
-    for i, (key, p) in enumerate(sorted(lost.items())[:20]):
-        home = p.get("home_team") or "?"
-        away = p.get("away_team") or "?"
-        lg = _extract_league(p) or "?"
-        d = _extract_date(p) or "?"
-        sc = _extract_score(p) or "?"
-        st = p.get("status") or "?"
-        sender = "?"
-        raw = fields.get(key, {})
-        if isinstance(raw, dict) and "sender_repo" in raw:
-            sender = raw["sender_repo"]
-        _p(f"  {i+1}. [{key}]")
-        _p(f"     {home} vs {away} | {lg} | {d} | score: {sc} | status: {st} | sender: {sender}")
-
-    # ── Future match:* examples ──
-    if future_matches:
-        _p(f"\n--- Future match:* examples (5) ---")
-        for i, (key, p) in enumerate(sorted(future_matches.items())[:5]):
-            home = p.get("home_team") or "?"
-            away = p.get("away_team") or "?"
-            lg = _extract_league(p) or "?"
-            d = _extract_date(p) or "?"
-            _p(f"  {i+1}. {home} vs {away} | {lg} | {d}")
-
-    # ── Verification ──
-    _p(f"\n{'='*60}")
-    _p(f"  VERIFICATION")
-    _p(f"{'='*60}")
-    _p(f"  history:match:*  = {len(hist_keys)}")
-    _p(f"  match:* (past)   = {len(past_matches)}")
-    _p(f"  match:* (future) = {len(future_matches)}")
-    _p(f"  match:* (unkn)   = {len(unknown_matches)}")
-    _p(f"  Duplicates        = {duplicates}")
-    _p(f"  LOST              = {len(lost)}")
-    _p(f"  history + lost    = {len(hist_keys) + len(lost)}")
-    _p(f"  Expected          = 17034")
-    _p(f"  Difference        = {17034 - (len(hist_keys) + len(lost))}")
-
-    # ── Sender breakdown for lost ──
-    lost_senders = {}
-    for key in lost:
-        raw = fields.get(key, {})
-        if isinstance(raw, dict) and "sender_repo" in raw:
-            s = raw["sender_repo"]
-        else:
-            s = "?"
-        lost_senders[s] = lost_senders.get(s, 0) + 1
-
-    _p(f"\n--- Lost by sender ---")
-    for s in sorted(lost_senders.keys(), key=lambda x: -lost_senders[x]):
-        _p(f"  {s}: {lost_senders[s]}")
-
+    # --- Verification ---
+    _p(f"\n{'=' * 60}")
+    _p(f"=== VERIFICATION ===")
+    _p(f"  history:match:*  = {len(hist_data)}")
+    _p(f"  match:* past     = {len(past_match)}")
+    _p(f"  match:* future   = {len(future_match)}")
+    _p(f"  match:* unknown  = {len(unknown_match)}")
+    _p(f"  Duplicates       = {len(past_match) - len(lost)}")
+    _p(f"  Lost             = {len(lost)}")
+    _p(f"  history + lost   = {len(hist_data) + len(lost)}")
+    _p(f"  Expected         = 17034")
+    _p(f"  Diff             = {17034 - len(hist_data) - len(lost)}")
     _p(f"\n=== HISTORY COMPLETE ===")
+
+
+def run_test():
+    _p("=== TEST MODE ===")
+    _p("\n--- 1. PING ---")
+    r = _exec(["PING"])
+    _p(f"  Result: {r!r}")
+
+    _p("\n--- 2. is_redis_available ---")
+    try:
+        avail = redis_hub.is_redis_available()
+        _p(f"  Available: {avail}")
+    except Exception as e:
+        _p(f"  Error: {e}")
+
+    _p("\n--- 3. HLEN ---")
+    r = _exec(["HLEN", "GatekeeperAI"])
+    _p(f"  HLEN: {r}")
+
+    _p("\n--- 4. HKEYS (first 10) ---")
+    r = _exec(["HKEYS", "GatekeeperAI"])
+    if r is None:
+        _p("  HKEYS returned None!")
+        return
+    if isinstance(r, str):
+        try:
+            r = json.loads(r)
+        except:
+            r = [r]
+    _p(f"  Total: {len(r)}")
+    _p(f"  First 10: {r[:10]}")
+
+    _p("\n=== TEST COMPLETE ===")
+
 
 def run_diagnostics():
     _p("=== DIAGNOSTICS ===")
@@ -457,11 +437,19 @@ def run_diagnostics():
     match = [k for k in fields if k.startswith("match:") and not k.startswith("history:")]
     other = [k for k in fields if not k.startswith("history:match:") and not k.startswith("match:")]
     _p(f"\nTotal: {len(fields)} (history={len(hist)}, match={len(match)}, other={len(other)})")
+    if other[:10]:
+        _p(f"Other keys sample: {other[:10]}")
     _p(f"\n=== DIAGNOSTICS COMPLETE ===")
+
 
 if __name__ == "__main__":
     _p(f"[DIAG] Python {sys.version}")
+    _p(f"[DIAG] CWD: {os.getcwd() if 'os' in dir() else '?'}")
     _p(f"[DIAG] Args: {sys.argv}")
+
+    import os
+    _p(f"[DIAG] CWD: {os.getcwd()}")
+
     mode = ""
     for arg in sys.argv[1:]:
         if arg.startswith("--"):
@@ -479,11 +467,6 @@ if __name__ == "__main__":
                 _p(f"Flushing (hard={hard})...")
                 keys = _exec(["HKEYS", "GatekeeperAI"])
                 if keys:
-                    if isinstance(keys, str):
-                        try:
-                            keys = json.loads(keys)
-                        except:
-                            keys = [keys]
                     live_keys = [k for k in keys if k.startswith("live:")]
                     _p(f"Deleting {len(live_keys)} live keys...")
                     for k in live_keys:
@@ -496,3 +479,4 @@ if __name__ == "__main__":
     except Exception as e:
         _p(f"[FATAL] Unhandled exception: {e}")
         traceback.print_exc()
+                                                                                          
