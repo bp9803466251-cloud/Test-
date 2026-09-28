@@ -1,0 +1,42 @@
+name: Collector Bzzoiro
+
+on:
+  workflow_dispatch:
+    inputs:
+      events_only:
+        description: "Только матчи, без enrichment"
+        type: boolean
+        default: false
+
+jobs:
+  collect-bzzoiro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests redis
+
+      - name: Run collector
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+          BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || 0.3 }}
+          BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || 0.2 }}
+          BZZOIRO_MAX_RETRIES: ${{ vars.BZZOIRO_MAX_RETRIES || 1 }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.events_only }}" = "true" ]; then
+            ARGS="--events-only"
+          fi
+          python collector_bzzoiro.py $ARGS
+          
