@@ -9,8 +9,9 @@ on:
         options:
           - diagnostics
           - history
+          - test
           - flush
-        default: diagnostics
+        default: test
       confirm:
         description: 'Type "yes" to confirm flush (только для mode=flush)'
         required: false
@@ -58,7 +59,11 @@ jobs:
           MODE="${{ inputs.mode || 'diagnostics' }}"
           echo "[WORKFLOW] Mode: $MODE"
 
-          if [ "$MODE" = "history" ]; then
+          if [ "$MODE" = "test" ]; then
+            echo "[WORKFLOW] Running test diagnostics..."
+            python redis_diagnostics.py --test
+
+          elif [ "$MODE" = "history" ]; then
             echo "[WORKFLOW] Running history diagnostics..."
             python redis_diagnostics.py --history
 
