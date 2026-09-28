@@ -1,0 +1,49 @@
+name: Collector SharpAPI
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
+jobs:
+  run-collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run collector
+        run: python collector_sharpapi.py
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+          SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '6' }}
+          SHARPAPI_MAX_PAGES: ${{ vars.SHARPAPI_MAX_PAGES || '60' }}
+          SHARPAPI_LIMIT: ${{ vars.SHARPAPI_LIMIT || '200' }}
+          SHARPAPI_MAX_RETRIES: ${{ vars.SHARPAPI_MAX_RETRIES || '3' }}
+          GATEKEEPER_EXTERNAL_API_TIMEOUT: ${{ vars.GATEKEEPER_EXTERNAL_API_TIMEOUT || '15' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          
