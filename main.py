@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Gatekeeper-AI v600-prod — Main Pipeline (Dashboard + Telegram)
-V5.8.0
+Gatekeeper-AI v700-prod — Main Pipeline (Dashboard + Telegram)
+V7.0.0
 """
 import os
 import sys
@@ -12,11 +12,13 @@ import urllib.parse
 import urllib.error
 from datetime import datetime, timezone, timedelta
 
-# Imports
 from gatekeeper_hub import (
     run_initialization,
     get_matches_by_date_range,
     save_search_results,
+    save_analysis,
+    get_current_odds,
+    get_odds_metadata,
     get_from_cache,
 )
 from search_module import SearchModule, _parse_date_msk, _get_competition_code
@@ -24,7 +26,6 @@ from search_module import SearchModule, _parse_date_msk, _get_competition_code
 MSK_TZ = timezone(timedelta(hours=3))
 VALUE_THRESHOLD = float(os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
 
-# Telegram
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_GROUP_ID", "")
 TG_MAX_CHARS = 4000
@@ -34,28 +35,21 @@ TG_MAX_CHARS = 4000
 # Telegram transport
 # ---------------------------------------------------------------------------
 def _send_telegram(text: str) -> bool:
-    """Отправляет текст в Telegram, разбивая на части до 4000 символов."""
     if not TG_TOKEN or not TG_CHAT:
         print("[TELEGRAM] Нет токена или chat_id — пропуск")
         return False
-
-    # Fix: заменяем % на &#37; чтобы Telegram не авто-линковал проценты как URL
     text = text.replace('%', '&#37;')
-
     parts = _split_message(text, TG_MAX_CHARS)
     print(f"[TELEGRAM] Отправка {len(parts)} сообщений...")
-
     for i, part in enumerate(parts, 1):
         if not _send_one(part):
             print(f"[TELEGRAM] Ошибка отправки части {i}/{len(parts)}")
             return False
         print(f"[TELEGRAM] Часть {i}/{len(parts)} отправлена")
-
     return True
 
 
 def _send_one(text: str) -> bool:
-    """Отправляет одно сообщение в Telegram."""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = json.dumps({
         "chat_id": TG_CHAT,
@@ -63,10 +57,8 @@ def _send_one(text: str) -> bool:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }).encode("utf-8")
-
     req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
-
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -93,14 +85,11 @@ def _send_one(text: str) -> bool:
 
 
 def _split_message(text: str, max_chars: int) -> list:
-    """Разбивает текст на части до max_chars по строкам."""
     if len(text) <= max_chars:
         return [text]
-
     lines = text.split("\n")
     parts = []
     current = ""
-
     for line in lines:
         if len(current) + len(line) + 1 > max_chars:
             if current:
@@ -120,10 +109,8 @@ def _split_message(text: str, max_chars: int) -> list:
             current = line + "\n"
         else:
             current += line + "\n"
-
     if current:
         parts.append(current)
-
     return parts
 
 
@@ -131,13 +118,11 @@ def _split_message(text: str, max_chars: int) -> list:
 # Ecosystem markers
 # ---------------------------------------------------------------------------
 def _ecosystem_line() -> str:
-    """Строит строку Ecosystem с маркерами +/−."""
-    markers = ["Ecosystem+"]
-    markers.append("Redis+")
-
+    markers = ["Ecosystem+", "Redis+"]
     for name, meta_key in [
         ("Bzzoiro", "bzzoiro:meta"),
         ("Sharp", "sharpapi:meta"),
+        ("PropLine", "propline:meta"),
         ("OddsAPI", "odds_api:meta"),
     ]:
         meta = get_from_cache(meta_key)
@@ -145,29 +130,25 @@ def _ecosystem_line() -> str:
             markers.append(f"{name}+")
         else:
             markers.append(f"{name}-")
-
     if os.environ.get("SHARPAPI_FLUSH_OLD") == "1":
         markers.append("Flush🧹")
     else:
         markers.append("Flush+")
-
     return " | ".join(markers)
 
 
 # ---------------------------------------------------------------------------
-# Last module (⭐)
+# Last module
 # ---------------------------------------------------------------------------
 def _last_module() -> str:
-    """Возвращает имя последнего коллектора по last_run."""
     modules = [
         ("Sharp", "sharpapi:meta"),
         ("Bzzoiro", "bzzoiro:meta"),
+        ("PropLine", "propline:meta"),
         ("OddsAPI", "odds_api:meta"),
     ]
-
     latest = None
     latest_dt = None
-
     for name, meta_key in modules:
         meta = get_from_cache(meta_key)
         if not isinstance(meta, dict):
@@ -182,7 +163,6 @@ def _last_module() -> str:
                 latest = name
         except Exception:
             continue
-
     return latest or "none"
 
 
@@ -190,18 +170,15 @@ def _last_module() -> str:
 # Форматирование
 # ---------------------------------------------------------------------------
 def _fmt_odds(o: float) -> str:
-    """Форматирует коэффициент: 2.2, 3.55, 1.67."""
     s = f"{o:.2f}".rstrip("0").rstrip(".")
     return s if s else "0"
 
 
 def _fmt_prob(p: float) -> str:
-    """Форматирует вероятность как процент: 41, 25, 33."""
     return str(round(p * 100))
 
 
 def _source_display(source: str) -> str:
-    """Капитализация имени источника для non-fire отображения."""
     if not source:
         return "unknown"
     s = source.lower().strip()
@@ -209,10 +186,10 @@ def _source_display(source: str) -> str:
         return "SharpAPI"
     if s == "bzzoiro":
         return "Bzzoiro"
-    if s == "odds_api":
+    if s == "odds_api" or s == "oddsapi":
         return "OddsAPI"
-    if s == "oddsapi":
-        return "OddsAPI"
+    if s == "propline":
+        return "PropLine"
     if s == "api_football":
         return "API-Football"
     if s == "betfair":
@@ -222,27 +199,37 @@ def _source_display(source: str) -> str:
     return source
 
 
+def _verification_badge(info: dict) -> str:
+    """Возвращает бейдж верификации odds на основе метаданных."""
+    v = info.get("odds_verification", {})
+    if not isinstance(v, dict):
+        return ""
+    level = v.get("level", "")
+    if level == "VERIFIED":
+        return " ✅"
+    elif level == "CONSENSUS":
+        return " 🔒"
+    elif level == "SINGLE":
+        return " ⚠️"
+    return ""
+
+
 def _fmt_bet(info: dict, is_hot: bool) -> tuple:
-    """Форматирует одну ставку в 3 строки."""
     arrow = "➔"
+    badge = _verification_badge(info)
 
-    # Заголовок
     if is_hot and info.get("is_fire"):
-        header = f"{arrow} {{n}} | 🔥 | {html.escape(info['comp_code'])} | {info['date']} | {info['time']}"
+        header = f"{arrow} {{n}} | 🔥{badge} | {html.escape(info['comp_code'])} | {info['date']} | {info['time']}"
     else:
-        header = f"{arrow} {{n}} | {html.escape(info['comp_code'])} | {info['date']} | {info['time']}"
+        header = f"{arrow} {{n}}{badge} | {html.escape(info['comp_code'])} | {info['date']} | {info['time']}"
 
-    # Команды
     teams = f"{html.escape(info['home_team'])} vs {html.escape(info['away_team'])}"
 
-    # Данные
     o_h, o_d, o_a = info["odds"]
     p_h, p_d, p_a = info["probs"]
-
     odds_str = f"O: {_fmt_odds(o_h)}/{_fmt_odds(o_d)}/{_fmt_odds(o_a)}"
     probs_str = f"P: {_fmt_prob(p_h)}%/{_fmt_prob(p_d)}%/{_fmt_prob(p_a)}%"
 
-    # V: строка
     v_odds_str = _fmt_odds(info["v_odds"])
     v_prob_str = _fmt_prob(info["v_prob"])
 
@@ -260,14 +247,11 @@ def _fmt_bet(info: dict, is_hot: bool) -> tuple:
 
 
 def _format_dashboard(result: dict) -> str:
-    """Формирует полный дашборд."""
     lines = []
-
     hot = result["hot"]
     warm = result["warm"]
     stats = result["stats"]
 
-    # HOT BETS
     if hot:
         lines.append(f"🎯 HOT BETS ({len(hot)})")
         lines.append("")
@@ -282,7 +266,6 @@ def _format_dashboard(result: dict) -> str:
         lines.append("Нет кандидатов в топе.")
         lines.append("")
 
-    # WARM BETS
     if warm:
         lines.append(f"⚠️ WARM BETS ({len(warm)})")
         lines.append("")
@@ -297,10 +280,8 @@ def _format_dashboard(result: dict) -> str:
         lines.append("Нет кандидатов.")
         lines.append("")
 
-    # Статусная строка
     now_str = datetime.now(MSK_TZ).strftime("%H:%M")
     module = _last_module()
-
     status_parts = [
         "🌐 Redis+",
         f"📦{stats['total']}",
@@ -313,10 +294,7 @@ def _format_dashboard(result: dict) -> str:
         f"⭐{module}",
     ]
     lines.append(" | ".join(status_parts))
-
-    # Ecosystem
     lines.append(_ecosystem_line())
-
     return "\n".join(lines)
 
 
@@ -325,11 +303,10 @@ def _format_dashboard(result: dict) -> str:
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 60)
-    print("[DASH] Gatekeeper-AI Pipeline v600-prod")
+    print("[DASH] Gatekeeper-AI Pipeline v700-prod")
     print(f"[DASH] Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
     print("=" * 60)
 
-    # Инициализация Redis
     print("[DASH] Инициализация Redis...")
     init = run_initialization()
     if not init or not init.get("redis_available"):
@@ -345,7 +322,6 @@ def main():
     latency = init.get("init_latency_ms", 0)
     print(f"[DASH] Redis init OK, latency={latency}ms")
 
-    # Загрузка матчей
     matches = get_matches_by_date_range()
     print(f"[DASH] get_matches_by_date_range → {len(matches)} матчей")
 
@@ -361,7 +337,6 @@ def main():
         _send_telegram(dashboard)
         return
 
-    # Поиск value bets
     search = SearchModule(value_threshold=VALUE_THRESHOLD)
     result = search.process(matches)
 
@@ -372,14 +347,25 @@ def main():
           f"H2H: {result['stats']['with_h2h']}, "
           f"Stats: {result['stats']['with_stats']}")
 
-    # Форматирование дашборда
-    dashboard = _format_dashboard(result)
+    # Сохранение analysis для HOT матчей
+    for info in result["hot"]:
+        cid = info.get("canonical_id", "")
+        if not cid:
+            continue
+        save_analysis(cid, {
+            "is_fire": info.get("is_fire", False),
+            "value_ev": info.get("value_ev", 0),
+            "v_side": info.get("v_side", ""),
+            "v_odds": info.get("v_odds", 0),
+            "v_prob": info.get("v_prob", 0),
+            "odds_verification": info.get("odds_verification", {}),
+            "timestamp": datetime.now(MSK_TZ).isoformat(),
+        })
 
-    # Вывод в stdout для лога
+    dashboard = _format_dashboard(result)
     print()
     print(dashboard)
 
-    # Сохранение результатов
     save_search_results({
         "hot": len(result["hot"]),
         "warm": len(result["warm"]),
@@ -389,9 +375,7 @@ def main():
     })
     print("[DASH] Результаты сохранены в Redis")
 
-    # Отправка в Telegram
     _send_telegram(dashboard)
-
     print("[DASH] Готово")
 
 

@@ -1,7 +1,7 @@
 """
-Коллектор SharpAPI для Gatekeeper-AI v600-prod.
+Коллектор SharpAPI для Gatekeeper-AI v700-prod.
 Получает матчи и коэффициенты, сохраняет в Redis через gatekeeper_hub.
-Хелперы normalize_date, is_future_match, now_msk, save_meta импортируются из хаба (правило 1.11).
+Хелперы normalize_date, is_future_match, now_msk, save_meta импортируются из хаба.
 """
 import os
 import json
@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
 from gatekeeper_hub import (
-    upsert_match, run_initialization,
+    upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
 )
 from redis_hub import get_all_fields, delete_from_cache
@@ -22,7 +22,6 @@ SHARP_API_BASE = "https://api.sharpapi.io/api/v1"
 
 # ---------------------------------------------------------------------------
 # Словари для парсинга слага лиги SharpAPI
-# Формат: country_slug_-_league_slug (например, 'argentina_-_primera_a')
 # ---------------------------------------------------------------------------
 COUNTRY_MAP = {
     "argentina": "Argentina", "england": "England", "spain": "Spain",
@@ -84,7 +83,7 @@ LEAGUE_NAME_MAP = {
     "swiss_super_league": "Super League", "super_league_greece": "Super League",
     "ekstraklasa": "Ekstraklasa", "superligaen": "Superliga",
     "allsvenskan": "Allsvenskan", "eliteserien": "Eliteserien",
-    "veikkausliiga": "Veikkausliiga", "premier_division_ie": "Premier Division",
+    "veikkausliitto": "Veikkausliiga", "premier_division_ie": "Premier Division",
     "primera_a_colombia": "Primera A", "primera_division_uy": "Primera División",
     "primera_a_ecuador": "Primera A", "liga_1_peru": "Liga 1",
     "primera_division_bo": "Primera División", "primera_division_ve": "Primera División",
@@ -105,23 +104,16 @@ LEAGUE_NAME_MAP = {
 
 
 def _resolve_league(league_slug: str, row: dict) -> tuple:
-    """
-    Возвращает (country, competition_name) из слага лиги SharpAPI.
-    Формат: country_slug_-_league_slug (например, 'argentina_-_primera_a').
-    """
     if not league_slug:
         return ("", "")
     slug_lower = league_slug.lower().strip()
-
     if "_-_" in slug_lower:
         parts = slug_lower.split("_-_", 1)
         country_slug = parts[0].strip()
         league_part = parts[1].strip() if len(parts) > 1 else ""
-
         country = COUNTRY_MAP.get(country_slug, country_slug.replace("_", " ").title())
         league_name = LEAGUE_NAME_MAP.get(league_part, league_part.replace("_", " ").title())
         return (country, league_name)
-
     return ("", slug_lower.replace("_", " ").title())
 
 
@@ -147,7 +139,6 @@ def _fetch_sharpapi(url, headers):
 
 
 def _flush_old_matches():
-    """Удаляет все match:* ключи перед свежим сбором."""
     all_fields = get_all_fields()
     deleted = 0
     for key in all_fields:
@@ -159,7 +150,6 @@ def _flush_old_matches():
 
 
 def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
-    """Одна фаза — только /odds с cursor-пагинацией."""
     all_rows = []
     pages = 0
     cursor = None
@@ -264,7 +254,7 @@ def collect_sharpapi():
         save_meta("sharpapi", **meta)
         return meta
 
-    # --- Группировать odds по event_id, выбрать лучшие ---
+    # --- Группировать odds по event_id ---
     events_map = {}
 
     for row in odds_rows:
@@ -331,21 +321,8 @@ def collect_sharpapi():
             continue
 
         ev_odds = ev["odds"]
-        odds = {
-            "home": str(ev_odds["home"]) if "home" in ev_odds else "-",
-            "draw": str(ev_odds["draw"]) if "draw" in ev_odds else "-",
-            "away": str(ev_odds["away"]) if "away" in ev_odds else "-",
-            "source": "SharpAPI",
-            "updated_at": now_msk(),
-        }
 
-        source_ids = {"sharpapi": str(eid)}
-
-        extra = {
-            "odds": odds,
-            "source_ids": source_ids,
-        }
-
+        # 1. Создать матч (без odds)
         cid = upsert_match(
             home_team=home_team,
             away_team=away_team,
@@ -353,16 +330,25 @@ def collect_sharpapi():
             competition=ev["league"],
             country=ev.get("country", ""),
             status="scheduled",
-            source="SharpAPI",
-            **extra,
+            source="sharpapi",
+            source_ids={"sharpapi": str(eid)},
         )
 
         if cid:
             stored += 1
-            if cid in existing_keys:
+            if f"match:{cid}" in existing_keys:
                 updated += 1
             else:
                 created += 1
+
+            # 2. Patch odds в новом формате v700
+            odds_current = {
+                "home": str(ev_odds["home"]) if "home" in ev_odds else "-",
+                "draw": str(ev_odds["draw"]) if "draw" in ev_odds else "-",
+                "away": str(ev_odds["away"]) if "away" in ev_odds else "-",
+            }
+            patch_match(cid, "odds", {"current": odds_current},
+                       source="sharpapi", upstream="betradar")
 
     total_events = len(events_map)
     print(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, пропущено (прошедшие): {skipped_past}, дедупликатов: {deduped}")

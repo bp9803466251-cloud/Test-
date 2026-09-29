@@ -1,6 +1,6 @@
 """
-Коллектор OddsAPI (The Odds API) для Gatekeeper-AI v600-prod.
-Получает матчи и коэффициенты.
+Коллектор OddsAPI (The Odds API) для Gatekeeper-AI v700-prod.
+Получает матчи и коэффициенты. Роль: VERIFICATION (запускается вручную, реже остальных).
 """
 import os
 import json
@@ -10,7 +10,7 @@ import urllib.error
 from typing import Dict, Any, Optional
 
 from gatekeeper_hub import (
-    batch_upsert_matches, run_initialization,
+    upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
 )
 
@@ -23,7 +23,6 @@ def _fetch_odds_api(url: str, max_retries: int = 1) -> Optional[dict]:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode("utf-8"))
-                # Сохраняем quota из headers
                 remaining = response.headers.get("x-requests-remaining")
                 used = response.headers.get("x-requests-used")
                 return {"data": data, "quota_remaining": remaining, "quota_used": used}
@@ -56,7 +55,6 @@ def collect_odds_api() -> Dict[str, Any]:
         print("[ODDS_API] Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
-    # Настройки из env (передаются через workflow)
     regions = os.environ.get("ODDS_API_REGIONS", "eu,uk")
     markets = os.environ.get("ODDS_API_MARKETS", "h2h")
     odds_format = os.environ.get("ODDS_API_ODDS_FORMAT", "decimal")
@@ -70,11 +68,14 @@ def collect_odds_api() -> Dict[str, Any]:
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     sports = sports_data.get("data", [])
-    # Фильтруем только активные футбол
     football_sports = [s for s in sports if s.get("group") == "Soccer" and s.get("active", True)]
     print(f"[ODDS_API] Активных футбольных лиг: {len(football_sports)}")
 
-    all_matches = []
+    stored = 0
+    created = 0
+    updated = 0
+    skipped_past = 0
+    total_events = 0
     quota_remaining = "?"
     quota_used = "?"
     error_count = 0
@@ -84,7 +85,6 @@ def collect_odds_api() -> Dict[str, Any]:
         if not sport_key:
             continue
 
-        # 2. Получаем odds для каждой лиги
         odds_url = (
             f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
             f"?apiKey={api_key}&regions={regions}&markets={markets}&oddsFormat={odds_format}"
@@ -107,9 +107,8 @@ def collect_odds_api() -> Dict[str, Any]:
             raw_date = ev.get("commence_time", "") or ev.get("start_time", "")
             date_utc = normalize_date(raw_date)
 
-            # Правило 1.5: матчи без даты считаются будущими — сохраняем.
-            # Пропускаем только матчи с датой в прошлом.
             if date_utc and not is_future_match(date_utc):
+                skipped_past += 1
                 continue
 
             sport_title = ev.get("sport_title", sport.get("title", ""))
@@ -145,42 +144,35 @@ def collect_odds_api() -> Dict[str, Any]:
                             if odds_away == "-" or price_float > float(odds_away):
                                 odds_away = str(price)
 
-            match_data = {
-                "home_team": home_team,
-                "away_team": away_team,
-                "date_utc": date_utc,
-                "competition": sport_title,
-                "country": "",
-                "status": "scheduled",
-                "source_ids": {"odds_api": event_id},
-                "odds": {
+            total_events += 1
+
+            # 1. Создать матч (без odds)
+            cid = upsert_match(
+                home_team=home_team,
+                away_team=away_team,
+                date_utc=date_utc,
+                competition=sport_title,
+                country="",
+                status="scheduled",
+                source="odds_api",
+                source_ids={"odds_api": event_id},
+            )
+
+            if cid:
+                stored += 1
+
+                # 2. Patch odds в новом формате v700
+                odds_current = {
                     "home": odds_home,
                     "draw": odds_draw,
                     "away": odds_away,
-                    "source": "odds_api",
-                    "updated_at": now_msk(),
-                },
-            }
-            all_matches.append(match_data)
+                }
+                patch_match(cid, "odds", {"current": odds_current},
+                           source="odds_api", upstream="betradar")
 
-        # Rate limit между лигами
         time.sleep(rate_delay)
 
-    total_events = len(all_matches)
-    print(f"[ODDS_API] Получено матчей с коэффициентами: {total_events}")
-
-    # 3. Batch upsert
-    if all_matches:
-        upsert_result = batch_upsert_matches(all_matches, source="odds_api")
-        created = upsert_result.get("created", 0)
-        updated = upsert_result.get("updated", 0)
-        deduped = upsert_result.get("deduped", 0)
-        skipped_past = upsert_result.get("skipped_past", 0)
-        stored = created + updated + deduped
-    else:
-        stored = created = updated = deduped = skipped_past = 0
-
-    print(f"[ODDS_API] Записано: {stored} (создано {created}, обновлено {updated}, дубликатов {deduped})")
+    print(f"[ODDS_API] Получено матчей: {total_events}, записано: {stored}, пропущено: {skipped_past}")
 
     meta = {
         "last_run": now_msk(),
@@ -188,7 +180,6 @@ def collect_odds_api() -> Dict[str, Any]:
         "stored_matches": stored,
         "created": created,
         "updated": updated,
-        "deduped": deduped,
         "skipped_past": skipped_past,
         "error_count": error_count,
         "quota_remaining": quota_remaining,
