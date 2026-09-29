@@ -1,0 +1,55 @@
+name: Collector — Football Data (History)
+
+on:
+  workflow_dispatch:
+    inputs:
+      history_days:
+        description: 'Окно истории (дней назад)'
+        required: false
+        type: string
+        default: '30'
+      season:
+        description: 'Сезон (пусто = текущий)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+      REDIS_URL: ${{ secrets.REDIS_URL }}
+      FOOTBALL_DATA_HISTORY_DAYS: ${{ github.event.inputs.history_days || '30' }}
+      FOOTBALL_DATA_SEASON: ${{ github.event.inputs.season || '' }}
+      FOOTBALL_DATA_RATE_DELAY: ${{ vars.FOOTBALL_DATA_RATE_DELAY || '0.15' }}
+      FOOTBALL_DATA_MAX_RETRIES: ${{ vars.FOOTBALL_DATA_MAX_RETRIES || '2' }}
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir requests
+
+      - name: Run collector
+        run: python football_data_to_redis.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: football-data-failure-logs
+          path: |
+            *.log
+          retention-days: 7
+          
