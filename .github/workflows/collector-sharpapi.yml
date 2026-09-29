@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12"
 
 permissions:
   contents: read
@@ -46,4 +46,14 @@ jobs:
           SHARPAPI_MAX_RETRIES: ${{ vars.SHARPAPI_MAX_RETRIES || '3' }}
           GATEKEEPER_EXTERNAL_API_TIMEOUT: ${{ vars.GATEKEEPER_EXTERNAL_API_TIMEOUT || '15' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          PYTHONUNBUFFERED: '1'
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sharpapi-failure-logs
+          path: |
+            *.log
+          retention-days: 7
           
