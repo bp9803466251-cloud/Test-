@@ -1,5 +1,5 @@
 """
-Транспортный слой Gatekeeper-AI Ecosystem v600-prod.
+Транспортный слой Gatekeeper-AI Ecosystem v700-prod.
 Единый инкапсулированный шлюз к Upstash Redis REST API.
 Только urllib.request. Никаких сторонних клиентов.
 """
@@ -20,7 +20,7 @@ HMGET_CHUNK_SIZE = int(os.getenv("GATEKEEPER_HMGET_CHUNK_SIZE", "50"))
 
 IMMUTABLE_ROOT_ADDRESS = "GatekeeperAI"
 MSK_TIMEZONE = timezone(timedelta(hours=3))
-ENVELOPE_VERSION = "v600-prod"
+ENVELOPE_VERSION = "v700-prod"
 
 # ---------------------------------------------------------------------------
 # Circuit Breaker
@@ -150,7 +150,7 @@ def get_from_cache(field_id: str) -> Optional[Any]:
 
 
 def save_to_cache(field_id: str, data: Any) -> bool:
-    """Атомарная запись в хэш-кэш с конвертом v600-prod."""
+    """Атомарная запись в хэш-кэш с конвертом v700-prod."""
     env_repo = os.environ.get("GITHUB_REPOSITORY", "")
     repo_name = env_repo.split("/")[-1] if "/" in env_repo else (env_repo or "local_dev")
     current_time = datetime.now(MSK_TIMEZONE).isoformat()
@@ -264,7 +264,6 @@ def get_circuit_breaker_status() -> dict:
 
 def is_redis_available() -> bool:
     """Быстрая проверка доступности Redis (PING)."""
-    # FIX: идём через _check_circuit_breaker() для авто-восстановления после cooldown
     if not _check_circuit_breaker():
         return False
     res = _execute_upstash_cmd(["PING"])

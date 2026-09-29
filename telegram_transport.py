@@ -1,5 +1,5 @@
 """
-Транспорт для отправки Telegram-дашбордов в Gatekeeper-AI v700-prod.
+Транспорт для отправки Telegram-дашбордов в Gatekeeper-AI v600-prod.
 Гарантирует:
 - корректную разбивку HTML по частям <= 4000 символов без разрыва тегов;
 - балансировку HTML-тегов между чанками;
@@ -211,4 +211,3 @@ def send_telegram_dashboard(dashboard_text: str) -> Dict[str, Any]:
     success = sent_parts == total_parts
     print(f"[TELEGRAM STATUS] Отправлено {sent_parts}/{total_parts} частей. success={success}")
     return {"success": success, "sent_parts": sent_parts, "total_parts": total_parts}
-        
