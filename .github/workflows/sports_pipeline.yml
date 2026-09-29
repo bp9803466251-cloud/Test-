@@ -6,7 +6,7 @@ on:
     - cron: "11 */2 * * *"
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12"
 
 permissions:
   contents: read
@@ -43,8 +43,8 @@ jobs:
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
           SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+          PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python source_diagnostics.py
@@ -60,13 +60,12 @@ jobs:
           SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          # FIX: исправлена опечатка COMPLETENCE -> COMPLETENESS (был mismatch с search_module.py)
           SEARCH_MIN_COMPLETENESS: "0.25"
-          # FIX: добавлен порог value bet (теперь используется в search_module.py после фикса)
           VALUE_BET_THRESHOLD: "0.03"
-          # FIX: убран "unknown" — фильтр источников снова работает
-          GATEKEEPER_VERIFIED_SOURCES: "SharpAPI,api_football,opta,betfair,bzzoiro,odds_api,oddsapi"
+          # v700: verification по upstream, не по списку источников
+          GATEKEEPER_VERIFIED_SOURCES: "sharpapi,propline,bzzoiro,odds_api,oddsapi"
         run: |
           python main.py
           
