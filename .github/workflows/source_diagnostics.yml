@@ -16,7 +16,7 @@ on:
         default: full
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12"
 
 permissions:
   contents: read
@@ -53,8 +53,8 @@ jobs:
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
           SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+          PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           MODE="${{ inputs.mode }}"
@@ -63,3 +63,4 @@ jobs:
           else
             python source_diagnostics.py --${MODE}
           fi
+          
