@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12"
 
 permissions:
   contents: read
@@ -45,5 +45,15 @@ jobs:
           ODDS_API_RATE_DELAY: ${{ vars.ODDS_API_RATE_DELAY || '1.0' }}
           ODDS_API_MAX_RETRIES: ${{ vars.ODDS_API_MAX_RETRIES || '1' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          PYTHONUNBUFFERED: '1'
         run: python collector_odds_api.py
-        
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddsapi-failure-logs
+          path: |
+            *.log
+          retention-days: 7
+          
