@@ -17,7 +17,7 @@ import requests
 
 logging.basicConfig(
     level=logging.INFO,
-    format=\'%(asctime)s - %(levelname)s - [BZZOIRO] %(message)s\'
+    format='%(asctime)s - %(levelname)s - [BZZOIRO] %(message)s'
 )
 
 try:
