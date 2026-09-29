@@ -21,7 +21,11 @@ jobs:
 
     env:
       FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
-      REDIS_URL: ${{ secrets.REDIS_URL }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
       FOOTBALL_DATA_HISTORY_DAYS: ${{ github.event.inputs.history_days || '30' }}
       FOOTBALL_DATA_SEASON: ${{ github.event.inputs.season || '' }}
       FOOTBALL_DATA_RATE_DELAY: ${{ vars.FOOTBALL_DATA_RATE_DELAY || '0.15' }}
