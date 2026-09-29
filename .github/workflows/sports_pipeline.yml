@@ -61,6 +61,7 @@ jobs:
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           SEARCH_MIN_COMPLETENESS: "0.25"
           VALUE_BET_THRESHOLD: "0.03"
