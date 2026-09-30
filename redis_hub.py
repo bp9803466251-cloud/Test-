@@ -192,7 +192,7 @@ def get_all_fields() -> Dict[str, Any]:
     """
     Возвращает все поля хэш-кэша как dict {field_id: value}.
     Использует HSCAN вместо HGETALL — Upstash REST API обрезает ответ
-    HGETALL при 500+ полях (~1 МБ лимит). HSCAN обходит курсорами по COUNT=500, timeout=15с на итерацию.
+    HGETALL при 500+ полях (~1 МБ лимит). HSCAN обходит курсорами по COUNT=500 с таймаутом 15 сек на итерацию.
     """
     result = {}
     cursor = "0"
@@ -232,7 +232,7 @@ def get_all_fields() -> Dict[str, Any]:
         cursor = next_cursor
 
     if iterations >= max_iterations:
-        print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), возможно не все поля прочитаны")
+        print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), прочитано {len(result)} полей, возможно не все")
 
     return result
 

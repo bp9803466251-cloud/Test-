@@ -265,12 +265,10 @@ def diagnose_matches() -> dict:
         if not isinstance(match, dict):
             continue
 
-        # v700: odds хранятся как match["odds"]["1x2"]["current"]["home"]
-        # get_current_odds() извлекает плоский dict из вложенной структуры
-        current_odds = get_current_odds(match)
-        if current_odds and isinstance(current_odds, dict):
-            home_val = current_odds.get("home")
-            if home_val and home_val != "-" and home_val != "":
+        odds_data = get_current_odds(match)
+        if odds_data and isinstance(odds_data, dict):
+            home = odds_data.get("home")
+            if home and home != "-" and home != "":
                 with_odds += 1
 
         value = match.get("value")
@@ -287,15 +285,23 @@ def diagnose_matches() -> dict:
 
         has_pred = False
         has_h2h = False
+        source_map = match.get("source_map", {})
+        if not isinstance(source_map, dict):
+            source_map = {}
+
         predictions = match.get("predictions", {})
-        if isinstance(predictions, dict) and predictions and "source" in predictions:
-            with_predictions += 1
-            has_pred = True
+        if isinstance(predictions, dict) and predictions:
+            meaningful = any(k for k in predictions if not k.startswith("_"))
+            if meaningful or "predictions" in source_map:
+                with_predictions += 1
+                has_pred = True
 
         h2h = match.get("h2h", {})
-        if isinstance(h2h, dict) and h2h and "source" in h2h:
-            with_h2h += 1
-            has_h2h = True
+        if isinstance(h2h, dict) and h2h:
+            meaningful = any(k for k in h2h if not k.startswith("_"))
+            if meaningful or "h2h" in source_map:
+                with_h2h += 1
+                has_h2h = True
 
         if not has_pred or not has_h2h:
             extra = match.get("extra", {})
