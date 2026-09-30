@@ -1,6 +1,6 @@
 # source_diagnostics.py
 """
-Единый модуль диагностики Gatekeeper-AI v600-prod.
+Единый модуль диагностики Gatekeeper-AI v700-prod.
 Заменяет debug_inspect.py и debug_odds.py.
 Объединяет диагностику всех источников, Redis и матчей в одном файле.
 
@@ -154,7 +154,7 @@ def diagnose_sources() -> dict:
     print(f"   ⚽ API-Football: ключ {football_key}")
 
     # Football-Data
-    fd_key = "✅" if os.getenv("FOOTBALL_DATA_TOKEN") else "❌"
+    fd_key = "✅" if os.getenv("FOOTBALL_DATA_API_KEY") else "❌"
     sources["football_data"] = {"key": fd_key}
     print(f"   🌐 Football-Data: ключ {fd_key}")
 
@@ -426,7 +426,7 @@ def print_summary(sources, redis_data, matches_data, errors_data) -> None:
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 60)
-    print("🔧 ДИАГНОСТИКА GATEKEEPER-AI v600-prod")
+    print("🔧 ДИАГНОСТИКА GATEKEEPER-AI v700-prod")
     print(f"   Время: {datetime.now(MSK_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')}")
     print("=" * 60)
 
@@ -463,4 +463,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
