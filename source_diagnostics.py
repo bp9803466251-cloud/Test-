@@ -21,7 +21,6 @@ from gatekeeper_hub import (
     run_initialization,
     get_matches_by_date_range,
     get_all_matches,
-    get_current_odds,
 )
 from redis_hub import get_from_cache, get_all_fields, is_redis_available
 
@@ -149,6 +148,40 @@ def diagnose_sources() -> dict:
         sources["odds_api"] = {"key": oddsapi_key, "last_run": "нет данных"}
         print(f"   🎲 OddsAPI: ключ {oddsapi_key}, мета отсутствует")
 
+    # Propline (Pinnacle)
+    propline_meta = get_from_cache("propline:meta")
+    propline_key = "✅" if os.getenv("PROPLINE_API_KEY") else "❌"
+    if propline_meta and isinstance(propline_meta, dict):
+        events = propline_meta.get("total_events", 0)
+        stored = propline_meta.get("stored_matches", 0)
+        created = propline_meta.get("created", 0)
+        updated = propline_meta.get("updated", 0)
+        error_count = propline_meta.get("error_count", 0)
+        quota_remaining = propline_meta.get("quota_remaining", "?")
+        quota_used = propline_meta.get("quota_used", "?")
+        last_run = propline_meta.get("last_run", "неизвестно")
+        deduped = propline_meta.get("deduped", 0)
+        sources["propline"] = {
+            "key": propline_key,
+            "events": events,
+            "stored": stored,
+            "created": created,
+            "updated": updated,
+            "deduped": deduped,
+            "errors": error_count,
+            "quota_remaining": quota_remaining,
+            "quota_used": quota_used,
+            "last_run": last_run,
+        }
+        print(f"   🏆 Propline: ключ {propline_key}, событий {events}, "
+              f"записано {stored} (создано {created}, обновлено {updated}, "
+              f"дедупликатов {deduped}), ошибок {error_count}")
+        print(f"           Quota: remaining={quota_remaining}, "
+              f"used={quota_used}, last_run: {last_run}")
+    else:
+        sources["propline"] = {"key": propline_key, "last_run": "нет данных"}
+        print(f"   🏆 Propline: ключ {propline_key}, мета отсутствует")
+
     # API-Football
     football_key = "✅" if os.getenv("API_FOOTBALL_KEY") else "❌"
     sources["api_football"] = {"key": football_key}
@@ -265,11 +298,9 @@ def diagnose_matches() -> dict:
         if not isinstance(match, dict):
             continue
 
-        odds_data = get_current_odds(match)
-        if odds_data and isinstance(odds_data, dict):
-            home = odds_data.get("home")
-            if home and home != "-" and home != "":
-                with_odds += 1
+        odds = match.get("odds", {})
+        if isinstance(odds, dict) and odds.get("home") and odds.get("home") != "-":
+            with_odds += 1
 
         value = match.get("value")
         if value is not None:
@@ -285,23 +316,15 @@ def diagnose_matches() -> dict:
 
         has_pred = False
         has_h2h = False
-        source_map = match.get("source_map", {})
-        if not isinstance(source_map, dict):
-            source_map = {}
-
         predictions = match.get("predictions", {})
-        if isinstance(predictions, dict) and predictions:
-            meaningful = any(k for k in predictions if not k.startswith("_"))
-            if meaningful or "predictions" in source_map:
-                with_predictions += 1
-                has_pred = True
+        if isinstance(predictions, dict) and predictions and "source" in predictions:
+            with_predictions += 1
+            has_pred = True
 
         h2h = match.get("h2h", {})
-        if isinstance(h2h, dict) and h2h:
-            meaningful = any(k for k in h2h if not k.startswith("_"))
-            if meaningful or "h2h" in source_map:
-                with_h2h += 1
-                has_h2h = True
+        if isinstance(h2h, dict) and h2h and "source" in h2h:
+            with_h2h += 1
+            has_h2h = True
 
         if not has_pred or not has_h2h:
             extra = match.get("extra", {})
