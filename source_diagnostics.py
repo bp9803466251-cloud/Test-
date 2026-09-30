@@ -262,6 +262,21 @@ def diagnose_redis() -> dict:
     return result
 
 
+
+def get_current_odds(odds_field: Any) -> dict:
+    """Извлекает текущие коэффициенты из v700 формата {current: {home, draw, away}} или плоского."""
+    if not isinstance(odds_field, dict):
+        return {}
+    # v700 nested format
+    current = odds_field.get("current")
+    if isinstance(current, dict):
+        return current
+    # Flat format (legacy)
+    if odds_field.get("home"):
+        return odds_field
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # 3. Диагностика матчей
 # ---------------------------------------------------------------------------
@@ -298,8 +313,8 @@ def diagnose_matches() -> dict:
         if not isinstance(match, dict):
             continue
 
-        odds = match.get("odds", {})
-        if isinstance(odds, dict) and odds.get("home") and odds.get("home") != "-":
+        odds = get_current_odds(match.get("odds", {}))
+        if odds and odds.get("home") and odds.get("home") != "-":
             with_odds += 1
 
         value = match.get("value")
@@ -316,15 +331,22 @@ def diagnose_matches() -> dict:
 
         has_pred = False
         has_h2h = False
+        _PRED_KEYS = {"predicted_home", "predicted_away", "prediction", "home_win_prob",
+                       "away_win_prob", "draw_prob", "predicted_score", "predictions",
+                       "winner", "home_score", "away_score", "home_goals", "away_goals"}
         predictions = match.get("predictions", {})
-        if isinstance(predictions, dict) and predictions and "source" in predictions:
-            with_predictions += 1
-            has_pred = True
+        if isinstance(predictions, dict) and predictions:
+            if any(k in predictions for k in _PRED_KEYS) or len(predictions) > 1:
+                with_predictions += 1
+                has_pred = True
 
+        _H2H_KEYS = {"total", "home_wins", "draws", "away_wins", "recent",
+                     "matches", "head_to_head", "h2h_stats", "results"}
         h2h = match.get("h2h", {})
-        if isinstance(h2h, dict) and h2h and "source" in h2h:
-            with_h2h += 1
-            has_h2h = True
+        if isinstance(h2h, dict) and h2h:
+            if any(k in h2h for k in _H2H_KEYS) or len(h2h) > 1:
+                with_h2h += 1
+                has_h2h = True
 
         if not has_pred or not has_h2h:
             extra = match.get("extra", {})
@@ -421,6 +443,13 @@ def diagnose_errors() -> dict:
         if cas > 0:
             errors.append({"source": "CAS", "count": cas})
             print(f"   🔒 CAS-конфликтов: {cas}")
+
+    propline_meta = get_from_cache("propline:meta")
+    if propline_meta and isinstance(propline_meta, dict):
+        err_count = propline_meta.get("error_count", propline_meta.get("errors", 0))
+        if err_count > 0:
+            errors.append({"source": "propline", "count": err_count})
+            print(f"   🏆 Propline: {err_count} ошибок")
 
     if not errors:
         print("   ✅ Ошибок не обнаружено")
