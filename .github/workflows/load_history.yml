@@ -81,7 +81,7 @@ jobs:
           fi
 
           echo "[WORKFLOW] Loading history: season='$SEASON' league='$LEAGUE' dry='$DRY'"
-          python football_data_loader_v2.py $ARGS
+          python football_data_loader.py $ARGS
 
       - name: Diagnostics after load
         if: ${{ inputs.dry_run != 'yes' }}
