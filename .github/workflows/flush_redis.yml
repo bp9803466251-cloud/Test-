@@ -14,7 +14,7 @@ on:
           - purge
         default: test
       confirm:
-        description: 'Type "yes" to confirm flush/purge'
+        description: 'Type "yes" to confirm (для flush и purge)'
         required: false
         default: 'no'
       hard:
@@ -35,7 +35,7 @@ concurrency:
 jobs:
   flush-redis:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
