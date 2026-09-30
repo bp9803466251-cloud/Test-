@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """redis_diagnostics.py — GATEKEEPER-AI diagnostics"""
 
@@ -7,9 +6,12 @@ import sys
 import json
 import time
 import traceback
+from datetime import datetime, timezone, timedelta
+
 
 def _p(msg):
     print(msg, flush=True)
+
 
 try:
     import redis_hub
@@ -34,12 +36,13 @@ def _safe_json(val):
     if isinstance(val, str):
         try:
             return json.loads(val)
-        except:
+        except Exception:
             return val
     return val
 
 
 def _unwrap(raw):
+    """Extract payload from wrapper."""
     if not isinstance(raw, dict):
         return raw
     if "payload" in raw and isinstance(raw["payload"], dict):
@@ -56,21 +59,6 @@ def _exec(cmd):
         return None
 
 
-def _parse_args(argv):
-    """Parse argv: first --mode sets mode, rest are flags."""
-    mode = ""
-    flags = set()
-    valid_modes = ("test", "history", "flush", "diagnostics", "purge")
-    for arg in argv[1:]:
-        if arg.startswith("--"):
-            val = arg[2:]
-            if mode == "" and val in valid_modes:
-                mode = val
-            else:
-                flags.add(val)
-    return mode, flags
-
-
 def load_all_fields():
     _p("[LOAD] Getting HKEYS...")
     keys = _exec(["HKEYS", "GatekeeperAI"])
@@ -80,7 +68,7 @@ def load_all_fields():
     if isinstance(keys, str):
         try:
             keys = json.loads(keys)
-        except:
+        except Exception:
             keys = [keys]
     _p(f"[LOAD] HKEYS: {len(keys)} keys")
     if not keys:
@@ -104,7 +92,7 @@ def load_all_fields():
         if isinstance(vals, str):
             try:
                 vals = json.loads(vals)
-            except:
+            except Exception:
                 pass
 
         if isinstance(vals, list):
@@ -139,7 +127,7 @@ def _get_season_from_date(date_str):
             return f"{y}/{y + 1}"
         else:
             return f"{y - 1}/{y}"
-    except:
+    except Exception:
         return "?"
 
 
@@ -191,54 +179,93 @@ def _get_status(payload):
     return payload.get("status") or "?"
 
 
-def _check_odds_format(payload):
-    """Check odds format: 1x2 / current / flat / empty / none."""
-    if not isinstance(payload, dict):
-        return "none"
-    odds = payload.get("odds", {})
-    if not isinstance(odds, dict) or not odds:
-        return "none"
-    if "1x2" in odds:
-        s = odds.get("1x2", {})
-        if isinstance(s, dict) and s.get("current"):
-            return "1x2"
-        return "empty"
-    if "current" in odds and isinstance(odds["current"], dict) and odds["current"]:
-        return "current"
-    if any(k in odds for k in ("home", "draw", "away")):
-        return "flat"
-    return "empty"
+# ---------------------------------------------------------------------------
+# Odds format check
+# ---------------------------------------------------------------------------
+def _check_odds_format(match_keys, fields):
+    fmt_1x2 = 0
+    fmt_current = 0
+    fmt_flat = 0
+    fmt_empty = 0
+    fmt_none = 0
+    src_0 = 0
+    src_1 = 0
+    src_2 = 0
+    src_3 = 0
+    ver_verified = 0
+    ver_warning = 0
+    ver_unverified = 0
 
+    for key in match_keys:
+        raw = fields.get(key)
+        payload = _unwrap(raw)
+        if not isinstance(payload, dict):
+            continue
+        odds = payload.get("odds", {})
+        if not isinstance(odds, dict):
+            fmt_none += 1
+            src_0 += 1
+            ver_unverified += 1
+            continue
 
-def _get_sources_count(payload):
-    """Count odds sources."""
-    if not isinstance(payload, dict):
-        return 0
-    odds = payload.get("odds", {})
-    if not isinstance(odds, dict):
-        return 0
-    s = odds.get("1x2", {})
-    if not isinstance(s, dict):
-        return 0
-    sources = s.get("sources", [])
-    return len(sources) if isinstance(sources, list) else 0
+        if "1x2" in odds and isinstance(odds["1x2"], dict):
+            section = odds["1x2"]
+            current = section.get("current", {})
+            if isinstance(current, dict) and current:
+                fmt_1x2 += 1
+            else:
+                fmt_empty += 1
+            sources = section.get("sources", [])
+            n = len(sources) if isinstance(sources, list) else 0
+            if n == 0:
+                src_0 += 1
+            elif n == 1:
+                src_1 += 1
+            elif n == 2:
+                src_2 += 1
+            else:
+                src_3 += 1
+            v = section.get("_verification", "UNVERIFIED")
+            if v == "VERIFIED":
+                ver_verified += 1
+            elif v == "WARNING":
+                ver_warning += 1
+            else:
+                ver_unverified += 1
+        elif "current" in odds and isinstance(odds["current"], dict) and odds["current"]:
+            fmt_current += 1
+            src_0 += 1
+            ver_unverified += 1
+        elif odds:
+            fmt_flat += 1
+            src_0 += 1
+            ver_unverified += 1
+        else:
+            fmt_empty += 1
+            src_0 += 1
+            ver_unverified += 1
 
+    _p(f"\n--- match:* odds format ---")
+    _p(f"  1x2: {fmt_1x2}")
+    _p(f"  current: {fmt_current}")
+    _p(f"  flat: {fmt_flat}")
+    _p(f"  empty: {fmt_empty}")
+    _p(f"  none: {fmt_none}")
 
-def _get_verification(payload):
-    """Get verification level."""
-    if not isinstance(payload, dict):
-        return "UNVERIFIED"
-    odds = payload.get("odds", {})
-    if not isinstance(odds, dict):
-        return "UNVERIFIED"
-    s = odds.get("1x2", {})
-    if not isinstance(s, dict):
-        return "UNVERIFIED"
-    return s.get("_verification", "UNVERIFIED")
+    _p(f"\n--- match:* sources count ---")
+    _p(f"  0+ sources: {src_0}")
+    _p(f"  1+ sources: {src_1}")
+    _p(f"  2+ sources: {src_2}")
+    _p(f"  3+ sources: {src_3}")
+
+    _p(f"\n--- match:* verification ---")
+    _p(f"  VERIFIED: {ver_verified}")
+    _p(f"  WARNING: {ver_warning}")
+    _p(f"  UNVERIFIED: {ver_unverified}")
 
 
 # ---------------------------------------------------------------------------
-# MODE: test
+# Run modes
 # ---------------------------------------------------------------------------
 def run_test():
     _p("=== TEST MODE ===")
@@ -265,30 +292,30 @@ def run_test():
     if isinstance(r, str):
         try:
             r = json.loads(r)
-        except:
+        except Exception:
             r = [r]
     _p(f"  Total: {len(r)}")
     _p(f"  First 10: {r[:10]}")
 
-    _p("\n--- 5. Hub functions test ---")
+    _p("\n--- 5. Hub function tests ---")
     try:
-        from gatekeeper_hub import build_canonical_id, get_match, get_all_odds
-        cid = build_canonical_id("Chelsea", "Arsenal", "2026-09-30T19:00:00Z")
+        cid = gatekeeper_hub.build_canonical_id("Chelsea", "Arsenal", "2026-09-30T15:00:00Z")
         _p(f"  build_canonical_id: {cid}")
-        m = get_match(cid)
-        _p(f"  get_match({cid}): {'found' if m else 'None (expected for new Redis)'}")
+    except Exception as e:
+        _p(f"  build_canonical_id ERROR: {e}")
+
+    try:
+        m = gatekeeper_hub.get_match(cid) if cid else None
+        _p(f"  get_match({cid}): {'OK' if m else 'None (not in cache)'}")
         if m:
-            o = get_all_odds(m)
+            o = gatekeeper_hub.get_all_odds(m)
             _p(f"  get_all_odds: sources={len(o.get('sources', []))}, verification={o.get('verification', '?')}")
     except Exception as e:
-        _p(f"  Hub test error: {e}")
+        _p(f"  get_match/get_all_odds ERROR: {e}")
 
     _p("\n=== TEST COMPLETE ===")
 
 
-# ---------------------------------------------------------------------------
-# MODE: history
-# ---------------------------------------------------------------------------
 def run_history():
     _p("=== HISTORY MODE ===")
     fields = load_all_fields()
@@ -297,24 +324,23 @@ def run_history():
         return
 
     hist_keys = sorted([k for k in fields if k.startswith("history:match:")])
-    match_keys = sorted([k for k in fields if k.startswith("match:") and not k.startswith("history:")])
-    index_keys = sorted([k for k in fields if k.startswith("match:index:") or k.startswith("history:index:") or k.startswith("analysis:index:")])
-    match_keys = [k for k in match_keys if not k.startswith("match:index:")]
-    other_keys = sorted([k for k in fields if not k.startswith("history:match:") and not k.startswith("match:")])
+    match_keys = sorted([k for k in fields if k.startswith("match:")
+                         and not k.startswith("history:")
+                         and not k.startswith("match:index:")])
+    index_keys = sorted([k for k in fields if k.startswith("match:index:")])
+    other_keys = sorted([k for k in fields
+                         if not k.startswith("history:match:")
+                         and not k.startswith("match:")])
 
     _p(f"\n--- Key breakdown ---")
     _p(f"  history:match:* = {len(hist_keys)}")
     _p(f"  match:*         = {len(match_keys)}")
-    _p(f" index:*         = {len(index_keys)}")
+    _p(f"  match:index:*   = {len(index_keys)}")
     _p(f"  other           = {len(other_keys)}")
 
     # --- Parse history ---
     hist_data = {}
     hist_errors = 0
-    hist_odds_formats = {"1x2": 0, "current": 0, "flat": 0, "empty": 0, "none": 0}
-    hist_sources = {0: 0, 1: 0, 2: 0, 3: 0}
-    hist_verification = {"VERIFIED": 0, "WARNING": 0, "UNVERIFIED": 0}
-
     for key in hist_keys:
         raw = fields[key]
         payload = _unwrap(raw)
@@ -342,29 +368,9 @@ def run_history():
             "home": payload.get("home_team") or "?",
             "away": payload.get("away_team") or "?",
         }
-        fmt = _check_odds_format(payload)
-        hist_odds_formats[fmt] = hist_odds_formats.get(fmt, 0) + 1
-        sc = _get_sources_count(payload)
-        bucket = min(sc, 3)
-        hist_sources[bucket] = hist_sources.get(bucket, 0) + 1
-        v = _get_verification(payload)
-        hist_verification[v] = hist_verification.get(v, 0) + 1
 
     _p(f"\n--- History parse ---")
     _p(f"  Parsed: {len(hist_data)}, Errors: {hist_errors}")
-
-    _p(f"\n--- History odds format ---")
-    for k in ("1x2", "current", "flat", "empty", "none"):
-        _p(f"  {k}: {hist_odds_formats.get(k, 0)}")
-
-    _p(f"\n--- History sources count ---")
-    for k in sorted(hist_sources.keys()):
-        label = f"{k}+ sources" if k > 0 else "0 sources"
-        _p(f"  {label}: {hist_sources[k]}")
-
-    _p(f"\n--- History verification ---")
-    for k in ("VERIFIED", "WARNING", "UNVERIFIED"):
-        _p(f"  {k}: {hist_verification.get(k, 0)}")
 
     # --- By season ---
     seasons = {}
@@ -459,7 +465,7 @@ def run_history():
         lg = d["competition"]
         past_leagues[lg] = past_leagues.get(lg, 0) + 1
     _p(f"\n--- Past match:* by league ({len(past_leagues)}) ---")
-    for lg in sorted(past_leagues.keys(), key=lambda x: -past_leagues[x]):
+    for lg in sorted(past_leagues.keys(), key=lambda x: -past_leagues[lg]):
         _p(f"  {lg}: {past_leagues[lg]}")
 
     # --- LOST MATCHES ---
@@ -514,6 +520,7 @@ def run_history():
                 f"score: {d['score_h']}-{d['score_a']} | status: {d['status']} | sender: {d['sender']}")
             _p(f"     key: {d['key']}")
 
+    # --- Verification ---
     _p(f"\n{'=' * 60}")
     _p(f"=== VERIFICATION ===")
     _p(f"  history:match:*  = {len(hist_data)}")
@@ -522,74 +529,89 @@ def run_history():
     _p(f"  match:* unknown  = {len(unknown_match)}")
     _p(f"  Duplicates       = {len(past_match) - len(lost)}")
     _p(f"  Lost             = {len(lost)}")
-    _p(f"  history + lost   = {len(hist_data) + len(lost)}")
+
+    # --- History odds format check ---
+    _p(f"\n--- History odds format check ---")
+    _check_odds_format(hist_keys, fields)
+
     _p(f"\n=== HISTORY COMPLETE ===")
 
 
-# ---------------------------------------------------------------------------
-# MODE: diagnostics
-# ---------------------------------------------------------------------------
-def run_diagnostics():
-    _p("=== DIAGNOSTICS ===")
-    fields = load_all_fields()
-    if not fields:
-        _p("[FATAL] No fields loaded")
-        return
-    hist = [k for k in fields if k.startswith("history:match:")]
-    match_raw = [k for k in fields if k.startswith("match:") and not k.startswith("history:")]
-    index = [k for k in match_raw if k.startswith("match:index:")]
-    match = [k for k in match_raw if not k.startswith("match:index:")]
-    other = [k for k in fields if not k.startswith("history:match:") and not k.startswith("match:")]
+def run_purge(hard=False):
+    """Полная очистка Redis — удаляет ВСЕ ключи из хеша GatekeeperAI."""
+    _p("=== PURGE MODE ===")
+    _p("[PURGE] This will DELETE ALL keys from GatekeeperAI hash!")
 
-    _p(f"\nTotal: {len(fields)} (history={len(hist)}, match={len(match)}, index={len(index)}, other={len(other)})")
-    if other[:10]:
-        _p(f"Other keys sample: {other[:10]}")
-
-    # Odds format check for match:* keys
-    odds_formats = {"1x2": 0, "current": 0, "flat": 0, "empty": 0, "none": 0}
-    sources_count = {0: 0, 1: 0, 2: 0, 3: 0}
-    verification = {"VERIFIED": 0, "WARNING": 0, "UNVERIFIED": 0}
-
-    for key in match:
-        payload = _unwrap(fields[key])
-        fmt = _check_odds_format(payload)
-        odds_formats[fmt] += 1
-        sc = _get_sources_count(payload)
-        bucket = min(sc, 3)
-        sources_count[bucket] = sources_count.get(bucket, 0) + 1
-        v = _get_verification(payload)
-        verification[v] = verification.get(v, 0) + 1
-
-    _p(f"\n--- match:* odds format ---")
-    for k in ("1x2", "current", "flat", "empty", "none"):
-        _p(f"  {k}: {odds_formats[k]}")
-
-    _p(f"\n--- match:* sources count ---")
-    for k in sorted(sources_count.keys()):
-        label = f"{k}+ sources" if k > 0 else "0+ sources"
-        _p(f"  {label}: {sources_count.get(k, 0)}")
-
-    _p(f"\n--- match:* verification ---")
-    for k in ("VERIFIED", "WARNING", "UNVERIFIED"):
-        _p(f"  {k}: {verification.get(k, 0)}")
-
-    _p(f"\n=== DIAGNOSTICS COMPLETE ===")
-
-
-# ---------------------------------------------------------------------------
-# MODE: flush (match:* only)
-# ---------------------------------------------------------------------------
-def run_flush(hard: bool):
-    _p(f"=== FLUSH MODE (hard={hard}) ===")
     keys = _exec(["HKEYS", "GatekeeperAI"])
-    if not keys:
-        _p("[FLUSH] No keys found.")
+    if keys is None:
+        _p("[FATAL] HKEYS returned None")
         return
     if isinstance(keys, str):
         try:
             keys = json.loads(keys)
-        except:
+        except Exception:
             keys = [keys]
+    if not keys:
+        _p("[PURGE] No keys found. Already empty.")
+        return
+
+    _p(f"[PURGE] Found {len(keys)} keys to delete")
+
+    # Breakdown
+    prefixes = {}
+    for k in keys:
+        p = k.split(":")[0] if ":" in k else k
+        prefixes[p] = prefixes.get(p, 0) + 1
+    _p("[PURGE] Breakdown:")
+    for p in sorted(prefixes.keys(), key=lambda x: -prefixes[x]):
+        _p(f"  {p}: = {prefixes[p]}")
+
+    # Batched HDEL — 100 keys per call
+    batch_size = 100
+    total = len(keys)
+    deleted = 0
+    batches_done = 0
+
+    for i in range(0, total, batch_size):
+        batch = keys[i:i + batch_size]
+        result = _exec(["HDEL", "GatekeeperAI"] + batch)
+        if result is None:
+            _p(f"[PURGE] HDEL batch failed at offset {i}, skipping")
+            time.sleep(1)
+            continue
+        deleted += len(batch)
+        batches_done += 1
+        if batches_done % 10 == 0 or deleted >= total:
+            _p(f"[PURGE] Deleted {deleted}/{total}...")
+        time.sleep(0.15)
+
+    _p(f"[PURGE] Done: {deleted} keys deleted.")
+
+    # Verify
+    remaining = _exec(["HLEN", "GatekeeperAI"])
+    _p(f"[PURGE] HLEN after purge: {remaining}")
+    _p("=== PURGE COMPLETE ===")
+
+
+def run_flush(hard=False):
+    """Очистка match:* ключей (hard) или live:* ключей (soft)."""
+    if hard:
+        _p("=== FLUSH MODE (hard=True) ===")
+    else:
+        _p("=== FLUSH MODE (hard=False) ===")
+
+    keys = _exec(["HKEYS", "GatekeeperAI"])
+    if keys is None:
+        _p("[FATAL] HKEYS returned None")
+        return
+    if isinstance(keys, str):
+        try:
+            keys = json.loads(keys)
+        except Exception:
+            keys = [keys]
+    if not keys:
+        _p("[FLUSH] No keys found.")
+        return
 
     if hard:
         to_delete = [k for k in keys if k.startswith("match:")]
@@ -598,65 +620,77 @@ def run_flush(hard: bool):
         to_delete = [k for k in keys if k.startswith("live:")]
         _p(f"[FLUSH] SOFT: deleting {len(to_delete)} live: keys...")
 
-    deleted = 0
-    for k in to_delete:
-        _exec(["HDEL", "GatekeeperAI", k])
-        deleted += 1
-        if deleted % 500 == 0:
-            _p(f"[FLUSH] Deleted {deleted}/{len(to_delete)}...")
-    _p(f"[FLUSH] Done: {deleted} keys deleted.")
-
-
-# ---------------------------------------------------------------------------
-# MODE: purge (ALL keys — complete wipe)
-# ---------------------------------------------------------------------------
-def run_purge():
-    _p("=== PURGE MODE ===")
-    _p("[PURGE] This will DELETE ALL keys from GatekeeperAI hash!")
-    keys = _exec(["HKEYS", "GatekeeperAI"])
-    if not keys:
-        _p("[PURGE] No keys found. Redis is already empty.")
+    if not to_delete:
+        _p("[FLUSH] Nothing to delete.")
         return
-    if isinstance(keys, str):
-        try:
-            keys = json.loads(keys)
-        except:
-            keys = [keys]
 
-    total = len(keys)
-    _p(f"[PURGE] Found {total} keys to delete")
-
-    # Group by prefix for visibility
-    prefixes = {}
-    for k in keys:
-        prefix = k.split(":")[0] + ":" if ":" in k else k
-        prefixes[prefix] = prefixes.get(prefix, 0) + 1
-    _p(f"[PURGE] Breakdown:")
-    for p in sorted(prefixes.keys(), key=lambda x: -prefixes[x]):
-        _p(f"  {p} = {prefixes[p]}")
-
+    # Batched HDEL
+    batch_size = 100
+    total = len(to_delete)
     deleted = 0
-    for k in keys:
-        _exec(["HDEL", "GatekeeperAI", k])
-        deleted += 1
-        if deleted % 500 == 0:
-            _p(f"[PURGE] Deleted {deleted}/{total}...")
-    _p(f"[PURGE] Done: {deleted} keys deleted.")
+    batches_done = 0
 
-    # Verify
-    remaining = _exec(["HLEN", "GatekeeperAI"])
-    _p(f"[PURGE] Verification — HLEN: {remaining}")
+    for i in range(0, total, batch_size):
+        batch = to_delete[i:i + batch_size]
+        result = _exec(["HDEL", "GatekeeperAI"] + batch)
+        if result is None:
+            _p(f"[FLUSH] HDEL batch failed at offset {i}, skipping")
+            time.sleep(1)
+            continue
+        deleted += len(batch)
+        batches_done += 1
+        if batches_done % 10 == 0 or deleted >= total:
+            _p(f"[FLUSH] Deleted {deleted}/{total}...")
+        time.sleep(0.15)
+
+    _p(f"[FLUSH] Done: {deleted} keys deleted.")
+    _p("=== FLUSH COMPLETE ===")
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
+def run_diagnostics():
+    _p("=== DIAGNOSTICS ===")
+    fields = load_all_fields()
+    if not fields:
+        _p("[FATAL] No fields loaded")
+        return
+
+    hist = [k for k in fields if k.startswith("history:match:")]
+    match = [k for k in fields if k.startswith("match:")
+             and not k.startswith("history:")
+             and not k.startswith("match:index:")]
+    index = [k for k in fields if k.startswith("match:index:")]
+    other = [k for k in fields
+             if not k.startswith("history:match:")
+             and not k.startswith("match:")]
+
+    _p(f"\nTotal: {len(fields)} (history={len(hist)}, match={len(match)}, "
+        f"index={len(index)}, other={len(other)})")
+    if other[:10]:
+        _p(f"Other keys sample: {other[:10]}")
+
+    # Odds format check for match:*
+    if match:
+        _check_odds_format(match, fields)
+
+    _p(f"\n=== DIAGNOSTICS COMPLETE ===")
+
+
 if __name__ == "__main__":
     _p(f"[DIAG] Python {sys.version}")
     _p(f"[DIAG] CWD: {os.getcwd()}")
     _p(f"[DIAG] Args: {sys.argv}")
 
-    mode, flags = _parse_args(sys.argv)
+    # Parse args — first --mode wins, rest are flags
+    mode = ""
+    flags = set()
+    for arg in sys.argv[1:]:
+        if arg.startswith("--"):
+            val = arg[2:]
+            if mode == "" and val in ("test", "history", "flush", "purge", "diagnostics"):
+                mode = val
+            else:
+                flags.add(val)
+
     _p(f"[DIAG] Mode: {mode}")
     if flags:
         _p(f"[DIAG] Flags: {sorted(flags)}")
@@ -667,15 +701,15 @@ if __name__ == "__main__":
         elif mode == "history":
             run_history()
         elif mode == "flush":
-            if "yes" in flags:
+            if "yes" not in flags:
+                _p("Use --flush --yes to confirm")
+            else:
                 run_flush(hard="hard" in flags)
-            else:
-                _p("Use --flush --yes to confirm (add --hard for full match:* deletion)")
         elif mode == "purge":
-            if "yes" in flags:
-                run_purge()
+            if "yes" not in flags:
+                _p("Use --purge --yes to confirm")
             else:
-                _p("Use --purge --yes to confirm. This will DELETE EVERYTHING.")
+                run_purge(hard="hard" in flags)
         else:
             run_diagnostics()
     except Exception as e:
