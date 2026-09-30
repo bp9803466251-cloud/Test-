@@ -191,27 +191,49 @@ def field_exists(field_id: str) -> bool:
 def get_all_fields() -> Dict[str, Any]:
     """
     Возвращает все поля хэш-кэша как dict {field_id: value}.
-    Используется для миграций и инициализации.
+    Использует HSCAN вместо HGETALL — Upstash REST API обрезает ответ
+    HGETALL при 500+ полях (~1 МБ лимит). HSCAN обходит курсорами по COUNT=100.
     """
-    res = _execute_upstash_cmd(["HGETALL", IMMUTABLE_ROOT_ADDRESS])
-    if res is None or not isinstance(res, list):
-        return {}
-
     result = {}
-    for i in range(0, len(res), 2):
-        if i + 1 < len(res):
-            key = res[i]
-            raw_value = res[i + 1]
-            if raw_value is None:
-                continue
-            try:
-                envelope = json.loads(raw_value)
-                if isinstance(envelope, dict) and "payload" in envelope:
-                    result[key] = envelope["payload"]
-                else:
-                    result[key] = envelope
-            except (json.JSONDecodeError, TypeError):
-                result[key] = raw_value
+    cursor = "0"
+    iterations = 0
+    max_iterations = 200  # защита от бесконечного цикла (200 × 100 = 20 000 полей)
+
+    while iterations < max_iterations:
+        iterations += 1
+        res = _execute_upstash_cmd(["HSCAN", IMMUTABLE_ROOT_ADDRESS, str(cursor), "COUNT", "100"])
+        if res is None or not isinstance(res, list) or len(res) < 2:
+            break
+
+        next_cursor = res[0]
+        fields = res[1]
+
+        if not isinstance(fields, list):
+            break
+
+        for i in range(0, len(fields), 2):
+            if i + 1 < len(fields):
+                key = fields[i]
+                raw_value = fields[i + 1]
+                if raw_value is None:
+                    continue
+                try:
+                    envelope = json.loads(raw_value)
+                    if isinstance(envelope, dict) and "payload" in envelope:
+                        result[key] = envelope["payload"]
+                    else:
+                        result[key] = envelope
+                except (json.JSONDecodeError, TypeError):
+                    result[key] = raw_value
+
+        # Курсор "0" означает конец сканирования
+        if str(next_cursor) == "0":
+            break
+        cursor = next_cursor
+
+    if iterations >= max_iterations:
+        print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), возможно не все поля прочитаны")
+
     return result
 
 
