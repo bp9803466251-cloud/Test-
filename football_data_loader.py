@@ -3,7 +3,9 @@
 football_data_loader_v2.py — загрузка CSV в Redis в формате GatekeeperAI v5.0
 
 26 полей payload, единый формат odds 1x2, TEAM_ALIASES, stats из 12 колонок,
-source_map, flags, индексы history:team:* / history:league:* / history:index:*
+source_map, flags (extreme_result, abnormal_score, red_card_driven),
+индексы history:team:* / history:league:* / history:index:*,
+конверт v700-prod, Upstash REST API + redis_hub fallback.
 
 Запуск:
   python football_data_loader_v2.py                    # загрузить все CSV из csv_data/
@@ -19,6 +21,8 @@ import csv
 import json
 import time
 import glob
+import urllib.request
+import urllib.error
 import traceback
 from datetime import datetime, timezone, timedelta
 
@@ -50,6 +54,17 @@ LEAGUE_MAP = {
     "P1":  ("Primeira Liga",        "Portugal"),
     "T1":  ("Super Lig",            "Turkey"),
     "G1":  ("Super League",         "Greece"),
+}
+
+# ---------------------------------------------------------------------------
+# UPSTREAM_MAP (v5.0 — единый словарь upstream-провайдеров)
+# ---------------------------------------------------------------------------
+UPSTREAM_MAP = {
+    "sharpapi": "betradar",
+    "odds_api": "betradar",
+    "bzzoiro": "opta",
+    "propline": "pinnacle",
+    "football_data": "bet365",
 }
 
 # ---------------------------------------------------------------------------
@@ -124,7 +139,6 @@ TEAM_ALIASES = {
     "oxford": "oxford", "oxford united": "oxford",
     "bristol rovers": "bristol_rovers",
     "plymouth": "plymouth", "plymouth argyle": "plymouth",
-    "portsmouth": "portsmouth",
     "accrington": "accrington", "accrington stanley": "accrington",
     "lincoln": "lincoln", "lincoln city": "lincoln",
     "sutton": "sutton", "sutton united": "sutton",
@@ -152,7 +166,6 @@ TEAM_ALIASES = {
     "exeter": "exeter", "exeter city": "exeter",
     "salford": "salford", "salford city": "salford",
     "leyton orient": "leyton_orient",
-    "wigan": "wigan",
 
     # Scotland
     "celtic": "celtic",
@@ -214,7 +227,6 @@ TEAM_ALIASES = {
     "oviedo": "oviedo", "real oviedo": "oviedo",
     "gijon": "gijon", "sporting gijon": "gijon",
     "zaragoza": "zaragoza", "real zaragoza": "zaragoza",
-    "elche": "elche",
 
     # Italy
     "inter": "inter", "inter milan": "inter", "internazionale": "inter",
@@ -245,7 +257,7 @@ TEAM_ALIASES = {
     "venezia": "venezia",
     "como": "como",
     "brescia": "brescia",
-    "palerma": "palermo", "palermo": "palermo",
+    "palermo": "palermo",
     "modena": "modena",
     "reggiana": "reggiana",
     "ternana": "ternana",
@@ -357,7 +369,7 @@ TEAM_ALIASES = {
     "excelsior": "excelsior",
     "nec": "nec", "nec nijmegen": "nec",
     "willem ii": "willem_ii",
-    " Den Haag": "den_haag", "ado den haag": "den_haag",
+    "den haag": "den_haag", "ado den haag": "den_haag",
 
     # Belgium
     "club brugge": "club_brugge",
@@ -375,7 +387,7 @@ TEAM_ALIASES = {
     "eupen": "eupen",
     "stvv": "stvv", "sint-truiden": "stvv",
     "westerlo": "westerlo",
-    "RFC": "rfc_seraing", "seraing": "rfc_seraing",
+    "rfc seraing": "rfc_seraing", "seraing": "rfc_seraing",
     "beerschot": "beerschot",
     "lommel": "lommel",
 
@@ -447,15 +459,7 @@ TEAM_ALIASES = {
     "xanthi": "xanthi",
 }
 
-UPSTREAM_MAP = {
-    "sharpapi": "betradar",
-    "odds_api": "betradar",
-    "bzzoiro": "opta",
-    "propline": "pinnacle",
-    "football_data": "bet365",
-}
-
-# Odds priority: B365 → BbAv → IW → LB → WH → VC
+# Odds priority: B365 -> BbAv -> IW -> LB -> WH -> VC
 ODDS_PRIORITY = [
     ("B365H", "B365D", "B365A", "bet365"),
     ("BbAvH", "BbAvD", "BbAvA", "betbrain_avg"),
@@ -463,11 +467,6 @@ ODDS_PRIORITY = [
     ("LBH", "LBD", "LBA", "ladbrokes"),
     ("WHH", "WHD", "WHA", "william_hill"),
     ("VCH", "VCD", "VCA", "vc_bet"),
-]
-
-# Opening odds priority (same sources, but "opening" columns if available)
-ODDS_OPENING_PRIORITY = [
-    ("Bb1X2", None, None),  # not standard, skip
 ]
 
 
@@ -478,8 +477,8 @@ def now_msk():
     return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
 
 
-def _p(msg):
-    print(msg, flush=True)
+def _p(msg, end="\n"):
+    print(msg, flush=True, end=end)
 
 
 def clean_team_name(name):
@@ -487,10 +486,8 @@ def clean_team_name(name):
     if not name:
         return ""
     name_lower = name.strip().lower()
-    # Прямой lookup в алиасах
     if name_lower in TEAM_ALIASES:
         return TEAM_ALIASES[name_lower]
-    # Fallback: убрать артикли, привести к нижнему регистру, заменить пробелы на _
     cleaned = name_lower
     for prefix in ["fc ", "afc ", "ssc ", "ss ", "sc ", "us ", "as ", "ac ",
                    "vfl ", "vfb ", "tsg ", "sv ", "rb ", "1. ", "1fc ", "b. "]:
@@ -503,27 +500,38 @@ def clean_team_name(name):
 
 
 def parse_csv_filename(filepath):
-    """2526_E0.csv → season='2526', league_code='E0'"""
+    """Извлекает season и league_code из пути файла.
+
+    Поддерживает два формата:
+      csv_data/2526/E0.csv  -> season='2526', league_code='E0'
+      csv_data/2526_E0.csv  -> season='2526', league_code='E0'
+    """
     base = os.path.basename(filepath).replace(".csv", "")
+    parent = os.path.basename(os.path.dirname(filepath))
+
+    # Формат 1: csv_data/2526/E0.csv -> parent='2526', base='E0'
+    if parent and len(parent) == 4 and parent.isdigit():
+        return parent, base
+
+    # Формат 2: 2526_E0.csv -> split by '_'
     parts = base.split("_")
-    if len(parts) >= 2:
+    if len(parts) >= 2 and len(parts[0]) == 4 and parts[0].isdigit():
         return parts[0], parts[1]
+
     return None, None
 
 
 def normalize_date(date_str):
-    """DD/MM/YYYY → ISO 8601 UTC (00:00:00Z — время неизвестно для history)."""
+    """DD/MM/YYYY -> ISO 8601 UTC (00:00:00Z)."""
     if not date_str:
         return None
     date_str = date_str.strip()
-    # Форматы: DD/MM/YYYY или DD/MM/YY
     for fmt in ("%d/%m/%Y", "%d/%m/%y"):
         try:
             dt = datetime.strptime(date_str, fmt)
             return dt.strftime("%Y-%m-%dT00:00:00Z")
         except ValueError:
             continue
-    # Формат ISO уже
     try:
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         return dt.strftime("%Y-%m-%dT00:00:00Z")
@@ -532,7 +540,7 @@ def normalize_date(date_str):
 
 
 def date_to_yyyymmdd(iso_date):
-    """2024-12-04T00:00:00Z → 20241204"""
+    """2024-12-04T00:00:00Z -> 20241204"""
     if not iso_date or len(iso_date) < 10:
         return None
     return iso_date[:10].replace("-", "")
@@ -601,42 +609,31 @@ def parse_match_stats(row, ts):
 def parse_odds(row, ts):
     """Парсит коэффициенты в формате 1x2 с приоритетом источников."""
     current = {}
-    opening = {}
-    source_name = None
-    upstream = "bet365"
 
-    # Current odds — по приоритету
     for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
-        h = row.get(h_col, "").strip() if row.get(h_col) else ""
-        d = row.get(d_col, "").strip() if row.get(d_col) else ""
-        a = row.get(a_col, "").strip() if row.get(a_col) else ""
+        h = (row.get(h_col) or "").strip()
+        d = (row.get(d_col) or "").strip()
+        a = (row.get(a_col) or "").strip()
         if h and d and a and h != "-" and d != "-" and a != "-":
             try:
-                float(h)
-                float(d)
-                float(a)
+                float(h); float(d); float(a)
                 current = {"home": h, "draw": d, "away": a}
-                source_name = bk_name
                 break
             except ValueError:
                 continue
 
-    # Opening odds — Bb1X2 или те же B365 (если нет отдельного opening)
-    # football-data.co.uk не имеет отдельных opening колонок для 1x2
-    # Используем те же коэффициенты как opening (conservative)
-    if current:
-        opening = dict(current)
-
     if not current:
         return None
 
-    # Best — максимум по каждому исходу
-    best = {}
+    # football-data.co.uk не имеет отдельных opening колонок -> копия current
+    opening = dict(current)
+
+    # Best — максимум по каждому исходу из всех букмекеров
     all_odds = {}
     for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
-        h = row.get(h_col, "").strip() if row.get(h_col) else ""
-        d = row.get(d_col, "").strip() if row.get(d_col) else ""
-        a = row.get(a_col, "").strip() if row.get(a_col) else ""
+        h = (row.get(h_col) or "").strip()
+        d = (row.get(d_col) or "").strip()
+        a = (row.get(a_col) or "").strip()
         if h and d and a and h != "-" and d != "-" and a != "-":
             try:
                 fh, fd, fa = float(h), float(d), float(a)
@@ -657,7 +654,7 @@ def parse_odds(row, ts):
 
     source_entry = {
         "source": "football_data",
-        "upstream": upstream,
+        "upstream": "bet365",
         "price": current,
         "timestamp": ts,
         "type": "closing",
@@ -674,32 +671,39 @@ def parse_odds(row, ts):
 
 
 def compute_flags(score, stats):
-    """Вычисляет флаги: extreme_result, red_card_driven."""
-    flags = {}
+    """Вычисляет флаги v5.0: extreme_result, abnormal_score, red_card_driven.
+
+    По гайду v5.0 раздел 22 + раздел 39.2:
+      abnormal_score: |score_diff| >= 4
+      red_card_driven: red card in match
+      extreme_result: True if abnormal_score OR red_card_driven
+    """
+    flags = {
+        "extreme_result": False,
+        "abnormal_score": False,
+        "red_card_driven": False,
+    }
     if not score:
         return flags
 
-    h = score.get("home", 0) or 0
-    a = score.get("away", 0) or 0
-    total = h + a
-    diff = abs(h - a)
+    diff = abs((score.get("home", 0) or 0) - (score.get("away", 0) or 0))
 
-    # extreme_result: разница в 3+ голов ИЛИ 5+ всего
-    if diff >= 3 or total >= 5:
+    # abnormal_score: разница 4+ голов
+    if diff >= 4:
+        flags["abnormal_score"] = True
         flags["extreme_result"] = True
 
     # red_card_driven: красная карточка в матче
     if stats:
-        if stats.get("red_home", 0) and stats["red_home"] > 0:
+        if (stats.get("red_home", 0) or 0) > 0 or (stats.get("red_away", 0) or 0) > 0:
             flags["red_card_driven"] = True
-        elif stats.get("red_away", 0) and stats["red_away"] > 0:
-            flags["red_card_driven"] = True
+            flags["extreme_result"] = True
 
     return flags
 
 
 def build_payload(row, season, league_code, ts):
-    """Собирает 26-полейный payload v5.0 из строки CSV."""
+    """Собирает 26-польный payload v5.0 из строки CSV."""
     home_team = (row.get("HomeTeam") or "").strip()
     away_team = (row.get("AwayTeam") or "").strip()
 
@@ -758,7 +762,7 @@ def build_payload(row, season, league_code, ts):
     # Flags
     flags = compute_flags(score, stats)
 
-    # Source map
+    # Source map (v5.0 — DQS Source Independence)
     source_map = {
         "odds": {
             "source": "football_data",
@@ -775,7 +779,7 @@ def build_payload(row, season, league_code, ts):
         },
     }
 
-    # 26-field payload
+    # 26-field payload (v5.0)
     payload = {
         "canonical_id": canonical_id,
         "home_team": home_team,
@@ -805,9 +809,11 @@ def build_payload(row, season, league_code, ts):
         "sources": ["football_data"],
         "section_history": [],
         "flags": flags,
+        "created_at": ts,
+        "updated_at": ts,
     }
 
-    # Дополнительные поля (не входят в 26, но добавляются при наличии)
+    # Дополнительные поля (при наличии в CSV)
     if half_time:
         payload["half_time_score"] = half_time
     if full_time_result:
@@ -815,7 +821,7 @@ def build_payload(row, season, league_code, ts):
     if referee:
         payload["referee"] = referee
 
-    # Wrapper (конверт)
+    # Wrapper (конверт v700-prod)
     wrapper = {
         "version": "v700-prod",
         "sender_repo": "football_data_loader",
@@ -827,22 +833,72 @@ def build_payload(row, season, league_code, ts):
 
 
 # ---------------------------------------------------------------------------
-# Redis interaction (through redis_hub)
+# Redis interaction
+# Сначала пробуем redis_hub (локально в Termux), потом Upstash REST API (CI)
 # ---------------------------------------------------------------------------
-try:
-    import redis_hub
-    _p("[LOADER] Import redis_hub: OK")
-except Exception as e:
-    _p(f"[FATAL] Cannot import redis_hub: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+_REDIS_MODE = None  # "redis_hub" | "upstash" | None
+_redis_hub = None
+_upstash_url = None
+_upstash_token = None
+
+
+def _init_redis():
+    """Инициализирует подключение к Redis."""
+    global _REDIS_MODE, _redis_hub, _upstash_url, _upstash_token
+
+    # Пробуем redis_hub (локально)
+    try:
+        import redis_hub
+        _redis_hub = redis_hub
+        _REDIS_MODE = "redis_hub"
+        _p("[LOADER] Redis mode: redis_hub (local)")
+        return True
+    except ImportError:
+        pass
+
+    # Пробуем Upstash REST API (GitHub Actions)
+    _upstash_url = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+    _upstash_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+    if _upstash_url and _upstash_token:
+        _REDIS_MODE = "upstash"
+        _p("[LOADER] Redis mode: Upstash REST API (CI)")
+        return True
+
+    _p("[FATAL] No Redis connection available (redis_hub or UPSTASH_REDIS_REST_*)")
+    return False
+
+
+def _upstash_exec(cmd):
+    """Выполняет команду через Upstash REST API."""
+    url = f"{_upstash_url}/{'/'.join(cmd)}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {_upstash_token}",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        _p(f"[ERROR] Upstash HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:200]}")
+        return None
+    except Exception as e:
+        _p(f"[ERROR] Upstash request failed: {e}")
+        return None
 
 
 def _exec(cmd):
+    """Выполняет Redis команду через доступный backend."""
     try:
-        return redis_hub._execute_upstash_cmd(cmd)
+        if _REDIS_MODE == "redis_hub":
+            return _redis_hub._execute_upstash_cmd(cmd)
+        elif _REDIS_MODE == "upstash":
+            return _upstash_exec(cmd)
+        else:
+            _p("[ERROR] Redis not initialized")
+            return None
     except Exception as e:
-        _p(f"[ERROR] _execute_upstash_cmd({cmd[0]}) failed: {e}")
+        _p(f"[ERROR] _exec({cmd[0]}) failed: {e}")
         return None
 
 
@@ -850,7 +906,6 @@ def save_batch_to_redis(batch):
     """Записывает батч матчей через HMSET (по 10)."""
     if not batch:
         return 0
-    # batch = list of (history_key, json_wrapper)
     hset_args = []
     for history_key, json_wrapper in batch:
         hset_args.append(history_key)
@@ -864,7 +919,6 @@ def save_index(index_key, cid_list):
     """Сохраняет индексный ключ."""
     if not cid_list:
         return
-    # Сохраняем как JSON-список
     wrapper = {
         "version": "v700-prod",
         "sender_repo": "football_data_loader",
@@ -890,10 +944,9 @@ def process_csv(filepath, dry_run=False):
     batch = []
     batch_size = 10
 
-    # Индексы для этого файла
-    team_index = {}  # team_clean → [cid, ...]
-    league_index = []  # [cid, ...]
-    date_index = {}  # yyyymmdd → [cid, ...]
+    team_index = {}
+    league_index = []
+    date_index = {}
 
     try:
         with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
@@ -916,7 +969,6 @@ def process_csv(filepath, dry_run=False):
                 history_key = f"history:match:{cid}"
                 json_wrapper = json.dumps(wrapper, ensure_ascii=False)
 
-                # Накапливаем индексы
                 payload = wrapper["payload"]
                 home_clean = payload["home_clean"]
                 away_clean = payload["away_clean"]
@@ -937,7 +989,6 @@ def process_csv(filepath, dry_run=False):
                 else:
                     stats_summary["loaded"] += 1
 
-                # Прогресс
                 if stats_summary["total"] % 100 == 0:
                     _p(f"  [PROG] Parsed {stats_summary['total']} rows, loaded {stats_summary['loaded']}...")
 
@@ -950,12 +1001,10 @@ def process_csv(filepath, dry_run=False):
         if not dry_run and league_index:
             _p(f"  [INDEX] Creating indexes for {len(league_index)} matches...")
 
-            # League index
             league_key = f"history:league:{league_code}"
             save_index(league_key, league_index)
             time.sleep(0.1)
 
-            # Team indexes (батч по 10)
             team_items = list(team_index.items())
             for i in range(0, len(team_items), 10):
                 batch_team = team_items[i:i+10]
@@ -964,7 +1013,6 @@ def process_csv(filepath, dry_run=False):
                     save_index(team_key, cids)
                 time.sleep(0.1)
 
-            # Date indexes
             for date_str, cids in date_index.items():
                 date_key = f"history:index:{date_str}"
                 save_index(date_key, cids)
@@ -996,15 +1044,23 @@ def main():
     filter_league = None
     dry_run = False
 
-    for i, arg in enumerate(sys.argv[1:]):
-        if arg == "--dir" and i + 1 < len(sys.argv) - 1:
-            base_dir = sys.argv[i + 2]
-        elif arg == "--season" and i + 1 < len(sys.argv) - 1:
-            filter_season = sys.argv[i + 2]
-        elif arg == "--league" and i + 1 < len(sys.argv) - 1:
-            filter_league = sys.argv[i + 2]
-        elif arg == "--dry-run":
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--dir" and i + 1 < len(args):
+            base_dir = args[i + 1]
+            i += 2
+        elif args[i] == "--season" and i + 1 < len(args):
+            filter_season = args[i + 1]
+            i += 2
+        elif args[i] == "--league" and i + 1 < len(args):
+            filter_league = args[i + 1]
+            i += 2
+        elif args[i] == "--dry-run":
             dry_run = True
+            i += 1
+        else:
+            i += 1
 
     # Find CSV files
     pattern = os.path.join(base_dir, "**", "*.csv")
@@ -1030,6 +1086,9 @@ def main():
     _p(f"\n[INFO] Found {len(all_csvs)} CSV files")
     if dry_run:
         _p("[INFO] DRY RUN — no Redis writes")
+    else:
+        if not _init_redis():
+            sys.exit(1)
     _p(f"[INFO] TEAM_ALIASES: {len(TEAM_ALIASES)} entries")
     _p(f"[INFO] LEAGUE_MAP: {len(LEAGUE_MAP)} leagues")
 
@@ -1041,7 +1100,8 @@ def main():
         for k in ("total", "loaded", "errors"):
             grand_total[k] += s.get(k, 0)
         grand_total["files"] += 1
-        time.sleep(0.3)
+        if not dry_run:
+            time.sleep(0.3)
 
     # Summary
     _p("\n" + "=" * 60)
