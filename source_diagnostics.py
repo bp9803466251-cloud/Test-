@@ -15,7 +15,7 @@ import os
 import sys
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from gatekeeper_hub import (
     run_initialization,
@@ -26,109 +26,101 @@ from redis_hub import get_from_cache, get_all_fields, is_redis_available
 
 MSK_TIMEZONE = timezone(timedelta(hours=3))
 
-
 # ---------------------------------------------------------------------------
-# Хелперы для v700-совместимого чтения odds/h2h/predictions
+# Хелперы для определения формата данных (v700 поддерживает 3 формата odds)
 # ---------------------------------------------------------------------------
 
-def _get_current_odds(match: dict) -> bool:
-    """Проверяет, есть ли реальные коэффициенты в v700-формате."""
-    odds = match.get("odds", {})
-    if not isinstance(odds, dict):
-        return False
+def _get_current_odds(match: dict) -> Optional[dict]:
+    """
+    Извлекает текущие коэффициенты из матча.
+    Поддерживает 3 формата (см. Гид v3.0, Раздел 21.1):
+      1. Плоский:       odds = {"home": "1.85", "draw": "3.60", "away": "2.10"}
+      2. Структурированный: odds = {"current": {"home": ..., "draw": ..., "away": ...}}
+      3. TO-BE:         odds = {"1x2": {"current": {"home": ...}, "sources": [...]}}
+    Возвращает {"home": ..., "draw": ..., "away": ...} или None.
+    """
+    odds = match.get("odds")
+    if not odds or not isinstance(odds, dict):
+        return None
 
-    # v700: odds.current.{home, draw, away}
-    current = odds.get("current", {})
-    if isinstance(current, dict):
-        h = current.get("home")
-        d = current.get("draw")
-        a = current.get("away")
-        if h and str(h) != "-" and str(h) != "":
-            return True
-        if a and str(a) != "-" and str(a) != "":
-            return True
-        if d and str(d) != "-" and str(d) != "":
-            return True
+    # Формат 3: TO-BE — odds.1x2.current.{home,draw,away}
+    x12 = odds.get("1x2")
+    if isinstance(x12, dict):
+        current = x12.get("current")
+        if isinstance(current, dict) and current.get("home") and str(current.get("home")) != "-":
+            return current
+        # Maybe sources[0].price
+        sources = x12.get("sources")
+        if isinstance(sources, list) and sources:
+            for s in sources:
+                price = s.get("price") if isinstance(s, dict) else None
+                if isinstance(price, dict) and price.get("home") and str(price.get("home")) != "-":
+                    return price
 
-    # Fallback: плоский формат odds.{home, draw, away}
-    h = odds.get("home")
-    if h and str(h) != "-" and str(h) != "":
-        return True
-    a = odds.get("away")
-    if a and str(a) != "-" and str(a) != "":
-        return True
+    # Формат 2: структурированный — odds.current.{home,draw,away}
+    current = odds.get("current")
+    if isinstance(current, dict) and current.get("home") and str(current.get("home")) != "-":
+        return current
 
-    # Fallback: sources[] массив с odds
-    sources = odds.get("sources", [])
-    if isinstance(sources, list):
+    # Формат 2b: odds.sources[].price.{home,draw,away} (struct without current)
+    sources = odds.get("sources")
+    if isinstance(sources, list) and sources:
         for s in sources:
-            if not isinstance(s, dict):
-                continue
-            cur = s.get("current", {})
-            if isinstance(cur, dict):
-                h = cur.get("home")
-                if h and str(h) != "-" and str(h) != "":
-                    return True
-                a = cur.get("away")
-                if a and str(a) != "-" and str(a) != "":
-                    return True
+            price = s.get("price") if isinstance(s, dict) else None
+            if isinstance(price, dict) and price.get("home") and str(price.get("home")) != "-":
+                return price
 
-    return False
+    # Формат 1: плоский — odds.{home,draw,away}
+    if odds.get("home") and str(odds.get("home")) != "-":
+        return odds
+
+    return None
 
 
 def _has_meaningful_h2h(match: dict) -> bool:
-    """Проверяет, есть ли реальные H2H-данные в v700-формате."""
-    h2h = match.get("h2h", {})
-    if not isinstance(h2h, dict) or not h2h:
+    """
+    Проверяет, есть ли реальная H2H-секция.
+    Гид v3.0 Раздел 1.3.3: Bzzoiro пишет {source, total_meetings, home_wins, draws, away_wins}.
+    Но patch_match() может не включать source в data-dict (только в section_history).
+    Поэтому проверяем meaningful keys, а не только "source".
+    """
+    h2h = match.get("h2h")
+    if not h2h or not isinstance(h2h, dict):
         return False
 
-    # v700: meaningful keys
-    meaningful_keys = ("total", "home_wins", "draws", "away_wins", "recent")
-    for k in meaningful_keys:
-        v = h2h.get(k)
-        if v is not None and v != 0 and v != []:
-            return True
-
-    # Fallback: "source" in h2h (старый формат)
-    if "source" in h2h:
+    # Гид: {total_meetings, home_wins, draws, away_wins} — без source
+    # Факт: {source, total_meetings, ...} — с source (зависит от коллектора)
+    meaningful_keys = {"total_meetings", "total", "home_wins", "draws",
+                       "away_wins", "recent", "meetings"}
+    if any(k in h2h for k in meaningful_keys):
         return True
-
-    # Fallback: extra.bzzoiro_h2h
-    extra = match.get("extra", {})
-    if isinstance(extra, dict) and "bzzoiro_h2h" in extra:
+    # Fallback: "source" key (старый формат)
+    if "source" in h2h and len(h2h) > 1:
         return True
-
     return False
 
 
 def _has_meaningful_pred(match: dict) -> bool:
-    """Проверяет, есть ли реальные predictions в v700-формате."""
-    predictions = match.get("predictions", {})
-    if not isinstance(predictions, dict) or not predictions:
+    """
+    Проверяет, есть ли реальная predictions-секция.
+    Гид v3.0 Раздел 1.3.3: {source, home_win, draw, away_win}.
+    Но patch_match() может не включать source в data-dict.
+    """
+    pred = match.get("predictions")
+    if not pred or not isinstance(pred, dict):
         return False
 
-    # v700: meaningful keys
-    meaningful_keys = (
-        "predicted_home", "predicted_away", "home_win_prob",
-        "away_win_prob", "draw_prob", "winner", "predicted_score",
-        "prediction", "confidence", "model",
-    )
-    for k in meaningful_keys:
-        v = predictions.get(k)
-        if v is not None and v != "":
-            return True
-
-    # Fallback: "source" in predictions (старый формат)
-    if "source" in predictions:
+    # Гид: {home_win, draw, away_win} — без source
+    # Факт: {source, home_win, ...} — с source
+    meaningful_keys = {"home_win", "draw", "away_win", "predicted_home",
+                       "predicted_away", "home_win_prob", "away_win_prob",
+                       "winner", "prediction"}
+    if any(k in pred for k in meaningful_keys):
         return True
-
-    # Fallback: extra.bzzoiro_prediction
-    extra = match.get("extra", {})
-    if isinstance(extra, dict) and "bzzoiro_prediction" in extra:
+    # Fallback: "source" key (старый формат)
+    if "source" in pred and len(pred) > 1:
         return True
-
     return False
-
 
 
 # ---------------------------------------------------------------------------
@@ -397,14 +389,35 @@ def diagnose_matches() -> dict:
     source_counts = {}
     now = datetime.now(MSK_TIMEZONE)
     ages = []
+    # Debug: запомним структуры odds для первых 5 матчей
+    _odds_debug_samples = []
+    _odds_debug_no_odds = []
 
     for match_id, match in matches.items():
         if not isinstance(match, dict):
             continue
 
-        if _get_current_odds(match):
+        # --- Odds: поддержка 3 форматов (Гид v3.0 Раздел 21.1) ---
+        odds_found = _get_current_odds(match)
+        if odds_found:
             with_odds += 1
+            if len(_odds_debug_samples) < 3:
+                _odds_debug_samples.append({
+                    "id": match_id,
+                    "odds_keys": list(match.get("odds", {}).keys()),
+                    "odds_sample": json.dumps(match.get("odds", {}), ensure_ascii=False)[:300],
+                })
+        else:
+            if len(_odds_debug_no_odds) < 3:
+                odds_raw = match.get("odds")
+                _odds_debug_no_odds.append({
+                    "id": match_id,
+                    "odds_type": type(odds_raw).__name__,
+                    "odds_value": json.dumps(odds_raw, ensure_ascii=False)[:200] if odds_raw else "None/empty",
+                    "sources": match.get("sources", []),
+                })
 
+        # --- Value bet ---
         value = match.get("value")
         if value is not None:
             try:
@@ -413,21 +426,26 @@ def diagnose_matches() -> dict:
             except (ValueError, TypeError):
                 pass
 
+        # --- Stats ---
         stats = match.get("stats", {})
         if isinstance(stats, dict) and stats:
             with_stats += 1
 
+        # --- Predictions: meaningful keys (Гид v3.0 Раздел 1.3.3) ---
         if _has_meaningful_pred(match):
             with_predictions += 1
 
+        # --- H2H: meaningful keys (Гид v3.0 Раздел 1.3.3) ---
         if _has_meaningful_h2h(match):
             with_h2h += 1
 
+        # --- Sources ---
         sources_list = match.get("sources", [])
         if isinstance(sources_list, list):
             for s in sources_list:
                 source_counts[s] = source_counts.get(s, 0) + 1
 
+        # --- Age ---
         created = match.get("created_at", "")
         if created:
             try:
@@ -465,6 +483,19 @@ def diagnose_matches() -> dict:
     missing_odds = total - with_odds
     if missing_odds > 0:
         print(f"   ⚠️ Без коэффициентов: {missing_odds} матчей")
+
+    # Debug: показываем структуру odds для диагностики формата
+    if _odds_debug_samples:
+        print(f"\n   🔍 Образцы odds (найдены):")
+        for s in _odds_debug_samples:
+            print(f"     • {s['id']}: keys={s['odds_keys']}")
+            print(f"       {s['odds_sample']}")
+
+    if _odds_debug_no_odds:
+        print(f"\n   🔍 Образцы без odds:")
+        for s in _odds_debug_no_odds:
+            print(f"     • {s['id']}: type={s['odds_type']}, sources={s['sources']}")
+            print(f"       {s['odds_value']}")
 
     return result
 
@@ -504,20 +535,20 @@ def diagnose_errors() -> dict:
             errors.append({"source": "odds_api", "count": err_count})
             print(f"   🎲 OddsAPI: {err_count} ошибок")
 
+    # Propline
+    propline_meta = get_from_cache("propline:meta")
+    if propline_meta and isinstance(propline_meta, dict):
+        err_count = propline_meta.get("error_count", 0)
+        if err_count > 0:
+            errors.append({"source": "propline", "count": err_count})
+            print(f"   🏆 Propline: {err_count} ошибок")
+
     health = get_from_cache("system:health")
     if health and isinstance(health, dict):
         cas = health.get("cas_conflicts_total", 0)
         if cas > 0:
             errors.append({"source": "CAS", "count": cas})
             print(f"   🔒 CAS-конфликтов: {cas}")
-
-    # Propline
-    propline_meta = get_from_cache("propline:meta")
-    if propline_meta and isinstance(propline_meta, dict):
-        err_count = propline_meta.get("error_count", propline_meta.get("errors", 0))
-        if err_count > 0:
-            errors.append({"source": "propline", "count": err_count})
-            print(f"   🏆 Propline: {err_count} ошибок")
 
     if not errors:
         print("   ✅ Ошибок не обнаружено")
