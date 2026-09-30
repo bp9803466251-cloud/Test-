@@ -503,31 +503,23 @@ def clean_team_name(name):
 
 
 def parse_csv_filename(filepath):
-    """Парсит путь к CSV. Поддерживает два формата:
-    - csv_data/2526/E0.csv  → season='2526', league_code='E0'  (из директории + файла)
-    - 2526_E0.csv           → season='2526', league_code='E0'  (из имени файла)
+    """Парсит season и league_code из пути файла.
+    Поддерживает два формата:
+      csv_data/2526/E0.csv  → season='2526', league_code='E0'  (сезон из директории)
+      2526_E0.csv           → season='2526', league_code='E0'  (старый формат)
     """
-    basename = os.path.basename(filepath).replace(".csv", "")  # E0 or 2526_E0
-    dirname = os.path.basename(os.path.dirname(filepath))      # 2526 or ""
+    base = os.path.basename(filepath).replace(".csv", "")
 
-    # Формат csv_data/2526/E0.csv: season из директории, league из файла
-    if dirname and len(dirname) == 4 and dirname.isdigit():
-        # basename is just the league code (e.g. "E0")
-        # But could also be "2526_E0" — check
-        if "_" in basename:
-            parts = basename.split("_")
-            if len(parts) >= 2 and len(parts[0]) == 4 and parts[0].isdigit():
-                return parts[0], parts[1]
-        return dirname, basename
+    # Формат 1: csv_data/2526/E0.csv — сезон из имени директории
+    parent = os.path.basename(os.path.dirname(filepath))
+    if parent and len(parent) == 4 and parent.isdigit():
+        return parent, base
 
-    # Формат 2526_E0.csv: split по _
-    parts = basename.split("_")
+    # Формат 2: 2526_E0.csv — старый формат с разделителем _
+    parts = base.split("_")
     if len(parts) >= 2 and len(parts[0]) == 4 and parts[0].isdigit():
         return parts[0], parts[1]
 
-    # fallback
-    if len(parts) >= 2:
-        return parts[0], parts[1]
     return None, None
 
 
@@ -695,7 +687,11 @@ def parse_odds(row, ts):
 
 def compute_flags(score, stats):
     """Вычисляет флаги: extreme_result, abnormal_score, red_card_driven.
-    По гайду v5.0 раздел 22 + 39.2.
+
+    По гайду v5.0 §22 + §39.2:
+    - extreme_result: разница 3+ голов ИЛИ 5+ всего
+    - abnormal_score: разница 4+ голов (более жёсткий порог)
+    - red_card_driven: красная карточка в матче
     """
     flags = {}
     if not score:
@@ -710,7 +706,7 @@ def compute_flags(score, stats):
     if diff >= 3 or total >= 5:
         flags["extreme_result"] = True
 
-    # abnormal_score: разница в 4+ голов (сверхэкстремальный результат)
+    # abnormal_score: разница 4+ голов (гайд v5.0 §39.2)
     if diff >= 4:
         flags["abnormal_score"] = True
 
@@ -804,6 +800,8 @@ def build_payload(row, season, league_code, ts):
     # 26-field payload
     payload = {
         "canonical_id": canonical_id,
+        "created_at": ts,
+        "updated_at": ts,
         "home_team": home_team,
         "away_team": away_team,
         "home_clean": home_clean,
@@ -831,8 +829,6 @@ def build_payload(row, season, league_code, ts):
         "sources": ["football_data"],
         "section_history": [],
         "flags": flags,
-        "created_at": ts,
-        "updated_at": ts,
     }
 
     # Дополнительные поля (не входят в 26, но добавляются при наличии)
@@ -855,107 +851,84 @@ def build_payload(row, season, league_code, ts):
 
 
 # ---------------------------------------------------------------------------
-# Redis interaction
-# Primary: redis_hub (local/Termux)
-# Fallback: Upstash REST API (GitHub Actions)
+# Redis interaction — Upstash REST API (GitHub Actions) or redis_hub (Termux)
 # ---------------------------------------------------------------------------
-_REDIS_MODE = None  # "redis_hub" | "upstash" | None
-_REDIS_URL = None
-_REDIS_TOKEN = None
-
 import urllib.request
-import urllib.error
 
+_REDIS_MODE = None  # "hub" | "upstash" | "shared_upstash"
 
 def _init_redis():
-    """Инициализация Redis: redis_hub или Upstash REST API."""
-    global _REDIS_MODE, _REDIS_URL, _REDIS_TOKEN
+    """Инициализация Redis. Сначала пробует redis_hub (Termux), потом Upstash REST."""
+    global _REDIS_MODE
 
-    # Попытка 1: redis_hub (локально в Termux)
+    # 1. Попытка импорта redis_hub (локально в Termux)
     try:
         import redis_hub
-        # Проверяем что функция доступна
-        _ = redis_hub._execute_upstash_cmd
-        _REDIS_MODE = "redis_hub"
-        _p("[LOADER] Redis backend: redis_hub (local)")
-        return True
-    except Exception:
+        _p("[LOADER] Redis: redis_hub (local)")
+        _REDIS_MODE = "hub"
+        return
+    except ImportError:
         pass
 
-    # Попытка 2: Upstash REST API через env vars (GitHub Actions)
-    _REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-    _REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
-
-    if _REDIS_URL and _REDIS_TOKEN:
+    # 2. Upstash REST API через env vars (GitHub Actions)
+    url = os.environ.get("UPSTASH_REDIS_REST_URL")
+    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    if url and token:
+        _p("[LOADER] Redis: Upstash REST API (primary)")
         _REDIS_MODE = "upstash"
-        _p("[LOADER] Redis backend: Upstash REST API")
-        return True
+        return
 
-    # Попытка 3: shared Upstash
-    _REDIS_URL = os.environ.get("SHARED_UPSTASH_REDIS_REST_URL", "")
-    _REDIS_TOKEN = os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN", "")
+    # 3. Shared Upstash
+    surl = os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
+    stoken = os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
+    if surl and stoken:
+        _p("[LOADER] Redis: Upstash REST API (shared)")
+        _REDIS_MODE = "shared_upstash"
+        os.environ["UPSTASH_REDIS_REST_URL"] = surl
+        os.environ["UPSTASH_REDIS_REST_TOKEN"] = stoken
+        return
 
-    if _REDIS_URL and _REDIS_TOKEN:
-        _REDIS_MODE = "upstash"
-        _p("[LOADER] Redis backend: Shared Upstash REST API")
-        return True
-
-    _p("[WARN] No Redis backend available (redis_hub nor Upstash env vars)")
+    _p("[WARN] No Redis backend available (redis_hub or Upstash env vars)")
     _REDIS_MODE = None
-    return False
 
 
-def _exec_upstash_rest(cmd):
+def _upstash_cmd(cmd_parts):
     """Выполняет команду через Upstash REST API."""
-    # Upstash REST: POST {url}/{command} with Bearer token
-    # cmd = ["HMSET", "GatekeeperAI", "key1", "val1", ...]
-    if not cmd:
+    url = os.environ.get("UPSTASH_REDIS_REST_URL")
+    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    if not url or not token:
         return None
 
-    command = cmd[0].lower()
-    args = cmd[1:]
+    # POST {url}/<cmd>/<arg1>/<arg2>/...
+    # Escape slashes in args
+    path_parts = [urllib.request.quote(str(p), safe="") for p in cmd_parts]
+    full_url = url.rstrip("/") + "/" + "/".join(path_parts)
 
-    # URL: https://xxx.upstash.io/hmset/ (pipe-separated)
-    url = f"{_REDIS_URL.rstrip('/')}/{command}"
-    if args:
-        # URL-encode and join with /
-        encoded_args = []
-        for a in args:
-            a_str = str(a)
-            # Upstash expects URL-encoded values
-            from urllib.parse import quote
-            encoded_args.append(quote(a_str, safe=""))
-        url += "/" + "/".join(encoded_args)
-
-    req = urllib.request.Request(url, method="POST")
-    req.add_header("Authorization", f"Bearer {_REDIS_TOKEN}")
+    req = urllib.request.Request(full_url, method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body) if body else {"result": "OK"}
-    except urllib.error.HTTPError as e:
-        _p(f"[ERROR] Upstash REST HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:200]}")
-        return None
+            return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        _p(f"[ERROR] Upstash REST: {e}")
+        _p(f"[ERROR] Upstash REST {cmd_parts[0]}: {e}")
         return None
 
 
 def _exec(cmd):
-    """Выполняет Redis команду через доступный backend."""
-    if _REDIS_MODE == "redis_hub":
+    """Выполняет Redis команду через redis_hub или Upstash REST API."""
+    if _REDIS_MODE == "hub":
         try:
             import redis_hub
             return redis_hub._execute_upstash_cmd(cmd)
         except Exception as e:
-            _p(f"[ERROR] redis_hub._execute_upstash_cmd({cmd[0]}) failed: {e}")
+            _p(f"[ERROR] redis_hub {cmd[0]}: {e}")
             return None
-    elif _REDIS_MODE == "upstash":
-        return _exec_upstash_rest(cmd)
+    elif _REDIS_MODE in ("upstash", "shared_upstash"):
+        return _upstash_cmd(cmd)
     else:
-        _p(f"[ERROR] No Redis backend for command: {cmd[0]}")
+        _p(f"[WARN] No Redis backend, skipping {cmd[0]}")
         return None
 
 
@@ -1136,6 +1109,15 @@ def main():
         _p("  Run football_data_downloader.py first to download CSV files.")
         sys.exit(1)
 
+    # Initialize Redis connection (only if not dry-run)
+    if not dry_run:
+        _init_redis()
+        if _REDIS_MODE is None:
+            _p("[FATAL] No Redis backend available and not dry-run")
+            sys.exit(1)
+    else:
+        _p("[INFO] DRY RUN — Redis not needed")
+
     # Filter
     if filter_season or filter_league:
         filtered = []
@@ -1151,10 +1133,6 @@ def main():
     _p(f"\n[INFO] Found {len(all_csvs)} CSV files")
     if dry_run:
         _p("[INFO] DRY RUN — no Redis writes")
-    else:
-        if not _init_redis():
-            _p("[FATAL] Cannot connect to Redis. Use --dry-run to test without Redis.")
-            sys.exit(1)
     _p(f"[INFO] TEAM_ALIASES: {len(TEAM_ALIASES)} entries")
     _p(f"[INFO] LEAGUE_MAP: {len(LEAGUE_MAP)} leagues")
 
