@@ -2,12 +2,17 @@
 """
 Collector Bzzoiro v700-prod (API v2 — predictions for pre-match + league pre-fetch)
 Изменения v700: upstream="opta" во всех patch_match, odds в формате {current: {...}}
+
+FIX v700.1:
+  - save_meta: enrichment как nested dict + events_only flag
+  - __main__: argparse для --events-only
 """
 
 import os
 import sys
 import time
 import json
+import argparse
 import datetime as dt
 from typing import Any
 import logging
@@ -222,10 +227,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     init_metrics = run_initialization()
     if not init_metrics or not init_metrics.get("redis_available"):
         print("[BZZOIRO] ERROR: Redis init failed")
-        save_meta("bzzoiro", stored_matches=0, error_count=1)
+        save_meta("bzzoiro", stored_matches=0, error_count=1, events_only=events_only)
         return {"error": "redis_init_failed"}
 
-    print(f"[BZZOIRO] Cleanup: {init_metrics.get('cleanup_count', 0)} ключей удалено")
+    print(f"[BZZOIRO] Cleanup: {init_metrics.get("cleanup_count", 0)} ключей удалено")
 
     existing_keys = set(get_all_fields().keys())
 
@@ -409,7 +414,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 enrichment_errors += 1
 
             if idx < DEBUG_EVENT_COUNT:
-                print(f"[BZZOIRO DEBUG] Odds #{idx}: {json.dumps(odds_data, ensure_ascii=False)[:500] if odds_data is not _NOT_FOUND else '404'}")
+                print(f"[BZZOIRO DEBUG] Odds #{idx}: {json.dumps(odds_data, ensure_ascii=False)[:500] if odds_data is not _NOT_FOUND else 404}")
 
             time.sleep(ENRICH_DELAY)
 
@@ -433,7 +438,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     enrichment_errors += 1
 
                 if idx < DEBUG_EVENT_COUNT:
-                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: {json.dumps(pred_data, ensure_ascii=False)[:500] if pred_data is not _NOT_FOUND else '404'}")
+                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: {json.dumps(pred_data, ensure_ascii=False)[:500] if pred_data is not _NOT_FOUND else 404}")
 
                 time.sleep(ENRICH_DELAY)
 
@@ -522,6 +527,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
     print(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
 
+    # FIX: enrichment как nested dict (diagnostics читает enrichment.*),
+    #      events_only чтобы сбросить stale-флаг из прошлого запуска
     save_meta("bzzoiro",
               total_events=len(all_events),
               stored_matches=len(stored_matches),
@@ -529,15 +536,25 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
               updated=updated,
               error_count=enrichment_errors,
               pages_fetched=pages_fetched,
-              odds_enriched=odds_enriched,
-              pred_enriched=pred_enriched,
-              stats_enriched=stats_enriched,
-              h2h_enriched=h2h_enriched,
-              score_enriched=score_enriched)
+              enrichment={
+                  "odds": odds_enriched,
+                  "predictions": pred_enriched,
+                  "stats": stats_enriched,
+                  "h2h": h2h_enriched,
+                  "score": score_enriched,
+                  "errors": enrichment_errors,
+                  "not_found": not_found,
+              },
+              events_only=events_only)
 
     return result
 
 
 if __name__ == "__main__":
-    result = collect_bzzoiro()
+    parser = argparse.ArgumentParser(description="Collector Bzzoiro v700-prod")
+    parser.add_argument("--events-only", action="store_true",
+                        help="Только события, без enrichment")
+    args = parser.parse_args()
+
+    result = collect_bzzoiro(events_only=args.events_only)
     print(f"[BZZOIRO] Result: {result}")
