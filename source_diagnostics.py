@@ -28,6 +28,110 @@ MSK_TIMEZONE = timezone(timedelta(hours=3))
 
 
 # ---------------------------------------------------------------------------
+# Хелперы для v700-совместимого чтения odds/h2h/predictions
+# ---------------------------------------------------------------------------
+
+def _get_current_odds(match: dict) -> bool:
+    """Проверяет, есть ли реальные коэффициенты в v700-формате."""
+    odds = match.get("odds", {})
+    if not isinstance(odds, dict):
+        return False
+
+    # v700: odds.current.{home, draw, away}
+    current = odds.get("current", {})
+    if isinstance(current, dict):
+        h = current.get("home")
+        d = current.get("draw")
+        a = current.get("away")
+        if h and str(h) != "-" and str(h) != "":
+            return True
+        if a and str(a) != "-" and str(a) != "":
+            return True
+        if d and str(d) != "-" and str(d) != "":
+            return True
+
+    # Fallback: плоский формат odds.{home, draw, away}
+    h = odds.get("home")
+    if h and str(h) != "-" and str(h) != "":
+        return True
+    a = odds.get("away")
+    if a and str(a) != "-" and str(a) != "":
+        return True
+
+    # Fallback: sources[] массив с odds
+    sources = odds.get("sources", [])
+    if isinstance(sources, list):
+        for s in sources:
+            if not isinstance(s, dict):
+                continue
+            cur = s.get("current", {})
+            if isinstance(cur, dict):
+                h = cur.get("home")
+                if h and str(h) != "-" and str(h) != "":
+                    return True
+                a = cur.get("away")
+                if a and str(a) != "-" and str(a) != "":
+                    return True
+
+    return False
+
+
+def _has_meaningful_h2h(match: dict) -> bool:
+    """Проверяет, есть ли реальные H2H-данные в v700-формате."""
+    h2h = match.get("h2h", {})
+    if not isinstance(h2h, dict) or not h2h:
+        return False
+
+    # v700: meaningful keys
+    meaningful_keys = ("total", "home_wins", "draws", "away_wins", "recent")
+    for k in meaningful_keys:
+        v = h2h.get(k)
+        if v is not None and v != 0 and v != []:
+            return True
+
+    # Fallback: "source" in h2h (старый формат)
+    if "source" in h2h:
+        return True
+
+    # Fallback: extra.bzzoiro_h2h
+    extra = match.get("extra", {})
+    if isinstance(extra, dict) and "bzzoiro_h2h" in extra:
+        return True
+
+    return False
+
+
+def _has_meaningful_pred(match: dict) -> bool:
+    """Проверяет, есть ли реальные predictions в v700-формате."""
+    predictions = match.get("predictions", {})
+    if not isinstance(predictions, dict) or not predictions:
+        return False
+
+    # v700: meaningful keys
+    meaningful_keys = (
+        "predicted_home", "predicted_away", "home_win_prob",
+        "away_win_prob", "draw_prob", "winner", "predicted_score",
+        "prediction", "confidence", "model",
+    )
+    for k in meaningful_keys:
+        v = predictions.get(k)
+        if v is not None and v != "":
+            return True
+
+    # Fallback: "source" in predictions (старый формат)
+    if "source" in predictions:
+        return True
+
+    # Fallback: extra.bzzoiro_prediction
+    extra = match.get("extra", {})
+    if isinstance(extra, dict) and "bzzoiro_prediction" in extra:
+        return True
+
+    return False
+
+
+
+# ---------------------------------------------------------------------------
 # 1. Диагностика источников
 # ---------------------------------------------------------------------------
 def diagnose_sources() -> dict:
@@ -263,71 +367,6 @@ def diagnose_redis() -> dict:
 
 
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Хелперы для v700-формата
-# ---------------------------------------------------------------------------
-_H2H_KEYS = {"total", "home_wins", "draws", "away_wins", "recent", "matches"}
-_PRED_KEYS = {"predicted_home", "predicted_away", "home_win_prob", "draw_prob",
-              "away_win_prob", "winner", "predicted_score", "confidence",
-              "predicted_winner", "home_score", "away_score"}
-
-
-def _get_current_odds(match: dict) -> bool:
-    """Проверяет наличие реальных коэффициентов в v700-формате."""
-    odds = match.get("odds")
-    if not isinstance(odds, dict):
-        return False
-    # v700: odds.current.{home,draw,away}
-    current = odds.get("current")
-    if isinstance(current, dict):
-        for k in ("home", "draw", "away"):
-            v = current.get(k)
-            if v and v != "-" and v != 0 and v != "0":
-                return True
-    # Fallback: плоский формат
-    for k in ("home", "draw", "away"):
-        v = odds.get(k)
-        if v and v != "-" and v != 0 and v != "0":
-            return True
-    # Fallback: sources[] (мульти-upstream)
-    sources = odds.get("sources")
-    if isinstance(sources, list):
-        for src in sources:
-            if isinstance(src, dict):
-                cur = src.get("current", src)
-                if isinstance(cur, dict):
-                    for k in ("home", "draw", "away"):
-                        v = cur.get(k)
-                        if v and v != "-" and v != 0 and v != "0":
-                            return True
-    return False
-
-
-def _has_meaningful_h2h(match: dict) -> bool:
-    """Проверяет наличие реальных H2H данных в v700-формате."""
-    h2h = match.get("h2h")
-    if not isinstance(h2h, dict) or not h2h:
-        return False
-    for key in _H2H_KEYS:
-        val = h2h.get(key)
-        if val is not None and val != 0 and val != [] and val != "":
-            return True
-    return False
-
-
-def _has_meaningful_pred(match: dict) -> bool:
-    """Проверяет наличие реальных prediction данных в v700-формате."""
-    pred = match.get("predictions")
-    if not isinstance(pred, dict) or not pred:
-        return False
-    for key in _PRED_KEYS:
-        val = pred.get(key)
-        if val is not None and val != "" and val != 0 and val != "-":
-            return True
-    return False
-
-
 # 3. Диагностика матчей
 # ---------------------------------------------------------------------------
 def diagnose_matches() -> dict:
@@ -465,19 +504,20 @@ def diagnose_errors() -> dict:
             errors.append({"source": "odds_api", "count": err_count})
             print(f"   🎲 OddsAPI: {err_count} ошибок")
 
-    propline_meta = get_from_cache("propline:meta")
-    if propline_meta and isinstance(propline_meta, dict):
-        err_count = propline_meta.get("error_count", propline_meta.get("errors", 0))
-        if err_count > 0:
-            errors.append({"source": "propline", "count": err_count})
-            print(f"   🏆 Propline: {err_count} ошибок")
-
     health = get_from_cache("system:health")
     if health and isinstance(health, dict):
         cas = health.get("cas_conflicts_total", 0)
         if cas > 0:
             errors.append({"source": "CAS", "count": cas})
             print(f"   🔒 CAS-конфликтов: {cas}")
+
+    # Propline
+    propline_meta = get_from_cache("propline:meta")
+    if propline_meta and isinstance(propline_meta, dict):
+        err_count = propline_meta.get("error_count", propline_meta.get("errors", 0))
+        if err_count > 0:
+            errors.append({"source": "propline", "count": err_count})
+            print(f"   🏆 Propline: {err_count} ошибок")
 
     if not errors:
         print("   ✅ Ошибок не обнаружено")
