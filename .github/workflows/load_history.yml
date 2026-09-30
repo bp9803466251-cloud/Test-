@@ -1,0 +1,89 @@
+name: Load History to Redis
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: 'Сезон (пусто = все, пример: 2526)'
+        required: false
+        default: ''
+      league:
+        description: 'Лига (пусто = все, пример: E0)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Type "yes" для dry-run (без записи в Redis)'
+        required: false
+        default: 'no'
+
+env:
+  PYTHON_VERSION: "3.11"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
+jobs:
+  load-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Check CSV files
+        run: |
+          if [ ! -d csv_data ]; then
+            echo "::error::csv_data/ directory not found. Run Download CSV Data workflow first."
+            exit 1
+          fi
+          CSV_COUNT=$(find csv_data -name "*.csv" | wc -l)
+          echo "Found $CSV_COUNT CSV files"
+          if [ "$CSV_COUNT" -eq 0 ]; then
+            echo "::error::No CSV files in csv_data/"
+            exit 1
+          fi
+
+      - name: Load history to Redis
+        run: |
+          SEASON="${{ inputs.season }}"
+          LEAGUE="${{ inputs.league }}"
+          DRY="${{ inputs.dry_run }}"
+          ARGS=""
+
+          if [ -n "$SEASON" ]; then
+            ARGS="$ARGS --season $SEASON"
+          fi
+          if [ -n "$LEAGUE" ]; then
+            ARGS="$ARGS --league $LEAGUE"
+          fi
+          if [ "$DRY" = "yes" ]; then
+            ARGS="$ARGS --dry-run"
+            echo "[WORKFLOW] DRY RUN — no Redis writes"
+          fi
+
+          echo "[WORKFLOW] Loading history: season='$SEASON' league='$LEAGUE' dry='$DRY'"
+          python football_data_loader_v2.py $ARGS
+
+      - name: Diagnostics after load
+        if: ${{ inputs.dry_run != 'yes' }}
+        run: python redis_diagnostics.py
+        
