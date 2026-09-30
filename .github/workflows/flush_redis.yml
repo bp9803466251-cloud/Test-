@@ -11,9 +11,10 @@ on:
           - history
           - test
           - flush
+          - purge
         default: test
       confirm:
-        description: 'Type "yes" to confirm flush (только для mode=flush)'
+        description: 'Type "yes" to confirm flush/purge'
         required: false
         default: 'no'
       hard:
@@ -86,12 +87,24 @@ jobs:
               python redis_diagnostics.py --flush --yes
             fi
 
+          elif [ "$MODE" = "purge" ]; then
+            CONFIRM="${{ inputs.confirm }}"
+
+            if [ "$CONFIRM" != "yes" ]; then
+              echo "[WORKFLOW] Purge not confirmed (confirm != yes). Running diagnostics only."
+              python redis_diagnostics.py
+              exit 0
+            fi
+
+            echo "[WORKFLOW] FULL PURGE requested"
+            python redis_diagnostics.py --purge --yes
+
           else
             echo "[WORKFLOW] Running standard diagnostics..."
             python redis_diagnostics.py
           fi
 
-      - name: Diagnostics after flush
-        if: ${{ inputs.mode == 'flush' && inputs.confirm == 'yes' }}
+      - name: Diagnostics after flush/purge
+        if: ${{ (inputs.mode == 'flush' || inputs.mode == 'purge') && inputs.confirm == 'yes' }}
         run: python redis_diagnostics.py
         
