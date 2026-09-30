@@ -21,6 +21,7 @@ from gatekeeper_hub import (
     run_initialization,
     get_matches_by_date_range,
     get_all_matches,
+    get_current_odds,
 )
 from redis_hub import get_from_cache, get_all_fields, is_redis_available
 
@@ -264,9 +265,13 @@ def diagnose_matches() -> dict:
         if not isinstance(match, dict):
             continue
 
-        odds = match.get("odds", {})
-        if isinstance(odds, dict) and odds.get("home") and odds.get("home") != "-":
-            with_odds += 1
+        # v700: odds хранятся как match["odds"]["1x2"]["current"]["home"]
+        # get_current_odds() извлекает плоский dict из вложенной структуры
+        current_odds = get_current_odds(match)
+        if current_odds and isinstance(current_odds, dict):
+            home_val = current_odds.get("home")
+            if home_val and home_val != "-" and home_val != "":
+                with_odds += 1
 
         value = match.get("value")
         if value is not None:
