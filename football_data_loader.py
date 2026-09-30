@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-football_data_loader_v2.py — загрузка CSV в Redis в формате GatekeeperAI v5.0
+football_data_loader.py — загрузка CSV в Redis в формате GatekeeperAI v5.0
 
 26 полей payload, единый формат odds 1x2, TEAM_ALIASES, stats из 12 колонок,
 source_map, flags, индексы history:team:* / history:league:* / history:index:*
 
 Запуск:
-  python football_data_loader_v2.py                    # загрузить все CSV из csv_data/
-  python football_data_loader_v2.py --dir csv_data     # указать директорию
-  python football_data_loader_v2.py --season 2526      # только один сезон
-  python football_data_loader_v2.py --league E0         # только одну лигу
-  python football_data_loader_v2.py --dry-run          # без записи в Redis
+  python football_data_loader.py                    # загрузить все CSV из csv_data/
+  python football_data_loader.py --dir csv_data     # указать директорию
+  python football_data_loader.py --season 2526      # только один сезон
+  python football_data_loader.py --league E0         # только одну лигу
+  python football_data_loader.py --dry-run          # без записи в Redis
 """
 
 import os
@@ -20,6 +20,8 @@ import json
 import time
 import glob
 import traceback
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------------------
@@ -52,12 +54,27 @@ LEAGUE_MAP = {
     "G1":  ("Super League",         "Greece"),
 }
 
+UPSTREAM_MAP = {
+    "sharpapi": "betradar",
+    "odds_api": "betradar",
+    "bzzoiro": "opta",
+    "propline": "pinnacle",
+    "football_data": "bet365",
+}
+
+ODDS_PRIORITY = [
+    ("B365H", "B365D", "B365A", "bet365"),
+    ("BbAvH", "BbAvD", "BbAvA", "betbrain_avg"),
+    ("IWH", "IWD", "IWA", "interwetten"),
+    ("LBH", "LBD", "LBA", "ladbrokes"),
+    ("WHH", "WHD", "WHA", "william_hill"),
+    ("VCH", "VCD", "VCA", "vc_bet"),
+]
+
 # ---------------------------------------------------------------------------
-# TEAM_ALIASES — единый словарь (как в gatekeeper_hub.py)
-# Ключ — вариант написания (lowercase), значение — canonical clean name
+# TEAM_ALIASES
 # ---------------------------------------------------------------------------
 TEAM_ALIASES = {
-    # England — Premier League
     "man united": "man", "manchester united": "man", "man utd": "man",
     "manchester utd": "man", "manchester": "man",
     "man city": "man_city", "manchester city": "man_city", "manchester c": "man_city",
@@ -124,7 +141,6 @@ TEAM_ALIASES = {
     "oxford": "oxford", "oxford united": "oxford",
     "bristol rovers": "bristol_rovers",
     "plymouth": "plymouth", "plymouth argyle": "plymouth",
-    "portsmouth": "portsmouth",
     "accrington": "accrington", "accrington stanley": "accrington",
     "lincoln": "lincoln", "lincoln city": "lincoln",
     "sutton": "sutton", "sutton united": "sutton",
@@ -152,17 +168,13 @@ TEAM_ALIASES = {
     "exeter": "exeter", "exeter city": "exeter",
     "salford": "salford", "salford city": "salford",
     "leyton orient": "leyton_orient",
-    "wigan": "wigan",
-
-    # Scotland
     "celtic": "celtic",
     "rangers": "rangers",
     "aberdeen": "aberdeen",
     "hearts": "hearts", "heart of midlothian": "hearts",
     "hibernian": "hibernian", "hibs": "hibernian",
     "dundee united": "dundee_united",
-    "dundee": "dundee",
-    "dundee fc": "dundee",
+    "dundee": "dundee", "dundee fc": "dundee",
     "st mirren": "st_mirren",
     "kilmarnock": "kilmarnock",
     "motherwell": "motherwell",
@@ -180,8 +192,6 @@ TEAM_ALIASES = {
     "falkirk": "falkirk",
     "alloa": "alloa",
     "caledonia": "caledonia",
-
-    # Spain
     "barcelona": "barcelona",
     "real madrid": "real_madrid",
     "atletico madrid": "atletico_madrid", "atletico": "atletico_madrid",
@@ -214,9 +224,6 @@ TEAM_ALIASES = {
     "oviedo": "oviedo", "real oviedo": "oviedo",
     "gijon": "gijon", "sporting gijon": "gijon",
     "zaragoza": "zaragoza", "real zaragoza": "zaragoza",
-    "elche": "elche",
-
-    # Italy
     "inter": "inter", "inter milan": "inter", "internazionale": "inter",
     "milan": "milan", "ac milan": "milan",
     "juventus": "juventus", "juve": "juventus",
@@ -256,8 +263,6 @@ TEAM_ALIASES = {
     "cittadella": "cittadella",
     "perugia": "perugia",
     "virtus entella": "virtus_entella",
-
-    # Germany
     "bayern munich": "bayern_munich", "bayern": "bayern_munich",
     "bayern munchen": "bayern_munich",
     "dortmund": "dortmund", "borussia dortmund": "dortmund",
@@ -295,8 +300,6 @@ TEAM_ALIASES = {
     "wehen": "wehen", "sv wehen": "wehen",
     "osnabruck": "osnabruck",
     "hansa rostock": "rostock", "rostock": "rostock",
-
-    # France
     "paris saint germain": "psg", "psg": "psg", "paris sg": "psg",
     "paris saint-germain": "psg",
     "marseille": "marseille",
@@ -334,8 +337,6 @@ TEAM_ALIASES = {
     "rodez": "rodez",
     "quevilly": "quevilly",
     "le mans": "le_mans",
-
-    # Netherlands
     "ajax": "ajax",
     "psv": "psv", "psv eindhoven": "psv",
     "feyenoord": "feyenoord",
@@ -357,9 +358,7 @@ TEAM_ALIASES = {
     "excelsior": "excelsior",
     "nec": "nec", "nec nijmegen": "nec",
     "willem ii": "willem_ii",
-    " Den Haag": "den_haag", "ado den haag": "den_haag",
-
-    # Belgium
+    "den haag": "den_haag", "ado den haag": "den_haag",
     "club brugge": "club_brugge",
     "anderlecht": "anderlecht",
     "genk": "genk", "krc genk": "genk",
@@ -375,11 +374,9 @@ TEAM_ALIASES = {
     "eupen": "eupen",
     "stvv": "stvv", "sint-truiden": "stvv",
     "westerlo": "westerlo",
-    "RFC": "rfc_seraing", "seraing": "rfc_seraing",
+    "rfc": "rfc_seraing", "seraing": "rfc_seraing",
     "beerschot": "beerschot",
     "lommel": "lommel",
-
-    # Portugal
     "benfica": "benfica",
     "porto": "porto",
     "sporting": "sporting", "sporting cp": "sporting",
@@ -403,8 +400,6 @@ TEAM_ALIASES = {
     "tondela": "tondela",
     "mafra": "mafra",
     "nacional": "nacional",
-
-    # Turkey
     "galatasaray": "galatasaray",
     "fenerbahce": "fenerbahce",
     "besiktas": "besiktas",
@@ -428,8 +423,6 @@ TEAM_ALIASES = {
     "altay": "altay",
     "yeni malatyaspor": "malatyaspor",
     "umbaniye": "umbaniye", "umlaniyespor": "umbaniye",
-
-    # Greece
     "olympiacos": "olympiacos",
     "panathinaikos": "panathinaikos",
     "paok": "paok",
@@ -447,30 +440,6 @@ TEAM_ALIASES = {
     "xanthi": "xanthi",
 }
 
-UPSTREAM_MAP = {
-    "sharpapi": "betradar",
-    "odds_api": "betradar",
-    "bzzoiro": "opta",
-    "propline": "pinnacle",
-    "football_data": "bet365",
-}
-
-# Odds priority: B365 → BbAv → IW → LB → WH → VC
-ODDS_PRIORITY = [
-    ("B365H", "B365D", "B365A", "bet365"),
-    ("BbAvH", "BbAvD", "BbAvA", "betbrain_avg"),
-    ("IWH", "IWD", "IWA", "interwetten"),
-    ("LBH", "LBD", "LBA", "ladbrokes"),
-    ("WHH", "WHD", "WHA", "william_hill"),
-    ("VCH", "VCD", "VCA", "vc_bet"),
-]
-
-# Opening odds priority (same sources, but "opening" columns if available)
-ODDS_OPENING_PRIORITY = [
-    ("Bb1X2", None, None),  # not standard, skip
-]
-
-
 # ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
@@ -483,14 +452,11 @@ def _p(msg, end="\n"):
 
 
 def clean_team_name(name):
-    """Нормализация имени команды через TEAM_ALIASES."""
     if not name:
         return ""
     name_lower = name.strip().lower()
-    # Прямой lookup в алиасах
     if name_lower in TEAM_ALIASES:
         return TEAM_ALIASES[name_lower]
-    # Fallback: убрать артикли, привести к нижнему регистру, заменить пробелы на _
     cleaned = name_lower
     for prefix in ["fc ", "afc ", "ssc ", "ss ", "sc ", "us ", "as ", "ac ",
                    "vfl ", "vfb ", "tsg ", "sv ", "rb ", "1. ", "1fc ", "b. "]:
@@ -503,39 +469,32 @@ def clean_team_name(name):
 
 
 def parse_csv_filename(filepath):
-    """Парсит season и league_code из пути файла.
-    Поддерживает два формата:
-      csv_data/2526/E0.csv  → season='2526', league_code='E0'  (сезон из директории)
-      2526_E0.csv           → season='2526', league_code='E0'  (старый формат)
-    """
-    base = os.path.basename(filepath).replace(".csv", "")
-
-    # Формат 1: csv_data/2526/E0.csv — сезон из имени директории
-    parent = os.path.basename(os.path.dirname(filepath))
-    if parent and len(parent) == 4 and parent.isdigit():
-        return parent, base
-
-    # Формат 2: 2526_E0.csv — старый формат с разделителем _
-    parts = base.split("_")
-    if len(parts) >= 2 and len(parts[0]) == 4 and parts[0].isdigit():
-        return parts[0], parts[1]
-
+    """Поддержка: csv_data/2526/E0.csv и 2526_E0.csv"""
+    parts = os.path.normpath(filepath).replace("\\", "/").split("/")
+    basename = parts[-1].replace(".csv", "")
+    if len(parts) >= 2:
+        season = parts[-2]
+        if season.isdigit() and len(season) == 4:
+            return season, basename
+    base_parts = basename.split("_")
+    if len(base_parts) >= 2:
+        season = base_parts[0]
+        league_code = base_parts[1]
+        if season.isdigit() and len(season) == 4:
+            return season, league_code
     return None, None
 
 
 def normalize_date(date_str):
-    """DD/MM/YYYY → ISO 8601 UTC (00:00:00Z — время неизвестно для history)."""
     if not date_str:
         return None
     date_str = date_str.strip()
-    # Форматы: DD/MM/YYYY или DD/MM/YY
     for fmt in ("%d/%m/%Y", "%d/%m/%y"):
         try:
             dt = datetime.strptime(date_str, fmt)
             return dt.strftime("%Y-%m-%dT00:00:00Z")
         except ValueError:
             continue
-    # Формат ISO уже
     try:
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         return dt.strftime("%Y-%m-%dT00:00:00Z")
@@ -544,16 +503,26 @@ def normalize_date(date_str):
 
 
 def date_to_yyyymmdd(iso_date):
-    """2024-12-04T00:00:00Z → 20241204"""
     if not iso_date or len(iso_date) < 10:
         return None
     return iso_date[:10].replace("-", "")
 
 
-def parse_match_stats(row, ts):
-    """Парсит 12 метрик статистики матча из CSV колонок."""
-    stats = {}
+def open_csv(filepath):
+    """Открывает CSV с fallback: utf-8-sig -> cp1252 -> latin-1"""
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            f = open(filepath, "r", encoding=enc, newline="")
+            f.readline()
+            f.seek(0)
+            return f
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError("utf-8", b"", 0, 1, "All encodings failed")
 
+
+def parse_match_stats(row, ts):
+    stats = {}
     def _safe_int(val):
         if val is None or val == "" or val == "-":
             return None
@@ -561,94 +530,59 @@ def parse_match_stats(row, ts):
             return int(float(val))
         except (ValueError, TypeError):
             return None
-
     sh = _safe_int(row.get("HS"))
     sa = _safe_int(row.get("AS"))
-    if sh is not None:
-        stats["shots_home"] = sh
-    if sa is not None:
-        stats["shots_away"] = sa
-
+    if sh is not None: stats["shots_home"] = sh
+    if sa is not None: stats["shots_away"] = sa
     hst = _safe_int(row.get("HST"))
     ast = _safe_int(row.get("AST"))
-    if hst is not None:
-        stats["shots_on_target_home"] = hst
-    if ast is not None:
-        stats["shots_on_target_away"] = ast
-
+    if hst is not None: stats["shots_on_target_home"] = hst
+    if ast is not None: stats["shots_on_target_away"] = ast
     hc = _safe_int(row.get("HC"))
     ac = _safe_int(row.get("AC"))
-    if hc is not None:
-        stats["corners_home"] = hc
-    if ac is not None:
-        stats["corners_away"] = ac
-
+    if hc is not None: stats["corners_home"] = hc
+    if ac is not None: stats["corners_away"] = ac
     hf = _safe_int(row.get("HF"))
     af = _safe_int(row.get("AF"))
-    if hf is not None:
-        stats["fouls_home"] = hf
-    if af is not None:
-        stats["fouls_away"] = af
-
+    if hf is not None: stats["fouls_home"] = hf
+    if af is not None: stats["fouls_away"] = af
     hy = _safe_int(row.get("HY"))
     ay = _safe_int(row.get("AY"))
-    if hy is not None:
-        stats["yellow_home"] = hy
-    if ay is not None:
-        stats["yellow_away"] = ay
-
+    if hy is not None: stats["yellow_home"] = hy
+    if ay is not None: stats["yellow_away"] = ay
     hr = _safe_int(row.get("HR"))
     ar = _safe_int(row.get("AR"))
-    if hr is not None:
-        stats["red_home"] = hr
-    if ar is not None:
-        stats["red_away"] = ar
-
+    if hr is not None: stats["red_home"] = hr
+    if ar is not None: stats["red_away"] = ar
     if stats:
         stats["_source"] = "football_data"
         stats["_updated_at"] = ts
-    return stats if stats else {}
+    return stats
 
 
 def parse_odds(row, ts):
-    """Парсит коэффициенты в формате 1x2 с приоритетом источников."""
     current = {}
-    opening = {}
     source_name = None
-    upstream = "bet365"
-
-    # Current odds — по приоритету
     for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
-        h = row.get(h_col, "").strip() if row.get(h_col) else ""
-        d = row.get(d_col, "").strip() if row.get(d_col) else ""
-        a = row.get(a_col, "").strip() if row.get(a_col) else ""
+        h = (row.get(h_col) or "").strip()
+        d = (row.get(d_col) or "").strip()
+        a = (row.get(a_col) or "").strip()
         if h and d and a and h != "-" and d != "-" and a != "-":
             try:
-                float(h)
-                float(d)
-                float(a)
+                float(h); float(d); float(a)
                 current = {"home": h, "draw": d, "away": a}
                 source_name = bk_name
                 break
             except ValueError:
                 continue
-
-    # Opening odds — Bb1X2 или те же B365 (если нет отдельного opening)
-    # football-data.co.uk не имеет отдельных opening колонок для 1x2
-    # Используем те же коэффициенты как opening (conservative)
-    if current:
-        opening = dict(current)
-
     if not current:
         return None
-
-    # Best — максимум по каждому исходу
-    best = {}
+    opening = dict(current)
     all_odds = {}
     for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
-        h = row.get(h_col, "").strip() if row.get(h_col) else ""
-        d = row.get(d_col, "").strip() if row.get(d_col) else ""
-        a = row.get(a_col, "").strip() if row.get(a_col) else ""
+        h = (row.get(h_col) or "").strip()
+        d = (row.get(d_col) or "").strip()
+        a = (row.get(a_col) or "").strip()
         if h and d and a and h != "-" and d != "-" and a != "-":
             try:
                 fh, fd, fa = float(h), float(d), float(a)
@@ -657,89 +591,61 @@ def parse_odds(row, ts):
                 all_odds.setdefault("away", []).append(fa)
             except ValueError:
                 continue
-
     if all_odds:
         best = {
-            "home": str(max(all_odds["home"])) if "home" in all_odds else current.get("home", ""),
-            "draw": str(max(all_odds["draw"])) if "draw" in all_odds else current.get("draw", ""),
-            "away": str(max(all_odds["away"])) if "away" in all_odds else current.get("away", ""),
+            "home": str(max(all_odds.get("home", [float(current["home"])]))),
+            "draw": str(max(all_odds.get("draw", [float(current["draw"])]))),
+            "away": str(max(all_odds.get("away", [float(current["away"])]))),
         }
     else:
         best = dict(current)
-
-    source_entry = {
-        "source": "football_data",
-        "upstream": upstream,
-        "price": current,
-        "timestamp": ts,
-        "type": "closing",
-    }
-
     return {
         "1x2": {
             "current": current,
             "opening": opening,
             "best": best,
-            "sources": [source_entry],
+            "sources": [{
+                "source": "football_data",
+                "upstream": "bet365",
+                "price": current,
+                "timestamp": ts,
+                "type": "closing",
+            }],
         }
     }
 
 
 def compute_flags(score, stats):
-    """Вычисляет флаги: extreme_result, abnormal_score, red_card_driven.
-
-    По гайду v5.0 §22 + §39.2:
-    - extreme_result: разница 3+ голов ИЛИ 5+ всего
-    - abnormal_score: разница 4+ голов (более жёсткий порог)
-    - red_card_driven: красная карточка в матче
-    """
     flags = {}
     if not score:
         return flags
-
     h = score.get("home", 0) or 0
     a = score.get("away", 0) or 0
     total = h + a
     diff = abs(h - a)
-
-    # extreme_result: разница в 3+ голов ИЛИ 5+ всего
     if diff >= 3 or total >= 5:
         flags["extreme_result"] = True
-
-    # abnormal_score: разница 4+ голов (гайд v5.0 §39.2)
     if diff >= 4:
         flags["abnormal_score"] = True
-
-    # red_card_driven: красная карточка в матче
     if stats:
-        if stats.get("red_home", 0) and stats["red_home"] > 0:
+        if (stats.get("red_home", 0) or 0) > 0 or (stats.get("red_away", 0) or 0) > 0:
             flags["red_card_driven"] = True
-        elif stats.get("red_away", 0) and stats["red_away"] > 0:
-            flags["red_card_driven"] = True
-
     return flags
 
 
 def build_payload(row, season, league_code, ts):
-    """Собирает 26-полейный payload v5.0 из строки CSV."""
     home_team = (row.get("HomeTeam") or "").strip()
     away_team = (row.get("AwayTeam") or "").strip()
-
     home_clean = clean_team_name(home_team)
     away_clean = clean_team_name(away_team)
-
     date_str = (row.get("Date") or "").strip()
     date_iso = normalize_date(date_str)
     if not date_iso:
         return None, None, None
-
     date_yyyymmdd = date_to_yyyymmdd(date_iso)
     if not date_yyyymmdd:
         return None, None, None
-
     canonical_id = f"{home_clean}__{away_clean}__{date_yyyymmdd}"
-
-    # Score
     try:
         score_home = int(float(row.get("FTHG", 0) or 0))
     except (ValueError, TypeError):
@@ -749,8 +655,6 @@ def build_payload(row, season, league_code, ts):
     except (ValueError, TypeError):
         score_away = 0
     score = {"home": score_home, "away": score_away}
-
-    # Half-time score
     half_time = {}
     try:
         hthg = int(float(row.get("HTHG", 0) or 0))
@@ -758,29 +662,15 @@ def build_payload(row, season, league_code, ts):
         half_time = {"home": hthg, "away": htag}
     except (ValueError, TypeError):
         pass
-
-    # Full-time result
     ftr = (row.get("FTR") or "").strip()
     full_time_result = ftr if ftr in ("H", "A", "D") else None
-
-    # Referee
     referee = (row.get("Referee") or "").strip() or None
-
-    # Competition / country
     comp_info = LEAGUE_MAP.get(league_code, (league_code, None))
     competition = comp_info[0]
     country = comp_info[1]
-
-    # Stats
     stats = parse_match_stats(row, ts)
-
-    # Odds
     odds = parse_odds(row, ts)
-
-    # Flags
     flags = compute_flags(score, stats)
-
-    # Source map
     source_map = {
         "odds": {
             "source": "football_data",
@@ -796,12 +686,8 @@ def build_payload(row, season, league_code, ts):
             "independent": True,
         },
     }
-
-    # 26-field payload
     payload = {
         "canonical_id": canonical_id,
-        "created_at": ts,
-        "updated_at": ts,
         "home_team": home_team,
         "away_team": away_team,
         "home_clean": home_clean,
@@ -829,128 +715,92 @@ def build_payload(row, season, league_code, ts):
         "sources": ["football_data"],
         "section_history": [],
         "flags": flags,
+        "created_at": ts,
+        "updated_at": ts,
     }
-
-    # Дополнительные поля (не входят в 26, но добавляются при наличии)
     if half_time:
         payload["half_time_score"] = half_time
     if full_time_result:
         payload["full_time_result"] = full_time_result
     if referee:
         payload["referee"] = referee
-
-    # Wrapper (конверт)
     wrapper = {
         "version": "v700-prod",
         "sender_repo": "football_data_loader",
         "timestamp": ts,
         "payload": payload,
     }
-
     return canonical_id, wrapper, date_yyyymmdd
 
 
 # ---------------------------------------------------------------------------
-# Redis interaction — Upstash REST API (GitHub Actions) or redis_hub (Termux)
+# Redis backend
 # ---------------------------------------------------------------------------
-import urllib.request
+_REDIS_MODE = None
+_REDIS_URL = None
+_REDIS_TOKEN = None
 
-_REDIS_MODE = None  # "hub" | "upstash" | "shared_upstash"
 
 def _init_redis():
-    """Инициализация Redis. Сначала пробует redis_hub (Termux), потом Upstash REST."""
-    global _REDIS_MODE
-
-    # 1. Попытка импорта redis_hub (локально в Termux)
+    global _REDIS_MODE, _REDIS_URL, _REDIS_TOKEN
     try:
         import redis_hub
-        _p("[LOADER] Redis: redis_hub (local)")
-        _REDIS_MODE = "hub"
-        return
-    except ImportError:
+        redis_hub._execute_upstash_cmd(["PING"])
+        _REDIS_MODE = "redis_hub"
+        _p("[REDIS] Using redis_hub")
+        return True
+    except Exception:
         pass
-
-    # 2. Upstash REST API через env vars (GitHub Actions)
-    url = os.environ.get("UPSTASH_REDIS_REST_URL")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
-    if url and token:
-        _p("[LOADER] Redis: Upstash REST API (primary)")
+    _REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+    _REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+    if _REDIS_URL and _REDIS_TOKEN:
         _REDIS_MODE = "upstash"
-        return
-
-    # 3. Shared Upstash
-    surl = os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
-    stoken = os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
-    if surl and stoken:
-        _p("[LOADER] Redis: Upstash REST API (shared)")
-        _REDIS_MODE = "shared_upstash"
-        os.environ["UPSTASH_REDIS_REST_URL"] = surl
-        os.environ["UPSTASH_REDIS_REST_TOKEN"] = stoken
-        return
-
-    _p("[WARN] No Redis backend available (redis_hub or Upstash env vars)")
+        _p("[REDIS] Using Upstash REST API")
+        return True
+    _REDIS_URL = os.environ.get("SHARED_UPSTASH_REDIS_REST_URL", "")
+    _REDIS_TOKEN = os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN", "")
+    if _REDIS_URL and _REDIS_TOKEN:
+        _REDIS_MODE = "upstash"
+        _p("[REDIS] Using shared Upstash REST API")
+        return True
     _REDIS_MODE = None
+    _p("[REDIS] No Redis backend available")
+    return False
 
 
-def _upstash_cmd(cmd_parts):
-    """Выполняет команду через Upstash REST API."""
-    url = os.environ.get("UPSTASH_REDIS_REST_URL")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
-    if not url or not token:
-        return None
-
-    # POST {url}/<cmd>/<arg1>/<arg2>/...
-    # Escape slashes in args
-    path_parts = [urllib.request.quote(str(p), safe="") for p in cmd_parts]
-    full_url = url.rstrip("/") + "/" + "/".join(path_parts)
-
-    req = urllib.request.Request(full_url, method="POST")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        _p(f"[ERROR] Upstash REST {cmd_parts[0]}: {e}")
-        return None
+def _exec_upstash(cmd):
+    url = _REDIS_URL.rstrip("/") + "/" + "/".join(
+        urllib.parse.quote(str(c), safe="") for c in cmd
+    )
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {_REDIS_TOKEN}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body).get("result")
 
 
 def _exec(cmd):
-    """Выполняет Redis команду через redis_hub или Upstash REST API."""
-    if _REDIS_MODE == "hub":
-        try:
-            import redis_hub
-            return redis_hub._execute_upstash_cmd(cmd)
-        except Exception as e:
-            _p(f"[ERROR] redis_hub {cmd[0]}: {e}")
-            return None
-    elif _REDIS_MODE in ("upstash", "shared_upstash"):
-        return _upstash_cmd(cmd)
-    else:
-        _p(f"[WARN] No Redis backend, skipping {cmd[0]}")
-        return None
+    if _REDIS_MODE == "redis_hub":
+        import redis_hub
+        return redis_hub._execute_upstash_cmd(cmd)
+    elif _REDIS_MODE == "upstash":
+        return _exec_upstash(cmd)
+    return None
 
 
 def save_batch_to_redis(batch):
-    """Записывает батч матчей через HMSET (по 10)."""
     if not batch:
         return 0
-    # batch = list of (history_key, json_wrapper)
     hset_args = []
     for history_key, json_wrapper in batch:
         hset_args.append(history_key)
-        hset_args.append(json.dumps(json_wrapper, ensure_ascii=False))
-
-    result = _exec(["HMSET", "GatekeeperAI"] + hset_args)
+        hset_args.append(json_wrapper)
+    result = _exec(["HSET", "GatekeeperAI"] + hset_args)
     return len(batch) if result is not None else 0
 
 
 def save_index(index_key, cid_list):
-    """Сохраняет индексный ключ."""
     if not cid_list:
         return
-    # Сохраняем как JSON-список
     wrapper = {
         "version": "v700-prod",
         "sender_repo": "football_data_loader",
@@ -961,10 +811,9 @@ def save_index(index_key, cid_list):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main processing
 # ---------------------------------------------------------------------------
 def process_csv(filepath, dry_run=False):
-    """Обрабатывает один CSV файл. Возвращает статистику."""
     season, league_code = parse_csv_filename(filepath)
     if not season or not league_code:
         _p(f"  [SKIP] Cannot parse filename: {filepath}")
@@ -972,76 +821,61 @@ def process_csv(filepath, dry_run=False):
 
     _p(f"\n[CSV] {os.path.basename(filepath)} — season={season}, league={league_code}")
 
-    stats_summary = {"total": 0, "loaded": 0, "errors": 0, "skipped": 0}
+    stats_summary = {"total": 0, "loaded": 0, "errors": 0}
     batch = []
     batch_size = 10
-
-    # Индексы для этого файла
-    team_index = {}  # team_clean → [cid, ...]
-    league_index = []  # [cid, ...]
-    date_index = {}  # yyyymmdd → [cid, ...]
+    team_index = {}
+    league_index = []
+    date_index = {}
 
     try:
-        with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                stats_summary["total"] += 1
-                ts = now_msk()
-
-                try:
-                    cid, wrapper, date_yyyymmdd = build_payload(row, season, league_code, ts)
-                    if not cid:
-                        stats_summary["errors"] += 1
-                        continue
-                except Exception as e:
+        f = open_csv(filepath)
+        reader = csv.DictReader(f)
+        for row in reader:
+            stats_summary["total"] += 1
+            ts = now_msk()
+            try:
+                cid, wrapper, date_yyyymmdd = build_payload(row, season, league_code, ts)
+                if not cid:
                     stats_summary["errors"] += 1
-                    if stats_summary["errors"] <= 3:
-                        _p(f"  [ERROR] Row {stats_summary['total']}: {e}")
                     continue
+            except Exception as e:
+                stats_summary["errors"] += 1
+                if stats_summary["errors"] <= 3:
+                    _p(f"  [ERROR] Row {stats_summary['total']}: {e}")
+                continue
+            history_key = f"history:match:{cid}"
+            json_wrapper = json.dumps(wrapper, ensure_ascii=False)
+            payload = wrapper["payload"]
+            home_clean = payload["home_clean"]
+            away_clean = payload["away_clean"]
+            team_index.setdefault(home_clean, []).append(cid)
+            team_index.setdefault(away_clean, []).append(cid)
+            league_index.append(cid)
+            date_index.setdefault(date_yyyymmdd, []).append(cid)
+            if not dry_run:
+                batch.append((history_key, json_wrapper))
+                if len(batch) >= batch_size:
+                    saved = save_batch_to_redis(batch)
+                    stats_summary["loaded"] += saved
+                    _p(f"  [BATCH] Loaded {stats_summary['loaded']}/{stats_summary['total']}...", end="\r")
+                    batch = []
+                    time.sleep(0.2)
+            else:
+                stats_summary["loaded"] += 1
+            if stats_summary["total"] % 100 == 0:
+                _p(f"  [PROG] Parsed {stats_summary['total']} rows, loaded {stats_summary['loaded']}...")
+        f.close()
 
-                history_key = f"history:match:{cid}"
-                json_wrapper = json.dumps(wrapper, ensure_ascii=False)
-
-                # Накапливаем индексы
-                payload = wrapper["payload"]
-                home_clean = payload["home_clean"]
-                away_clean = payload["away_clean"]
-
-                team_index.setdefault(home_clean, []).append(cid)
-                team_index.setdefault(away_clean, []).append(cid)
-                league_index.append(cid)
-                date_index.setdefault(date_yyyymmdd, []).append(cid)
-
-                if not dry_run:
-                    batch.append((history_key, json_wrapper))
-                    if len(batch) >= batch_size:
-                        saved = save_batch_to_redis(batch)
-                        stats_summary["loaded"] += saved
-                        _p(f"  [BATCH] Loaded {stats_summary['loaded']}/{stats_summary['total']}...", end="\r")
-                        batch = []
-                        time.sleep(0.2)
-                else:
-                    stats_summary["loaded"] += 1
-
-                # Прогресс
-                if stats_summary["total"] % 100 == 0:
-                    _p(f"  [PROG] Parsed {stats_summary['total']} rows, loaded {stats_summary['loaded']}...")
-
-        # Остаток батча
         if batch and not dry_run:
             saved = save_batch_to_redis(batch)
             stats_summary["loaded"] += saved
 
-        # Сохраняем индексы
         if not dry_run and league_index:
             _p(f"  [INDEX] Creating indexes for {len(league_index)} matches...")
-
-            # League index
             league_key = f"history:league:{league_code}"
             save_index(league_key, league_index)
             time.sleep(0.1)
-
-            # Team indexes (батч по 10)
             team_items = list(team_index.items())
             for i in range(0, len(team_items), 10):
                 batch_team = team_items[i:i+10]
@@ -1049,8 +883,6 @@ def process_csv(filepath, dry_run=False):
                     team_key = f"history:team:{team}"
                     save_index(team_key, cids)
                 time.sleep(0.1)
-
-            # Date indexes
             for date_str, cids in date_index.items():
                 date_key = f"history:index:{date_str}"
                 save_index(date_key, cids)
@@ -1072,11 +904,10 @@ def process_csv(filepath, dry_run=False):
 
 def main():
     _p("=" * 60)
-    _p("  football_data_loader_v2.py — v5.0 / 26-field payload")
+    _p("  football_data_loader.py — v5.0 / 26-field payload")
     _p(f"  Time: {now_msk()}")
     _p("=" * 60)
 
-    # Parse args
     base_dir = "csv_data"
     filter_season = None
     filter_league = None
@@ -1100,7 +931,6 @@ def main():
         else:
             i += 1
 
-    # Find CSV files
     pattern = os.path.join(base_dir, "**", "*.csv")
     all_csvs = sorted(glob.glob(pattern, recursive=True))
 
@@ -1109,16 +939,6 @@ def main():
         _p("  Run football_data_downloader.py first to download CSV files.")
         sys.exit(1)
 
-    # Initialize Redis connection (only if not dry-run)
-    if not dry_run:
-        _init_redis()
-        if _REDIS_MODE is None:
-            _p("[FATAL] No Redis backend available and not dry-run")
-            sys.exit(1)
-    else:
-        _p("[INFO] DRY RUN — Redis not needed")
-
-    # Filter
     if filter_season or filter_league:
         filtered = []
         for f in all_csvs:
@@ -1136,7 +956,11 @@ def main():
     _p(f"[INFO] TEAM_ALIASES: {len(TEAM_ALIASES)} entries")
     _p(f"[INFO] LEAGUE_MAP: {len(LEAGUE_MAP)} leagues")
 
-    # Process
+    if not dry_run:
+        if not _init_redis():
+            _p("[FATAL] No Redis backend available. Use --dry-run for testing.")
+            sys.exit(1)
+
     grand_total = {"total": 0, "loaded": 0, "errors": 0, "files": 0}
 
     for filepath in all_csvs:
@@ -1146,7 +970,6 @@ def main():
         grand_total["files"] += 1
         time.sleep(0.3)
 
-    # Summary
     _p("\n" + "=" * 60)
     _p("  SUMMARY")
     _p("=" * 60)
