@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""redis_diagnostics.py — GATEKEEPER-AI diagnostics"""
+"""redis_diagnostics.py — GATEKEEPER-AI diagnostics
+V2.0 — fixes: os import, match:index exclusion, odds format check, hub function tests.
+"""
 
+import os
 import sys
 import json
 import time
 import traceback
+from datetime import datetime, timezone, timedelta
 
 def _p(msg):
     print(msg, flush=True)
@@ -175,6 +179,51 @@ def _get_status(payload):
     return payload.get("status") or "?"
 
 
+def _check_odds_format(payload):
+    """Проверяет формат odds в матче: 1x2, current-вложенный, плоский, пустой."""
+    if not isinstance(payload, dict):
+        return "none"
+    odds = payload.get("odds", {})
+    if not isinstance(odds, dict):
+        return "none"
+    if "1x2" in odds:
+        return "1x2"
+    if "current" in odds and isinstance(odds.get("current"), dict):
+        return "current"
+    if "home" in odds:
+        return "flat"
+    return "empty"
+
+
+def _count_sources(payload):
+    """Считает количество источников в odds.1x2.sources."""
+    if not isinstance(payload, dict):
+        return 0
+    odds = payload.get("odds", {})
+    if not isinstance(odds, dict):
+        return 0
+    block = odds.get("1x2", {})
+    if not isinstance(block, dict):
+        return 0
+    sources = block.get("sources", [])
+    if not isinstance(sources, list):
+        return 0
+    return len(sources)
+
+
+def _get_verification(payload):
+    """Возвращает уровень верификации odds."""
+    if not isinstance(payload, dict):
+        return "UNVERIFIED"
+    odds = payload.get("odds", {})
+    if not isinstance(odds, dict):
+        return "UNVERIFIED"
+    block = odds.get("1x2", {})
+    if not isinstance(block, dict):
+        return "UNVERIFIED"
+    return block.get("_verification", "UNVERIFIED")
+
+
 def run_history():
     _p("=== HISTORY MODE ===")
     fields = load_all_fields()
@@ -182,14 +231,21 @@ def run_history():
         _p("[FATAL] No fields loaded")
         return
 
-    # --- Key breakdown ---
+    # --- Key breakdown (исключаем match:index:* из match:*) ---
     hist_keys = sorted([k for k in fields if k.startswith("history:match:")])
-    match_keys = sorted([k for k in fields if k.startswith("match:") and not k.startswith("history:")])
-    other_keys = sorted([k for k in fields if not k.startswith("history:match:") and not k.startswith("match:")])
+    match_keys = sorted([k for k in fields
+                         if k.startswith("match:")
+                         and not k.startswith("history:")
+                         and not k.startswith("match:index")])
+    index_keys = sorted([k for k in fields if k.startswith("match:index")])
+    other_keys = sorted([k for k in fields
+                         if not k.startswith("history:match:")
+                         and not k.startswith("match:")])
 
     _p(f"\n--- Key breakdown ---")
     _p(f"  history:match:* = {len(hist_keys)}")
     _p(f"  match:*         = {len(match_keys)}")
+    _p(f"  match:index:*   = {len(index_keys)}")
     _p(f"  other           = {len(other_keys)}")
 
     # --- Parse history ---
@@ -221,10 +277,30 @@ def run_history():
             "status": _get_status(payload),
             "home": payload.get("home_team") or "?",
             "away": payload.get("away_team") or "?",
+            "odds_format": _check_odds_format(payload),
+            "sources_count": _count_sources(payload),
         }
 
     _p(f"\n--- History parse ---")
     _p(f"  Parsed: {len(hist_data)}, Errors: {hist_errors}")
+
+    # --- History odds format check ---
+    hist_fmt = {}
+    for cid, d in hist_data.items():
+        fmt = d["odds_format"]
+        hist_fmt[fmt] = hist_fmt.get(fmt, 0) + 1
+    _p(f"\n--- History odds format ---")
+    for fmt in sorted(hist_fmt.keys()):
+        _p(f"  {fmt}: {hist_fmt[fmt]}")
+
+    # --- History odds coverage ---
+    hist_with_odds = sum(1 for d in hist_data.values() if d["odds_format"] != "empty" and d["odds_format"] != "none")
+    hist_with_sources = sum(1 for d in hist_data.values() if d["sources_count"] > 0)
+    hist_multi_source = sum(1 for d in hist_data.values() if d["sources_count"] >= 2)
+    _p(f"\n--- History odds coverage ---")
+    _p(f"  With odds:     {hist_with_odds}/{len(hist_data)}")
+    _p(f"  With sources:  {hist_with_sources}/{len(hist_data)}")
+    _p(f"  Multi-source:  {hist_multi_source}/{len(hist_data)}")
 
     # --- By season ---
     seasons = {}
@@ -277,6 +353,9 @@ def run_history():
             "status": _get_status(payload),
             "home": payload.get("home_team") or "?",
             "away": payload.get("away_team") or "?",
+            "odds_format": _check_odds_format(payload),
+            "sources_count": _count_sources(payload),
+            "verification": _get_verification(payload),
         }
 
     _p(f"\n--- match:* parse ---")
@@ -286,8 +365,30 @@ def run_history():
         for k, t, v in non_dict_payloads[:5]:
             _p(f"    {k}: type={t}, val={v}")
 
+    # --- match:* odds format check ---
+    match_fmt = {}
+    for cid, d in match_data.items():
+        fmt = d["odds_format"]
+        match_fmt[fmt] = match_fmt.get(fmt, 0) + 1
+    _p(f"\n--- match:* odds format ---")
+    for fmt in sorted(match_fmt.keys()):
+        _p(f"  {fmt}: {match_fmt[fmt]}")
+
+    # --- match:* odds coverage ---
+    match_with_odds = sum(1 for d in match_data.values() if d["odds_format"] != "empty" and d["odds_format"] != "none")
+    match_with_sources = sum(1 for d in match_data.values() if d["sources_count"] > 0)
+    match_multi_source = sum(1 for d in match_data.values() if d["sources_count"] >= 2)
+    match_verified = sum(1 for d in match_data.values() if d["verification"] == "VERIFIED")
+    match_warning = sum(1 for d in match_data.values() if d["verification"] == "WARNING")
+    _p(f"\n--- match:* odds coverage ---")
+    _p(f"  With odds:       {match_with_odds}/{len(match_data)}")
+    _p(f"  With sources:    {match_with_sources}/{len(match_data)}")
+    _p(f"  Multi-source:   {match_multi_source}/{len(match_data)}")
+    _p(f"  VERIFIED:        {match_verified}/{len(match_data)}")
+    _p(f"  WARNING:         {match_warning}/{len(match_data)}")
+
     # --- Split match:* into past / future / unknown ---
-    now_str = "2026-09-28"
+    now_str = datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%d")
     past_match = {}
     future_match = {}
     unknown_match = {}
@@ -389,8 +490,6 @@ def run_history():
     _p(f"  Duplicates       = {len(past_match) - len(lost)}")
     _p(f"  Lost             = {len(lost)}")
     _p(f"  history + lost   = {len(hist_data) + len(lost)}")
-    _p(f"  Expected         = 17034")
-    _p(f"  Diff             = {17034 - len(hist_data) - len(lost)}")
     _p(f"\n=== HISTORY COMPLETE ===")
 
 
@@ -424,6 +523,32 @@ def run_test():
     _p(f"  Total: {len(r)}")
     _p(f"  First 10: {r[:10]}")
 
+    # --- 5. Hub function tests ---
+    _p("\n--- 5. Hub function tests ---")
+    try:
+        cid = gatekeeper_hub.build_canonical_id("Chelsea", "Arsenal", "2026-09-30T15:00:00Z")
+        _p(f"  build_canonical_id: {cid}")
+    except Exception as e:
+        _p(f"  build_canonical_id: ERROR — {e}")
+
+    try:
+        m = gatekeeper_hub.get_match("nonexistent__test__20260101")
+        _p(f"  get_match(nonexistent): {m}")
+    except Exception as e:
+        _p(f"  get_match: ERROR — {e}")
+
+    try:
+        h = gatekeeper_hub.get_history("nonexistent__test__20260101")
+        _p(f"  get_history(nonexistent): {h}")
+    except Exception as e:
+        _p(f"  get_history: ERROR — {e}")
+
+    try:
+        empty_odds = gatekeeper_hub.get_all_odds({})
+        _p(f"  get_all_odds({{}}): {empty_odds}")
+    except Exception as e:
+        _p(f"  get_all_odds: ERROR — {e}")
+
     _p("\n=== TEST COMPLETE ===")
 
 
@@ -434,21 +559,53 @@ def run_diagnostics():
         _p("[FATAL] No fields loaded")
         return
     hist = [k for k in fields if k.startswith("history:match:")]
-    match = [k for k in fields if k.startswith("match:") and not k.startswith("history:")]
-    other = [k for k in fields if not k.startswith("history:match:") and not k.startswith("match:")]
-    _p(f"\nTotal: {len(fields)} (history={len(hist)}, match={len(match)}, other={len(other)})")
+    match_real = [k for k in fields
+                  if k.startswith("match:")
+                  and not k.startswith("history:")
+                  and not k.startswith("match:index")]
+    index_keys = [k for k in fields if k.startswith("match:index")]
+    other = [k for k in fields
+             if not k.startswith("history:match:")
+             and not k.startswith("match:")]
+    _p(f"\nTotal: {len(fields)} (history={len(hist)}, match={len(match_real)}, "
+        f"index={len(index_keys)}, other={len(other)})")
     if other[:10]:
         _p(f"Other keys sample: {other[:10]}")
+
+    # --- Odds format check for match:* ---
+    fmt_counts = {"1x2": 0, "current": 0, "flat": 0, "empty": 0, "none": 0}
+    src_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    verification_counts = {"VERIFIED": 0, "WARNING": 0, "UNVERIFIED": 0}
+    for key in match_real:
+        payload = _unwrap(fields[key])
+        fmt = _check_odds_format(payload)
+        fmt_counts[fmt] = fmt_counts.get(fmt, 0) + 1
+        src = _count_sources(payload)
+        if src > 3:
+            src = 3
+        src_counts[src] = src_counts.get(src, 0) + 1
+        ver = _get_verification(payload)
+        verification_counts[ver] = verification_counts.get(ver, 0) + 1
+
+    _p(f"\n--- match:* odds format ---")
+    for fmt in sorted(fmt_counts.keys()):
+        _p(f"  {fmt}: {fmt_counts[fmt]}")
+
+    _p(f"\n--- match:* sources count ---")
+    for s in sorted(src_counts.keys()):
+        _p(f"  {s}+ sources: {src_counts[s]}")
+
+    _p(f"\n--- match:* verification ---")
+    for v in sorted(verification_counts.keys()):
+        _p(f"  {v}: {verification_counts[v]}")
+
     _p(f"\n=== DIAGNOSTICS COMPLETE ===")
 
 
 if __name__ == "__main__":
     _p(f"[DIAG] Python {sys.version}")
-    _p(f"[DIAG] CWD: {os.getcwd() if 'os' in dir() else '?'}")
-    _p(f"[DIAG] Args: {sys.argv}")
-
-    import os
     _p(f"[DIAG] CWD: {os.getcwd()}")
+    _p(f"[DIAG] Args: {sys.argv}")
 
     mode = ""
     for arg in sys.argv[1:]:
@@ -467,10 +624,20 @@ if __name__ == "__main__":
                 _p(f"Flushing (hard={hard})...")
                 keys = _exec(["HKEYS", "GatekeeperAI"])
                 if keys:
-                    live_keys = [k for k in keys if k.startswith("live:")]
-                    _p(f"Deleting {len(live_keys)} live keys...")
-                    for k in live_keys:
-                        _exec(["HDEL", "GatekeeperAI", k])
+                    if hard:
+                        # Hard flush: delete all match:* (excluding history:match:* and analysis:*)
+                        keys_to_delete = [k for k in keys
+                                          if k.startswith("match:")
+                                          and not k.startswith("history:")]
+                        _p(f"Hard flush: deleting {len(keys_to_delete)} keys (match:* + match:index:*)")
+                        for k in keys_to_delete:
+                            _exec(["HDEL", "GatekeeperAI", k])
+                    else:
+                        # Soft flush: delete only live: keys
+                        live_keys = [k for k in keys if k.startswith("live:")]
+                        _p(f"Soft flush: deleting {len(live_keys)} live keys")
+                        for k in live_keys:
+                            _exec(["HDEL", "GatekeeperAI", k])
                     _p("Flush complete.")
             else:
                 _p("Use --flush --yes to confirm")
@@ -479,4 +646,3 @@ if __name__ == "__main__":
     except Exception as e:
         _p(f"[FATAL] Unhandled exception: {e}")
         traceback.print_exc()
-                                                                                          

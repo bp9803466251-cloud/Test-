@@ -16,6 +16,13 @@
   - _betradar_consensus — cross-check SharpAPI vs OddsAPI
   - _mad_outlier — MAD outlier detection для odds
 
+Обновления V5.0 (единый формат 1x2):
+  - build_canonical_id() — публичная обёртка для загрузчика и нормализации
+  - _normalize_incoming_odds() — нормализация любого входа (1x2, current, плоский) → плоский price
+  - _count_independent() — подсчёт уникальных upstream в sources[]
+  - _build_1x2() — создание начального 1x2 блока из плоского price
+  - get_all_odds() — полные odds-данные одним вызовом для value_engine и main.py
+
 Сохранено из v600:
   - CAS-версионирование (поле version) внутри patch_match
   - Шардированный индекс по датам (match:index:YYYYMMDD)
@@ -1660,3 +1667,247 @@ def run_initialization() -> Dict[str, Any]:
           f"мигрировано {metrics.get('cleanup_migrated', 0)}, "
           f"latency {latency_ms}ms")
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# V5.0: Единый формат 1x2 — публичные функции для всех модулей
+# ---------------------------------------------------------------------------
+
+def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
+    """
+    Публичная обёртка над _make_canonical_id.
+    Используется football_data_loader и normalize_history_ids
+    вместо собственной реализации — гарантирует единый canonical_id.
+    """
+    return _make_canonical_id(home_team, away_team, date_utc)
+
+
+def _normalize_incoming_odds(data: Any) -> Optional[dict]:
+    """
+    Нормализует любой входной формат odds к плоскому price dict.
+    Принимает:
+      - 1x2-формат: {"1x2": {"current": {"home": "1.85", ...}}}
+      - current-вложенный: {"current": {"home": "1.85", ...}}
+      - плоский: {"home": "1.85", "draw": "3.60", "away": "2.10"}
+    Возвращает:
+      - {"home": "1.85", "draw": "3.60", "away": "2.10"} или None
+    """
+    if not isinstance(data, dict):
+        return None
+
+    # 1x2-формат
+    if "1x2" in data:
+        block = data.get("1x2", {})
+        if isinstance(block, dict):
+            cur = block.get("current", {})
+            if isinstance(cur, dict) and "home" in cur:
+                return {
+                    "home": str(cur.get("home", "")),
+                    "draw": str(cur.get("draw", "")),
+                    "away": str(cur.get("away", "")),
+                }
+
+    # current-вложенный
+    if "current" in data and isinstance(data["current"], dict):
+        cur = data["current"]
+        if "home" in cur:
+            return {
+                "home": str(cur.get("home", "")),
+                "draw": str(cur.get("draw", "")),
+                "away": str(cur.get("away", "")),
+            }
+
+    # плоский
+    if "home" in data:
+        return {
+            "home": str(data.get("home", "")),
+            "draw": str(data.get("draw", "")),
+            "away": str(data.get("away", "")),
+        }
+
+    return None
+
+
+def _count_independent(sources: list) -> int:
+    """
+    Подсчёт уникальных upstream в sources[].
+    Исключает 'unknown' — только реальные провайдеры.
+    Используется в get_all_odds и доступна для diagnostics.
+    """
+    if not isinstance(sources, list):
+        return 0
+    upstreams = set()
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        up = s.get("upstream", "unknown")
+        if up and up != "unknown":
+            upstreams.add(up)
+    return len(upstreams)
+
+
+def _build_1x2(price: dict, source: str, upstream: str,
+               timestamp: str = None, odds_type: str = "closing") -> dict:
+    """
+    Создание начального 1x2 блока из плоского price.
+    Используется football_data_loader для записи history
+    с правильной структурой 1x2 (а не плоским форматом).
+    """
+    if timestamp is None:
+        timestamp = _now_msk()
+
+    if not isinstance(price, dict):
+        price = {}
+
+    flat = {
+        "home": str(price.get("home", "")),
+        "draw": str(price.get("draw", "")),
+        "away": str(price.get("away", "")),
+    }
+
+    return {
+        "1x2": {
+            "current": dict(flat),
+            "opening": dict(flat),
+            "best": dict(flat),
+            "sources": [{
+                "source": source,
+                "upstream": upstream,
+                "price": dict(flat),
+                "timestamp": timestamp,
+                "type": odds_type,
+            }],
+        }
+    }
+
+
+def get_all_odds(match_payload: dict) -> dict:
+    """
+    Полные odds-данные одним вызовом.
+    Возвращает current, opening, best, sources, independent_sources,
+    verification, movement — всё что нужно value_engine и main.py.
+
+    Для старого формата (плоский или current-вложенный) —
+    возвращает что есть, independent_sources=0.
+    """
+    odds = match_payload.get("odds", {})
+    if not isinstance(odds, dict):
+        return _empty_all_odds()
+
+    # Новый формат: 1x2
+    if "1x2" in odds:
+        block = odds.get("1x2", {})
+        if not isinstance(block, dict):
+            return _empty_all_odds()
+
+        sources = block.get("sources", [])
+        if not isinstance(sources, list):
+            sources = []
+
+        # Opening: prefer explicit opening, fallback to first source
+        opening = block.get("opening", {})
+        if not isinstance(opening, dict) or not opening:
+            if sources and isinstance(sources[0].get("price"), dict):
+                opening = sources[0]["price"]
+            else:
+                opening = {}
+
+        # Best
+        best = block.get("best", {})
+        if not isinstance(best, dict):
+            best = {}
+
+        # Current
+        current = block.get("current", {})
+        if not isinstance(current, dict):
+            current = {}
+
+        # Upstreams
+        upstreams = list(set(
+            s.get("upstream", "unknown") for s in sources
+            if isinstance(s, dict) and s.get("upstream", "unknown") != "unknown"
+        ))
+
+        # Metadata from block (if computed by _merge_odds)
+        verification = block.get("_verification", "UNVERIFIED")
+        if not isinstance(verification, str):
+            verification = "UNVERIFIED"
+
+        independent = _count_independent(sources)
+        if independent >= 2:
+            verification = "VERIFIED"
+        elif independent == 1:
+            verification = "WARNING" if verification == "UNVERIFIED" else verification
+
+        betradar_consensus = block.get("_betradar_consensus", False)
+        outlier_detected = block.get("_outlier_detected", False)
+        movement = block.get("movement", {})
+        if not isinstance(movement, dict):
+            movement = {}
+
+        return {
+            "current": current,
+            "opening": opening,
+            "best": best,
+            "sources": sources,
+            "independent_sources": independent,
+            "verification": verification,
+            "betradar_consensus": bool(betradar_consensus),
+            "outlier_detected": bool(outlier_detected),
+            "movement": movement,
+            "upstreams": upstreams,
+        }
+
+    # Промежуточный формат: current-вложенный
+    if "current" in odds and isinstance(odds["current"], dict):
+        cur = odds["current"]
+        return {
+            "current": cur,
+            "opening": {},
+            "best": cur,
+            "sources": [],
+            "independent_sources": 0,
+            "verification": "UNVERIFIED",
+            "betradar_consensus": False,
+            "outlier_detected": False,
+            "movement": {},
+            "upstreams": [],
+        }
+
+    # Старый формат: плоский
+    if "home" in odds:
+        flat = {
+            "home": str(odds.get("home", "")),
+            "draw": str(odds.get("draw", "")),
+            "away": str(odds.get("away", "")),
+        }
+        return {
+            "current": flat,
+            "opening": {},
+            "best": flat,
+            "sources": [],
+            "independent_sources": 0,
+            "verification": "UNVERIFIED",
+            "betradar_consensus": False,
+            "outlier_detected": False,
+            "movement": {},
+            "upstreams": [],
+        }
+
+    return _empty_all_odds()
+
+
+def _empty_all_odds() -> dict:
+    """Заглушка для отсутствующих odds."""
+    return {
+        "current": {},
+        "opening": {},
+        "best": {},
+        "sources": [],
+        "independent_sources": 0,
+        "verification": "UNVERIFIED",
+        "betradar_consensus": False,
+        "outlier_detected": False,
+        "movement": {},
+        "upstreams": [],
+    }

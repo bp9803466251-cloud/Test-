@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Gatekeeper-AI v700-prod — Main Pipeline (Dashboard + Telegram)
-V7.0.0
+V7.0.1 — value_engine вместо SearchModule
 """
 import os
 import sys
@@ -15,13 +15,17 @@ from datetime import datetime, timezone, timedelta
 from gatekeeper_hub import (
     run_initialization,
     get_matches_by_date_range,
+    get_match,
+    get_history,
+    get_current_odds,
+    get_all_odds,
+    get_odds_metadata,
     save_search_results,
     save_analysis,
-    get_current_odds,
-    get_odds_metadata,
     get_from_cache,
 )
-from search_module import SearchModule, _parse_date_msk, _get_competition_code
+from search_module import _parse_date_msk, _get_competition_code
+from value_engine import batch_evaluate
 
 MSK_TZ = timezone(timedelta(hours=3))
 VALUE_THRESHOLD = float(os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
@@ -131,7 +135,7 @@ def _ecosystem_line() -> str:
         else:
             markers.append(f"{name}-")
     if os.environ.get("SHARPAPI_FLUSH_OLD") == "1":
-        markers.append("Flush🧹")
+        markers.append("Flush\U0001f9f9")
     else:
         markers.append("Flush+")
     return " | ".join(markers)
@@ -206,20 +210,20 @@ def _verification_badge(info: dict) -> str:
         return ""
     level = v.get("level", "")
     if level == "VERIFIED":
-        return " ✅"
+        return " \u2705"
     elif level == "CONSENSUS":
-        return " 🔒"
+        return " \U0001f512"
     elif level == "SINGLE":
-        return " ⚠️"
+        return " \u26a0\ufe0f"
     return ""
 
 
 def _fmt_bet(info: dict, is_hot: bool) -> tuple:
-    arrow = "➔"
+    arrow = "\u2794"
     badge = _verification_badge(info)
 
     if is_hot and info.get("is_fire"):
-        header = f"{arrow} {{n}} | 🔥{badge} | {html.escape(info['comp_code'])} | {info['date']} | {info['time']}"
+        header = f"{arrow} {{n}} | \U0001f525{badge} | {html.escape(info['comp_code'])} | {info['date']} | {info['time']}"
     else:
         header = f"{arrow} {{n}}{badge} | {html.escape(info['comp_code'])} | {info['date']} | {info['time']}"
 
@@ -253,7 +257,7 @@ def _format_dashboard(result: dict) -> str:
     stats = result["stats"]
 
     if hot:
-        lines.append(f"🎯 HOT BETS ({len(hot)})")
+        lines.append(f"\U0001f3af HOT BETS ({len(hot)})")
         lines.append("")
         for i, info in enumerate(hot, 1):
             header, teams, data = _fmt_bet(info, is_hot=True)
@@ -262,12 +266,12 @@ def _format_dashboard(result: dict) -> str:
             lines.append(data)
             lines.append("")
     else:
-        lines.append("🎯 HOT BETS (0)")
+        lines.append("\U0001f3af HOT BETS (0)")
         lines.append("Нет кандидатов в топе.")
         lines.append("")
 
     if warm:
-        lines.append(f"⚠️ WARM BETS ({len(warm)})")
+        lines.append(f"\u26a0\ufe0f WARM BETS ({len(warm)})")
         lines.append("")
         for i, info in enumerate(warm, 1):
             header, teams, data = _fmt_bet(info, is_hot=False)
@@ -276,22 +280,22 @@ def _format_dashboard(result: dict) -> str:
             lines.append(data)
             lines.append("")
     else:
-        lines.append("⚠️ WARM BETS (0)")
+        lines.append("\u26a0\ufe0f WARM BETS (0)")
         lines.append("Нет кандидатов.")
         lines.append("")
 
     now_str = datetime.now(MSK_TZ).strftime("%H:%M")
     module = _last_module()
     status_parts = [
-        "🌐 Redis+",
-        f"📦{stats['total']}",
-        f"📊Odds:{stats['with_odds']}",
-        f"🔥Value:{stats['value_bets']}",
+        "\U0001f310 Redis+",
+        f"\U0001f4e6{stats['total']}",
+        f"\U0001f4caOdds:{stats['with_odds']}",
+        f"\U0001f525Value:{stats['value_bets']}",
         f"Pred:{stats['with_pred']}",
         f"H2H:{stats['with_h2h']}",
         f"Stats:{stats['with_stats']}",
-        f"🕒{now_str}",
-        f"⭐{module}",
+        f"\U0001f552{now_str}",
+        f"\u2b50{module}",
     ]
     lines.append(" | ".join(status_parts))
     lines.append(_ecosystem_line())
@@ -310,9 +314,9 @@ def main():
     print("[DASH] Инициализация Redis...")
     init = run_initialization()
     if not init or not init.get("redis_available"):
-        print("[DASH] ❌ Redis недоступен")
+        print("[DASH] \u274c Redis недоступен")
         dashboard = (
-            "🌐 Redis- | Пайплайн работает в graceful degradation | "
+            "\U0001f310 Redis- | Пайплайн работает в graceful degradation | "
             "Данные не обновлены\n"
             + _ecosystem_line()
         )
@@ -323,22 +327,22 @@ def main():
     print(f"[DASH] Redis init OK, latency={latency}ms")
 
     matches = get_matches_by_date_range()
-    print(f"[DASH] get_matches_by_date_range → {len(matches)} матчей")
+    print(f"[DASH] get_matches_by_date_range \u2192 {len(matches)} матчей")
 
     if not matches:
         print("[DASH] Нет матчей для анализа")
         now_str = datetime.now(MSK_TZ).strftime("%H:%M")
         module = _last_module()
         dashboard = (
-            f"📦 Нет матчей для анализа\n"
-            f"🌐 Redis+ | 📦0 | 📊Odds:0 | 🕒{now_str} | ⭐{module}\n"
+            f"\U0001f4e6 Нет матчей для анализа\n"
+            f"\U0001f310 Redis+ | \U0001f4e60 | \U0001f4caOdds:0 | \U0001f552{now_str} | \u2b50{module}\n"
             + _ecosystem_line()
         )
         _send_telegram(dashboard)
         return
 
-    search = SearchModule(value_threshold=VALUE_THRESHOLD)
-    result = search.process(matches)
+    print(f"[DASH] Value-анализ через value_engine (threshold={VALUE_THRESHOLD})...")
+    result = batch_evaluate(matches, value_threshold=VALUE_THRESHOLD)
 
     print(f"[DASH] HOT: {len(result['hot'])}, WARM: {len(result['warm'])}, "
           f"Value: {result['stats']['value_bets']}")
