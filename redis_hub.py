@@ -232,7 +232,7 @@ def get_all_fields() -> Dict[str, Any]:
         cursor = next_cursor
 
     if iterations >= max_iterations:
-        print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), прочитано {len(result)} полей, возможно не все")
+        print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), возможно не все поля прочитаны")
 
     return result
 
