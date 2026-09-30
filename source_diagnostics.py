@@ -28,107 +28,6 @@ MSK_TIMEZONE = timezone(timedelta(hours=3))
 
 
 # ---------------------------------------------------------------------------
-# Helpers для v700 формата
-# ---------------------------------------------------------------------------
-
-def _get_current_odds(match: dict) -> dict | None:
-    """
-    Извлекает текущие коэффициенты из матча в v700 формате.
-    Проверяет:
-      1) match["odds"]["current"]["home"/"draw"/"away"]
-      2) match["odds"]["home"/"draw"/"away"]  (старый плоский формат)
-      3) match["sources"] — список с odds от разных upstream'ов
-    Возвращает dict {home, draw, away} или None.
-    """
-    # 1. v700 nested: odds.current.{home,draw,away}
-    odds = match.get("odds", {})
-    if isinstance(odds, dict):
-        current = odds.get("current")
-        if isinstance(current, dict):
-            home = current.get("home")
-            draw = current.get("draw")
-            away = current.get("away")
-            if home and home != "-" and home != "":
-                return {"home": home, "draw": draw, "away": away}
-        # 2. Старый плоский формат: odds.{home,draw,away}
-        home = odds.get("home")
-        if home and home != "-" and home != "":
-            return {"home": home, "draw": odds.get("draw"), "away": odds.get("away")}
-
-    # 3. sources[] — odds от разных upstream'ов
-    sources = match.get("sources", [])
-    if isinstance(sources, list):
-        for s in sources:
-            if not isinstance(s, dict):
-                continue
-            s_odds = s.get("odds", {})
-            if not isinstance(s_odds, dict):
-                continue
-            current = s_odds.get("current")
-            if isinstance(current, dict):
-                home = current.get("home")
-                if home and home != "-" and home != "":
-                    return {"home": home, "draw": current.get("draw"), "away": current.get("away")}
-            # плоский fallback
-            home = s_odds.get("home")
-            if home and home != "-" and home != "":
-                return {"home": home, "draw": s_odds.get("draw"), "away": s_odds.get("away")}
-
-    return None
-
-
-# Ключи, которые означают, что H2H реально заполнен (а не пустая заглушка)
-_H2H_KEYS = {"total", "home_wins", "draws", "away_wins", "recent", "matches", "source"}
-
-def _has_meaningful_h2h(match: dict) -> bool:
-    """Проверяет, есть ли в матче реальный H2H (а не пустой словарь)."""
-    h2h = match.get("h2h", {})
-    if not isinstance(h2h, dict) or not h2h:
-        return False
-    # Есть хотя бы один meaningful key с непустым значением
-    for k in _H2H_KEYS:
-        v = h2h.get(k)
-        if v is not None and v != "" and v != 0:
-            return True
-    # Проверяем extra — Bzzoiro может класть h2h туда
-    extra = match.get("extra", {})
-    if isinstance(extra, dict):
-        bzz_h2h = extra.get("bzzoiro_h2h")
-        if isinstance(bzz_h2h, dict) and bzz_h2h:
-            for k in _H2H_KEYS:
-                v = bzz_h2h.get(k)
-                if v is not None and v != "" and v != 0:
-                    return True
-    return False
-
-
-# Ключи, которые означают, что prediction реально заполнен
-_PRED_KEYS = {
-    "predicted_home", "predicted_away", "predicted_score_home", "predicted_score_away",
-    "home_win_prob", "draw_prob", "away_win_prob",
-    "winner", "predicted_winner", "source",
-    "prediction", "predictions", "model",
-}
-
-def _has_meaningful_pred(match: dict) -> bool:
-    """Проверяет, есть ли в матче реальный prediction (а не пустой словарь)."""
-    predictions = match.get("predictions", {})
-    if isinstance(predictions, dict) and predictions:
-        for k in _PRED_KEYS:
-            if k in predictions:
-                return True
-    # Проверяем extra
-    extra = match.get("extra", {})
-    if isinstance(extra, dict):
-        bzz_pred = extra.get("bzzoiro_prediction")
-        if isinstance(bzz_pred, dict) and bzz_pred:
-            for k in _PRED_KEYS:
-                if k in bzz_pred:
-                    return True
-    return False
-
-
-# ---------------------------------------------------------------------------
 # 1. Диагностика источников
 # ---------------------------------------------------------------------------
 def diagnose_sources() -> dict:
@@ -364,6 +263,71 @@ def diagnose_redis() -> dict:
 
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Хелперы для v700-формата
+# ---------------------------------------------------------------------------
+_H2H_KEYS = {"total", "home_wins", "draws", "away_wins", "recent", "matches"}
+_PRED_KEYS = {"predicted_home", "predicted_away", "home_win_prob", "draw_prob",
+              "away_win_prob", "winner", "predicted_score", "confidence",
+              "predicted_winner", "home_score", "away_score"}
+
+
+def _get_current_odds(match: dict) -> bool:
+    """Проверяет наличие реальных коэффициентов в v700-формате."""
+    odds = match.get("odds")
+    if not isinstance(odds, dict):
+        return False
+    # v700: odds.current.{home,draw,away}
+    current = odds.get("current")
+    if isinstance(current, dict):
+        for k in ("home", "draw", "away"):
+            v = current.get(k)
+            if v and v != "-" and v != 0 and v != "0":
+                return True
+    # Fallback: плоский формат
+    for k in ("home", "draw", "away"):
+        v = odds.get(k)
+        if v and v != "-" and v != 0 and v != "0":
+            return True
+    # Fallback: sources[] (мульти-upstream)
+    sources = odds.get("sources")
+    if isinstance(sources, list):
+        for src in sources:
+            if isinstance(src, dict):
+                cur = src.get("current", src)
+                if isinstance(cur, dict):
+                    for k in ("home", "draw", "away"):
+                        v = cur.get(k)
+                        if v and v != "-" and v != 0 and v != "0":
+                            return True
+    return False
+
+
+def _has_meaningful_h2h(match: dict) -> bool:
+    """Проверяет наличие реальных H2H данных в v700-формате."""
+    h2h = match.get("h2h")
+    if not isinstance(h2h, dict) or not h2h:
+        return False
+    for key in _H2H_KEYS:
+        val = h2h.get(key)
+        if val is not None and val != 0 and val != [] and val != "":
+            return True
+    return False
+
+
+def _has_meaningful_pred(match: dict) -> bool:
+    """Проверяет наличие реальных prediction данных в v700-формате."""
+    pred = match.get("predictions")
+    if not isinstance(pred, dict) or not pred:
+        return False
+    for key in _PRED_KEYS:
+        val = pred.get(key)
+        if val is not None and val != "" and val != 0 and val != "-":
+            return True
+    return False
+
+
 # 3. Диагностика матчей
 # ---------------------------------------------------------------------------
 def diagnose_matches() -> dict:
@@ -399,12 +363,9 @@ def diagnose_matches() -> dict:
         if not isinstance(match, dict):
             continue
 
-        # --- Odds: v700 nested формат ---
-        current_odds = _get_current_odds(match)
-        if current_odds and current_odds.get("home") and current_odds["home"] != "-":
+        if _get_current_odds(match):
             with_odds += 1
 
-        # --- Value bet ---
         value = match.get("value")
         if value is not None:
             try:
@@ -413,26 +374,21 @@ def diagnose_matches() -> dict:
             except (ValueError, TypeError):
                 pass
 
-        # --- Stats ---
         stats = match.get("stats", {})
         if isinstance(stats, dict) and stats:
             with_stats += 1
 
-        # --- Predictions: meaningful keys ---
         if _has_meaningful_pred(match):
             with_predictions += 1
 
-        # --- H2H: meaningful keys ---
         if _has_meaningful_h2h(match):
             with_h2h += 1
 
-        # --- Sources ---
         sources_list = match.get("sources", [])
         if isinstance(sources_list, list):
             for s in sources_list:
                 source_counts[s] = source_counts.get(s, 0) + 1
 
-        # --- Age ---
         created = match.get("created_at", "")
         if created:
             try:
@@ -509,10 +465,9 @@ def diagnose_errors() -> dict:
             errors.append({"source": "odds_api", "count": err_count})
             print(f"   🎲 OddsAPI: {err_count} ошибок")
 
-    # Propline
     propline_meta = get_from_cache("propline:meta")
     if propline_meta and isinstance(propline_meta, dict):
-        err_count = propline_meta.get("error_count", 0)
+        err_count = propline_meta.get("error_count", propline_meta.get("errors", 0))
         if err_count > 0:
             errors.append({"source": "propline", "count": err_count})
             print(f"   🏆 Propline: {err_count} ошибок")
