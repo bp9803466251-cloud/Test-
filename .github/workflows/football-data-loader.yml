@@ -1,0 +1,59 @@
+name: Football Data Loader
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: 'Сезон (напр. 2024 — пусто = текущий)'
+        required: false
+        default: ''
+      history_days:
+        description: 'Дней истории (по умолчанию 30)'
+        required: false
+        default: '30'
+      rate_delay:
+        description: 'Задержка между запросами (сек)'
+        required: false
+        default: '0.15'
+
+jobs:
+  load-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run Football Data Loader
+      env:
+        FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+        UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+        UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+        SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+        FOOTBALL_DATA_HISTORY_DAYS: ${{ github.event.inputs.history_days }}
+        FOOTBALL_DATA_SEASON: ${{ github.event.inputs.season }}
+        FOOTBALL_DATA_RATE_DELAY: ${{ github.event.inputs.rate_delay }}
+      run: |
+        python football_data_to_redis.py
+
+    - name: Run Season Check
+      env:
+        UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+        UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+        SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+      run: |
+        python seasons_check.py
+        
