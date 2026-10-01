@@ -65,19 +65,26 @@ def _exec_upstash(cmd):
         return json.loads(body).get("result")
 
 
-def _exec(cmd):
-    try:
-        if _REDIS_MODE == "redis_hub":
-            import redis_hub
-            return redis_hub._execute_upstash_cmd(cmd)
-        elif _REDIS_MODE == "upstash":
-            return _exec_upstash(cmd)
-        else:
-            _p("[ERROR] No Redis backend initialised")
-            return None
-    except Exception as e:
-        _p(f"[REDIS ERROR] {e}")
-        return None
+def _exec(cmd, max_retries=0):
+    for attempt in range(max_retries + 1):
+        try:
+            if _REDIS_MODE == "redis_hub":
+                import redis_hub
+                return redis_hub._execute_upstash_cmd(cmd)
+            elif _REDIS_MODE == "upstash":
+                return _exec_upstash(cmd)
+            else:
+                _p("[ERROR] No Redis backend initialised")
+                return None
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 2 * (attempt + 1)
+                _p(f"[REDIS ERROR] {e} (attempt {attempt+1}/{max_retries+1}, retry in {wait}s)")
+                time.sleep(wait)
+            else:
+                _p(f"[REDIS ERROR] {e} (no more retries)")
+                return None
+    return None
 
 
 def _safe_json(val):
@@ -103,20 +110,27 @@ def _unwrap(raw):
 
 
 def _hscan_all(hash_name, match_pattern=None):
-    """Итерация по большому хэшу через HSCAN (без таймаута HKEYS)."""
+    """Итерация по большому хэшу через HSCAN с retry при таймауте."""
     cursor = "0"
     all_keys = []
+    consecutive_failures = 0
     while True:
         cmd = ["HSCAN", hash_name, str(cursor)]
         if match_pattern:
             cmd.append("MATCH")
             cmd.append(match_pattern)
         cmd.append("COUNT")
-        cmd.append("500")
-        result = _exec(cmd)
+        cmd.append("100")
+        result = _exec(cmd, max_retries=2)
         if result is None:
-            _p(f"[WARN] HSCAN returned None at cursor={cursor}")
-            break
+            consecutive_failures += 1
+            _p(f"[WARN] HSCAN returned None at cursor={cursor} (failures={consecutive_failures})")
+            if consecutive_failures >= 5:
+                _p(f"[WARN] Too many consecutive failures, stopping scan")
+                break
+            time.sleep(3)
+            continue
+        consecutive_failures = 0
         if isinstance(result, str):
             try:
                 result = json.loads(result)
@@ -131,22 +145,36 @@ def _hscan_all(hash_name, match_pattern=None):
             all_keys.extend(field_names)
         if cursor == "0" or cursor == 0:
             break
-        time.sleep(0.05)
+        time.sleep(0.1)
     return all_keys
 
 
 def load_all_fields():
-    """Загружает все поля хэша через HSCAN (не таймаутит на больших хэшах)."""
-    _p("[LOAD] Scanning via HSCAN...")
+    """Загружает все поля хэша через HSCAN с retry и маленькими батчами."""
+    # Сначала узнаем общий размер
+    hlen = _exec(["HLEN", "GatekeeperAI"])
+    if hlen is not None:
+        _p(f"[LOAD] HLEN = {hlen} fields expected")
+    _p("[LOAD] Scanning via HSCAN (COUNT=100, retry=2)...")
     cursor = "0"
     all_fields = {}
     batch_num = 0
+    consecutive_failures = 0
     while True:
-        cmd = ["HSCAN", "GatekeeperAI", str(cursor), "COUNT", "500"]
-        result = _exec(cmd)
+        cmd = ["HSCAN", "GatekeeperAI", str(cursor), "COUNT", "100"]
+        result = _exec(cmd, max_retries=2)
         if result is None:
-            _p(f"[WARN] HSCAN returned None at cursor={cursor}")
-            break
+            consecutive_failures += 1
+            _p(f"[WARN] HSCAN returned None at cursor={cursor} (failures={consecutive_failures})")
+            if consecutive_failures >= 5:
+                _p(f"[WARN] Too many consecutive failures, stopping scan")
+                break
+            # Ждём подольше перед retry и пробуем с того же курсора
+            wait = 5 * consecutive_failures
+            _p(f"[LOAD] Waiting {wait}s before retry from cursor={cursor}...")
+            time.sleep(wait)
+            continue
+        consecutive_failures = 0
         if isinstance(result, str):
             try:
                 result = json.loads(result)
@@ -163,13 +191,19 @@ def load_all_fields():
                 if v is not None:
                     all_fields[k] = _safe_json(v)
         batch_num += 1
-        if batch_num % 50 == 0:
-            _p(f"[LOAD] Scanned {len(all_fields)} fields so far...")
+        if batch_num % 20 == 0:
+            _p(f"[LOAD] Scanned {len(all_fields)} fields so far (batch #{batch_num}, cursor={cursor})...")
         if cursor == "0" or cursor == 0:
             break
-        time.sleep(0.05)
+        time.sleep(0.1)
 
     _p(f"[LOAD] Done: {len(all_fields)} fields")
+    if hlen is not None:
+        hlen_int = int(hlen) if hlen else 0
+        if len(all_fields) < hlen_int:
+            _p(f"[LOAD] WARNING: loaded {len(all_fields)} but HLEN={hlen_int} — {hlen_int - len(all_fields)} fields missing!")
+        elif len(all_fields) == hlen_int:
+            _p(f"[LOAD] OK: loaded count matches HLEN")
     return all_fields
 
 
