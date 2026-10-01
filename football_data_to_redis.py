@@ -136,13 +136,7 @@ class RedisClient:
         self.MAX_PIPELINE = 50  # max commands per pipeline
         self.BATCH_DELAY = 0.15  # 150ms between batches
 
-    def _headers(self):
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-
-    def _post(self, body):
+        def _post(self, body, path=""):
         if self.cb.is_open():
             wait = self.cb.remaining_cooldown()
             if wait > 0:
@@ -151,7 +145,7 @@ class RedisClient:
                 self.cb.state = "half_open"
 
         req = urllib.request.Request(
-            self.url,
+            self.url + path,
             data=json.dumps(body).encode(),
             headers=self._headers(),
             method="POST",
@@ -161,22 +155,29 @@ class RedisClient:
                 data = json.loads(resp.read().decode())
                 self.cb.record_success()
                 return data
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        except urllib.error.HTTPError as e:
+            self.cb.record_failure()
+            err_body = e.read().decode("utf-8", errors="replace")
+            print(f"[REDIS ERROR] HTTP {e.code}: {err_body}")
+            return None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
             self.cb.record_failure()
             print(f"[REDIS ERROR] {e}")
             return None
+
 
     def _post_pipeline(self, commands):
         """Send pipeline of commands as single Upstash REST call."""
         if not commands:
             return None
-        body = commands  # Upstash REST pipeline: array of [command, args...]
-        return self._post(body)
+        return self._post(commands, "/pipeline")
+
 
     def pipe_add(self, command, *args):
         """Add command to pipeline. Auto-flush when full."""
-        self._pipeline.append([command] + list(args))
+        self._pipeline.append([command] + [str(a) for a in args])
         self._pipeline_size += 1
+
         if self._pipeline_size >= self.MAX_PIPELINE:
             return self.flush()
         return None
