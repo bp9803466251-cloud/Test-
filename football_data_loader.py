@@ -785,6 +785,33 @@ def _exec(cmd):
     return None
 
 
+def _exec_with_retry(cmd, max_retries=5):
+    """Execute Redis command with retry on Circuit Breaker / timeout."""
+    backoff_times = [2, 4, 8, 16, 30]
+    for attempt in range(max_retries):
+        try:
+            result = _exec(cmd)
+            if result is not None:
+                return result
+            _p(f"  [REDIS WARN] None result (attempt {attempt+1}/{max_retries})")
+        except Exception as e:
+            err_str = str(e).lower()
+            if "circuit" in err_str or "timeout" in err_str or "rate" in err_str:
+                wait = backoff_times[min(attempt, len(backoff_times) - 1)]
+                _p(f"  [REDIS WARNING] Circuit Breaker active — retry in {wait}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            else:
+                _p(f"  [REDIS ERROR] {e}")
+                return None
+        # None result — wait and retry
+        if attempt < max_retries - 1:
+            wait = backoff_times[min(attempt, len(backoff_times) - 1)]
+            _p(f"  [REDIS WARN] Waiting {wait}s before retry...")
+            time.sleep(wait)
+    return None
+
+
 def save_batch_to_redis(batch):
     if not batch:
         return 0
@@ -792,7 +819,7 @@ def save_batch_to_redis(batch):
     for history_key, json_wrapper in batch:
         hset_args.append(history_key)
         hset_args.append(json_wrapper)
-    result = _exec(["HSET", "GatekeeperAI"] + hset_args)
+    result = _exec_with_retry(["HSET", "GatekeeperAI"] + hset_args)
     return len(batch) if result is not None else 0
 
 
@@ -810,7 +837,7 @@ def save_indexes_batch(index_entries):
         }
         hset_args.append(index_key)
         hset_args.append(json.dumps(wrapper, ensure_ascii=False))
-    _exec(["HSET", "GatekeeperAI"] + hset_args)
+    _exec_with_retry(["HSET", "GatekeeperAI"] + hset_args)
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +853,7 @@ def process_csv(filepath, dry_run=False):
 
     stats_summary = {"total": 0, "loaded": 0, "errors": 0}
     batch = []
-    batch_size = 50
+    batch_size = 20
     team_index = {}
     league_index = []
     date_index = {}
@@ -863,7 +890,7 @@ def process_csv(filepath, dry_run=False):
                     stats_summary["loaded"] += saved
                     _p(f"  [BATCH] {stats_summary['loaded']}/{stats_summary['total']}...", end="\r")
                     batch = []
-                    time.sleep(0.05)
+                    time.sleep(0.3)
             else:
                 stats_summary["loaded"] += 1
             if stats_summary["total"] % 200 == 0:
@@ -891,7 +918,7 @@ def process_csv(filepath, dry_run=False):
                 save_indexes_batch(chunk)
                 if (i // idx_batch_size) % 10 == 0:
                     _p(f"  [INDEX] {min(i + idx_batch_size, len(all_index_entries))}/{len(all_index_entries)}...", end="\r")
-                time.sleep(0.05)
+                time.sleep(0.1)
             _p(f"  [INDEX] Done: {len(all_index_entries)} indexes created")
 
         _p(f"  [DONE] {os.path.basename(filepath)}: total={stats_summary['total']}, "
@@ -974,7 +1001,7 @@ def main():
         for k in ("total", "loaded", "errors"):
             grand_total[k] += s.get(k, 0)
         grand_total["files"] += 1
-        time.sleep(0.1)
+        time.sleep(0.5)
 
     _p("\n" + "=" * 60)
     _p("  SUMMARY")
