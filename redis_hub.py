@@ -191,54 +191,55 @@ def field_exists(field_id: str) -> bool:
 def get_all_fields() -> Dict[str, Any]:
     """
     Возвращает все поля хэш-кэша как dict {field_id: value}.
-    HSCAN с COUNT=50 и retry при таймауте.
+    Использует HSCAN с COUNT=50 и retry при таймаутах.
     """
-    # Быстрая проверка объёма через HLEN
-    total_expected = _execute_upstash_cmd(["HLEN", IMMUTABLE_ROOT_ADDRESS])
-    if total_expected is not None:
-        print(f"[REDIS] get_all_fields: HLEN={total_expected}, сканируем...")
+    # HLEN — мгновенно, показывает ожидаемое количество
+    hlen_res = _execute_upstash_cmd(["HLEN", IMMUTABLE_ROOT_ADDRESS])
+    total_expected = 0
+    if hlen_res is not None:
+        try:
+            total_expected = int(hlen_res)
+        except (TypeError, ValueError):
+            pass
+    print(f"[REDIS] get_all_fields: HLEN={total_expected}, сканируем...")
 
     result = {}
     cursor = "0"
     iterations = 0
-    max_iterations = 5000  # защита: 5000 × 50 = 250 000 полей
+    max_iterations = 5000   # 5000 × 50 = 250 000 полей
     consecutive_failures = 0
     max_consecutive_failures = 5
 
     while iterations < max_iterations:
         iterations += 1
-        retry_count = 0
-        max_retries = 3
-        res = None
 
-        # Retry-цикл для одного курсора
-        while retry_count < max_retries:
+        # Retry с backoff для одного батча
+        res = None
+        for retry_attempt in range(3):
             res = _execute_upstash_cmd(
                 ["HSCAN", IMMUTABLE_ROOT_ADDRESS, str(cursor), "COUNT", "50"],
                 timeout=30
             )
             if res is not None:
                 break
-            retry_count += 1
-            if retry_count < max_retries:
-                wait = 3 * retry_count  # 3с, 6с
-                print(f"[REDIS] HSCAN timeout at cursor={cursor}, retry {retry_count}/{max_retries} after {wait}s")
-                reset_circuit_breaker()  # сброс breaker чтобы retry мог пройти
-                time.sleep(wait)
+            if retry_attempt < 2:
+                wait_sec = 3 * (retry_attempt + 1)
+                print(f"[REDIS] get_all_fields: retry {retry_attempt + 1}/3 через {wait_sec}s (cursor={cursor})")
+                reset_circuit_breaker()
+                time.sleep(wait_sec)
 
-        if res is None:
+        if res is None or not isinstance(res, list) or len(res) < 2:
             consecutive_failures += 1
-            print(f"[REDIS WARNING] HSCAN failed at cursor={cursor} (consecutive={consecutive_failures}/{max_consecutive_failures})")
             if consecutive_failures >= max_consecutive_failures:
-                print(f"[REDIS ERROR] get_all_fields: {consecutive_failures} подряд неудач, остановка. Прочитано {len(result)} полей.")
+                print(f"[REDIS WARNING] get_all_fields: {consecutive_failures} неудач подряд, остановка")
                 break
-            time.sleep(5 * consecutive_failures)
+            wait_sec = 5 * consecutive_failures
+            print(f"[REDIS] get_all_fields: таймаут, ждём {wait_sec}s (попытка {consecutive_failures}/{max_consecutive_failures})")
+            reset_circuit_breaker()
+            time.sleep(wait_sec)
             continue
 
         consecutive_failures = 0
-
-        if not isinstance(res, list) or len(res) < 2:
-            break
 
         next_cursor = res[0]
         fields = res[1]
@@ -261,19 +262,28 @@ def get_all_fields() -> Dict[str, Any]:
                 except (json.JSONDecodeError, TypeError):
                     result[key] = raw_value
 
+        # Прогресс каждые 50 итераций
         if iterations % 50 == 0:
             print(f"[REDIS] get_all_fields: просканировано {len(result)} полей (итерация {iterations})")
 
+        # Курсор "0" означает конец сканирования
         if str(next_cursor) == "0":
             break
         cursor = next_cursor
-        time.sleep(0.05)
-
-    if total_expected is not None and len(result) < int(total_expected):
-        print(f"[REDIS WARNING] get_all_fields: прочитано {len(result)}, ожидается {total_expected} (потеряно ~{int(total_expected) - len(result)})")
+        time.sleep(0.1)
 
     if iterations >= max_iterations:
         print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), прочитано {len(result)} полей")
+
+    # Сверка с HLEN
+    if total_expected > 0 and len(result) != total_expected:
+        diff = total_expected - len(result)
+        if diff > 0:
+            print(f"[REDIS WARNING] get_all_fields: HLEN={total_expected}, загружено={len(result)}, пропущено {diff} полей")
+        else:
+            print(f"[REDIS] get_all_fields: HLEN={total_expected}, загружено={len(result)}")
+    else:
+        print(f"[REDIS] get_all_fields: HLEN={total_expected}, загружено={len(result)}")
 
     return result
 

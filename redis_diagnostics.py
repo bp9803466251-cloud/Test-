@@ -60,7 +60,7 @@ def _exec_upstash(cmd):
         urllib.parse.quote(str(c), safe="") for c in cmd
     )
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {_REDIS_TOKEN}"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         body = resp.read().decode("utf-8")
         return json.loads(body).get("result")
 
@@ -103,12 +103,16 @@ def _unwrap(raw):
 
 
 def _hscan_all(hash_name, match_pattern=None):
-    """Итерация по большому хэшу через HSCAN с retry и малым COUNT."""
+    """Итерация по большому хэшу через HSCAN (COUNT=50, retry при таймаутах)."""
     cursor = "0"
     all_keys = []
     consecutive_failures = 0
     max_consecutive_failures = 5
+    iterations = 0
+
     while True:
+        iterations += 1
+
         cmd = ["HSCAN", hash_name, str(cursor)]
         if match_pattern:
             cmd.append("MATCH")
@@ -116,30 +120,31 @@ def _hscan_all(hash_name, match_pattern=None):
         cmd.append("COUNT")
         cmd.append("50")
 
-        retry_count = 0
-        max_retries = 3
+        # Retry с backoff
         result = None
-        while retry_count < max_retries:
+        for retry_attempt in range(3):
             result = _exec(cmd)
             if result is not None:
                 break
-            retry_count += 1
-            if retry_count < max_retries:
-                wait = 3 * retry_count
-                _p(f"[WARN] HSCAN timeout at cursor={cursor}, retry {retry_count}/{max_retries} after {wait}s")
-                try:
+            if retry_attempt < 2:
+                wait_sec = 3 * (retry_attempt + 1)
+                _p(f"[HSCAN] retry {retry_attempt + 1}/3 через {wait_sec}s (cursor={cursor})")
+                if _REDIS_MODE == "redis_hub":
                     import redis_hub
                     redis_hub.reset_circuit_breaker()
-                except Exception:
-                    pass
-                time.sleep(wait)
+                time.sleep(wait_sec)
 
         if result is None:
             consecutive_failures += 1
-            _p(f"[WARN] HSCAN failed at cursor={cursor} (consecutive={consecutive_failures}/{max_consecutive_failures})")
             if consecutive_failures >= max_consecutive_failures:
+                _p(f"[WARN] HSCAN: {consecutive_failures} неудач подряд, остановка")
                 break
-            time.sleep(5 * consecutive_failures)
+            wait_sec = 5 * consecutive_failures
+            _p(f"[HSCAN] таймаут, ждём {wait_sec}s (попытка {consecutive_failures}/{max_consecutive_failures})")
+            if _REDIS_MODE == "redis_hub":
+                import redis_hub
+                redis_hub.reset_circuit_breaker()
+            time.sleep(wait_sec)
             continue
 
         consecutive_failures = 0
@@ -151,31 +156,34 @@ def _hscan_all(hash_name, match_pattern=None):
                 break
         if not isinstance(result, list) or len(result) < 2:
             break
+
         cursor = str(result[0])
         kv = result[1]
         if isinstance(kv, list):
             field_names = kv[::2]
             all_keys.extend(field_names)
+
+        if iterations % 50 == 0:
+            _p(f"[HSCAN] просканировано {len(all_keys)} ключей (итерация {iterations})")
+
         if cursor == "0" or cursor == 0:
             break
         time.sleep(0.1)
+
     return all_keys
 
 
 def load_all_fields():
-    """Загружает все поля хэша через HSCAN с retry и малым COUNT."""
-    _p("[LOAD] Scanning via HSCAN (COUNT=50, retry=3)...")
-
-    # Быстрый HLEN для сверки
-    hlen_result = _exec(["HLEN", "GatekeeperAI"])
+    """Загружает все поля хэша через HSCAN (COUNT=50, retry при таймаутах)."""
+    # HLEN — мгновенно
+    hlen_res = _exec(["HLEN", "GatekeeperAI"])
     total_expected = 0
-    if hlen_result is not None:
+    if hlen_res is not None:
         try:
-            total_expected = int(hlen_result)
-        except Exception:
-            total_expected = 0
-    if total_expected:
-        _p(f"[LOAD] HLEN={total_expected} fields expected")
+            total_expected = int(hlen_res)
+        except (TypeError, ValueError):
+            pass
+    _p(f"[LOAD] HLEN={total_expected}, сканируем...")
 
     cursor = "0"
     all_fields = {}
@@ -184,33 +192,34 @@ def load_all_fields():
     max_consecutive_failures = 5
 
     while True:
-        retry_count = 0
-        max_retries = 3
-        result = None
+        batch_num += 1
 
-        # Retry-цикл для одного курсора
-        while retry_count < max_retries:
-            result = _exec(["HSCAN", "GatekeeperAI", str(cursor), "COUNT", "50"])
+        cmd = ["HSCAN", "GatekeeperAI", str(cursor), "COUNT", "50"]
+        # Retry с backoff
+        result = None
+        for retry_attempt in range(3):
+            result = _exec(cmd)
             if result is not None:
                 break
-            retry_count += 1
-            if retry_count < max_retries:
-                wait = 3 * retry_count
-                _p(f"[LOAD] HSCAN timeout at cursor={cursor}, retry {retry_count}/{max_retries} after {wait}s")
-                try:
+            if retry_attempt < 2:
+                wait_sec = 3 * (retry_attempt + 1)
+                _p(f"[LOAD] retry {retry_attempt + 1}/3 через {wait_sec}s (cursor={cursor})")
+                if _REDIS_MODE == "redis_hub":
                     import redis_hub
                     redis_hub.reset_circuit_breaker()
-                except Exception:
-                    pass
-                time.sleep(wait)
+                time.sleep(wait_sec)
 
         if result is None:
             consecutive_failures += 1
-            _p(f"[WARN] HSCAN failed at cursor={cursor} (consecutive={consecutive_failures}/{max_consecutive_failures})")
             if consecutive_failures >= max_consecutive_failures:
-                _p(f"[LOAD] {consecutive_failures} подряд неудач, остановка. Прочитано {len(all_fields)} полей.")
+                _p(f"[WARN] load_all_fields: {consecutive_failures} неудач подряд, остановка")
                 break
-            time.sleep(5 * consecutive_failures)
+            wait_sec = 5 * consecutive_failures
+            _p(f"[LOAD] таймаут, ждём {wait_sec}s (попытка {consecutive_failures}/{max_consecutive_failures})")
+            if _REDIS_MODE == "redis_hub":
+                import redis_hub
+                redis_hub.reset_circuit_breaker()
+            time.sleep(wait_sec)
             continue
 
         consecutive_failures = 0
@@ -222,6 +231,7 @@ def load_all_fields():
                 break
         if not isinstance(result, list) or len(result) < 2:
             break
+
         cursor = str(result[0])
         kv_pairs = result[1]
         if isinstance(kv_pairs, list):
@@ -230,16 +240,24 @@ def load_all_fields():
                 v = kv_pairs[i + 1] if i + 1 < len(kv_pairs) else None
                 if v is not None:
                     all_fields[k] = _safe_json(v)
-        batch_num += 1
-        if batch_num % 20 == 0:
-            _p(f"[LOAD] Scanned {len(all_fields)} fields so far (batch {batch_num})...")
+
+        if batch_num % 50 == 0:
+            _p(f"[LOAD] просканировано {len(all_fields)} полей (итерация {batch_num})")
+
         if cursor == "0" or cursor == 0:
             break
         time.sleep(0.1)
 
-    _p(f"[LOAD] Done: {len(all_fields)} fields")
-    if total_expected and len(all_fields) < total_expected:
-        _p(f"[LOAD] WARNING: expected {total_expected}, got {len(all_fields)} (lost ~{total_expected - len(all_fields)})")
+    # Сверка с HLEN
+    if total_expected > 0 and len(all_fields) != total_expected:
+        diff = total_expected - len(all_fields)
+        if diff > 0:
+            _p(f"[LOAD] WARNING: HLEN={total_expected}, загружено={len(all_fields)}, пропущено {diff} полей")
+        else:
+            _p(f"[LOAD] HLEN={total_expected}, загружено={len(all_fields)}")
+    else:
+        _p(f"[LOAD] HLEN={total_expected}, загружено={len(all_fields)}")
+
     return all_fields
 
 
@@ -400,17 +418,19 @@ def _check_odds_format(match_keys, fields):
 
 
 # ---------------------------------------------------------------------------
-# Run modes
+# Modes
 # ---------------------------------------------------------------------------
+
 def run_test():
     _p("=== TEST MODE ===")
+
     _p("\n--- 1. PING ---")
-    r = _exec(["PING"])
-    _p(f"  Result: {r!r}")
+    ping = _exec(["PING"])
+    _p(f"  PING: {ping}")
 
     _p("\n--- 2. HLEN ---")
-    r = _exec(["HLEN", "GatekeeperAI"])
-    _p(f"  HLEN: {r}")
+    hlen = _exec(["HLEN", "GatekeeperAI"])
+    _p(f"  HLEN: {hlen}")
 
     _p("\n--- 3. HSCAN (first batch) ---")
     result = _exec(["HSCAN", "GatekeeperAI", "0", "COUNT", "10"])
@@ -535,8 +555,6 @@ def run_history():
             "score_a": a,
             "sender": _get_sender(raw),
             "status": _get_status(payload),
-            "home": payload.get("home_team") or "?",
-            "away": payload.get("away_team") or "?",
         }
 
     _p(f"\n--- match:* parse ---")
@@ -564,76 +582,6 @@ def run_history():
     _p(f"  Future  = {len(future_match)}")
     _p(f"  Unknown = {len(unknown_match)}")
 
-    # --- Past match:* by season ---
-    past_seasons = {}
-    for cid, d in past_match.items():
-        s = d["season"]
-        past_seasons[s] = past_seasons.get(s, 0) + 1
-    _p(f"\n--- Past match:* by season ({len(past_seasons)}) ---")
-    for s in sorted(past_seasons.keys()):
-        _p(f"  {s}: {past_seasons[s]}")
-
-    # --- Past match:* by league ---
-    past_leagues = {}
-    for cid, d in past_match.items():
-        lg = d["competition"]
-        past_leagues[lg] = past_leagues.get(lg, 0) + 1
-    _p(f"\n--- Past match:* by league ({len(past_leagues)}) ---")
-    for lg in sorted(past_leagues.keys(), key=lambda x: -past_leagues[lg]):
-        _p(f"  {lg}: {past_leagues[lg]}")
-
-    # --- LOST MATCHES ---
-    hist_cids = set(hist_data.keys())
-    lost = {}
-    for cid, d in past_match.items():
-        if cid not in hist_cids:
-            lost[cid] = d
-
-    _p(f"\n{'=' * 60}")
-    _p(f"=== LOST MATCHES: {len(lost)} ===")
-    _p(f"{'=' * 60}")
-
-    if not lost:
-        _p("  No lost matches found — all past match:* are in history:match:*")
-    else:
-        lost_seasons = {}
-        for cid, d in lost.items():
-            s = d["season"]
-            lost_seasons[s] = lost_seasons.get(s, 0) + 1
-        _p(f"\n--- Lost by season ({len(lost_seasons)}) ---")
-        for s in sorted(lost_seasons.keys()):
-            _p(f"  {s}: {lost_seasons[s]}")
-
-        lost_leagues = {}
-        for cid, d in lost.items():
-            lg = d["competition"]
-            lost_leagues[lg] = lost_leagues.get(lg, 0) + 1
-        _p(f"\n--- Lost by league ({len(lost_leagues)}) ---")
-        for lg in sorted(lost_leagues.keys(), key=lambda x: -lost_leagues[lg]):
-            _p(f"  {lg}: {lost_leagues[lg]}")
-
-        lost_sl = {}
-        for cid, d in lost.items():
-            sl = f"{d['season']} | {d['competition']}"
-            lost_sl[sl] = lost_sl.get(sl, 0) + 1
-        _p(f"\n--- Lost by season x league (top 20) ---")
-        for sl in sorted(lost_sl.keys(), key=lambda x: -lost_sl[x])[:20]:
-            _p(f"  {sl}: {lost_sl[sl]}")
-
-        lost_senders = {}
-        for cid, d in lost.items():
-            s = d["sender"]
-            lost_senders[s] = lost_senders.get(s, 0) + 1
-        _p(f"\n--- Lost by sender ---")
-        for s in sorted(lost_senders.keys()):
-            _p(f"  {s}: {lost_senders[s]}")
-
-        _p(f"\n--- Lost examples (20) ---")
-        for i, (cid, d) in enumerate(sorted(lost.items(), key=lambda x: x[1]["date"] or "")[:20]):
-            _p(f"  {i + 1}. {d['home']} vs {d['away']} | {d['date']} | {d['competition']} | "
-                f"score: {d['score_h']}-{d['score_a']} | status: {d['status']} | sender: {d['sender']}")
-            _p(f"     key: {d['key']}")
-
     # --- Verification ---
     _p(f"\n{'=' * 60}")
     _p(f"=== VERIFICATION ===")
@@ -641,8 +589,6 @@ def run_history():
     _p(f"  match:* past     = {len(past_match)}")
     _p(f"  match:* future   = {len(future_match)}")
     _p(f"  match:* unknown  = {len(unknown_match)}")
-    _p(f"  Duplicates       = {len(past_match) - len(lost)}")
-    _p(f"  Lost             = {len(lost)}")
 
     # --- History odds format check ---
     _p(f"\n--- History odds format check ---")
@@ -661,32 +607,23 @@ def run_purge(hard=False):
         _p("[FATAL] HLEN returned None — cannot reach Redis")
         return
     hlen = int(hlen) if hlen else 0
+    _p(f"[PURGE] HLEN = {hlen}")
 
-    if hlen == 0:
-        _p("[PURGE] HLEN=0, already empty.")
+    if "yes" not in sys.argv:
+        _p("[PURGE] Use --purge --yes to confirm")
         return
 
-    _p(f"[PURGE] HLEN = {hlen} fields")
-
-    _p("[PURGE] Executing DEL GatekeeperAI...")
     result = _exec(["DEL", "GatekeeperAI"])
     if result is None:
-        _p("[FATAL] DEL failed")
+        _p("[FATAL] DEL returned None")
         return
-
     _p(f"[PURGE] DEL result: {result}")
-
-    remaining = _exec(["HLEN", "GatekeeperAI"])
-    _p(f"[PURGE] HLEN after purge: {remaining}")
     _p("=== PURGE COMPLETE ===")
 
 
 def run_flush(hard=False):
-    """Очистка match:* ключей (hard) или live:* ключей (soft) через HSCAN."""
-    if hard:
-        _p("=== FLUSH MODE (hard=True) ===")
-    else:
-        _p("=== FLUSH MODE (hard=False) ===")
+    """Мягкая (live:*) или жёсткая (match:*) очистка через HSCAN + HDEL."""
+    _p("=== FLUSH MODE ===")
 
     if hard:
         _p("[FLUSH] Scanning for match:* keys via HSCAN...")
