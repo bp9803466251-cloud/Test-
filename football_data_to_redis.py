@@ -1,463 +1,441 @@
 #!/usr/bin/env python3
 """
-Коллектор football-data.co.uk CSV для Gatekeeper-AI v700-prod.
-История матчей — результаты, счёт, статистика.
-Upstream: bet365
-Роль: HISTORY — даёт исторические данные для H2H и form-анализа.
+Football-Data Collector v5.0 (CSV)
+Источник: football-data.co.uk/mmz4281/{season}/{league}.csv
+Запись: gatekeeper_hub.upsert_history_match() → history:match:* + 3 индекса
 
-Источник: football-data.co.uk (CSV-файлы, ~65 колонок)
-Запуск: вручную (Termux) или через GitHub Actions.
-
-v5.0: 26 полей payload, odds 1x2, source_map, flags, season, league_code, 12 stats.
-       Запись через gatekeeper_hub.upsert_history_match() (TEAM_ALIASES, индексы).
+Параметры:
+  --seasons      Сезоны через запятую (напр. 2425,2526,2627). Пусто = авто
+  --leagues      Лиги через запятую (напр. E0,E1,SP1). Пусто = все 22
+  --history-days Окно истории (0 = весь CSV)
+  --limit        Лимит матчей на лигу (для теста)
 """
 
+import argparse
+import csv
+import io
 import os
 import sys
-import csv
-import time
-import shutil
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional, Tuple
 
+# ---------------------------------------------------------------------------
+# Импорт хаба
+# ---------------------------------------------------------------------------
 from gatekeeper_hub import (
     upsert_history_match,
+    update_history_indexes,
     build_canonical_id,
     clean_team_name,
-    detect_upstream,
-    now_msk,
     save_meta,
-    _build_1x2,
+    now_msk,
 )
-from redis_hub import is_redis_available
 
-FD_SOURCE = "football_data"
-FD_BASE = "https://www.football-data.co.uk/mmz4281"
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+BASE_URL = "https://www.football-data.co.uk/mmz4281"
+ARCHIVE_DIR = "archive"
+MAX_RETRIES = 3
+RETRY_DELAY = 3  # seconds
 
-# 22 лиги football-data.co.uk (коды CSV, не API)
-COMPETITIONS = [
-    ("E0",  "Premier League",   "England"),
-    ("E1",  "Championship",     "England"),
-    ("E2",  "League One",       "England"),
-    ("E3",  "League Two",       "England"),
-    ("EC",  "National League",  "England"),
-    ("SC0", "Premiership",      "Scotland"),
-    ("SC1", "Championship",     "Scotland"),
-    ("SC2", "League One",       "Scotland"),
-    ("SC3", "League Two",       "Scotland"),
-    ("D1",  "Bundesliga",       "Germany"),
-    ("D2",  "2. Bundesliga",    "Germany"),
-    ("I1",  "Serie A",          "Italy"),
-    ("I2",  "Serie B",          "Italy"),
-    ("SP1", "La Liga",          "Spain"),
-    ("SP2", "La Liga 2",        "Spain"),
-    ("F1",  "Ligue 1",          "France"),
-    ("F2",  "Ligue 2",          "France"),
-    ("N1",  "Eredivisie",       "Netherlands"),
-    ("P1",  "Primeira Liga",    "Portugal"),
-    ("B1",  "Brasileirão",      "Brazil"),
-    ("G1",  "Super League",     "Greece"),
-    ("T1",  "Süper Lig",        "Turkey"),
+ALL_LEAGUES = [
+    ("E0", "Premier League", "England"),
+    ("E1", "Championship", "England"),
+    ("E2", "League One", "England"),
+    ("E3", "League Two", "England"),
+    ("EC", "National League", "England"),
+    ("SC0", "Premiership", "Scotland"),
+    ("SC1", "Championship", "Scotland"),
+    ("SC2", "League One", "Scotland"),
+    ("SC3", "League Two", "Scotland"),
+    ("D1", "Bundesliga", "Germany"),
+    ("D2", "2. Bundesliga", "Germany"),
+    ("I1", "Serie A", "Italy"),
+    ("I2", "Serie B", "Italy"),
+    ("SP1", "La Liga", "Spain"),
+    ("SP2", "La Liga 2", "Spain"),
+    ("F1", "Ligue 1", "France"),
+    ("F2", "Ligue 2", "France"),
+    ("N1", "Eredivisie", "Netherlands"),
+    ("P1", "Primeira Liga", "Portugal"),
+    ("B1", "First Division A", "Belgium"),
+    ("G1", "Super League", "Greece"),
+    ("T1", "Super Lig", "Turkey"),
 ]
 
-MAX_RETRIES = int(os.environ.get("FOOTBALL_DATA_MAX_RETRIES", "3"))
-ARCHIVE_DIR = os.environ.get("FOOTBALL_DATA_ARCHIVE_DIR", "archive")
-SEASON = os.environ.get("FOOTBALL_DATA_SEASON", "")  # напр. "2526" — пусто = авто
+LEAGUE_MAP = {code: (name, country) for code, name, country in ALL_LEAGUES}
 
-# Приоритет коэффициентов: B365 → BbAv → IW → LB → WH → VC
+# Приоритет odds: B365 → BbAv → IW → LB → WH → VC
 ODDS_PRIORITY = [
-    ("B365",  "B365H",  "B365D",  "B365A"),
-    ("BbAv",  "BbAvH",  "BbAvD",  "BbAvA"),
-    ("IW",    "IWH",    "IWD",    "IWA"),
-    ("LB",    "LBH",    "LBD",    "LBA"),
-    ("WH",    "WHH",    "WHD",    "WHA"),
-    ("VC",    "VCH",    "VCD",    "VCA"),
+    ("B365", "B365H", "B365D", "B365A", "bet365"),
+    ("BbAv", "BbAvH", "BbAvD", "BbAvA", "betbrain_avg"),
+    ("IW", "IWH", "IWD", "IWA", "interwetten"),
+    ("LB", "LBH", "LBD", "LBA", "ladbrokes"),
+    ("WH", "WHH", "WHD", "WHA", "william_hill"),
+    ("VC", "VCH", "VCD", "VCA", "vc_bet"),
 ]
 
 
-def _p(msg):
-    print(msg, flush=True)
-
-
 # ---------------------------------------------------------------------------
-# Сезон
+# Утилиты
 # ---------------------------------------------------------------------------
-def _auto_season() -> str:
-    """Текущий сезон в формате YY/YY: октябрь 2026 → '2627'."""
+def auto_season() -> str:
+    """Текущий сезон в формате YYYY (напр. 2627 для 2026/2027)."""
     now = datetime.now(timezone.utc)
-    y, m = now.year, now.month
-    if m >= 7:
-        return f"{y % 100:02d}{(y + 1) % 100:02d}"
-    return f"{(y - 1) % 100:02d}{y % 100:02d}"
+    year = now.year
+    month = now.month
+    # Сезон начинается в августе: если месяц >= 8, сезон = YY(YY+1)
+    if month >= 8:
+        return f"{year % 100:02d}{(year + 1) % 100:02d}"
+    else:
+        return f"{(year - 1) % 100:02d}{year % 100:02d}"
 
 
-# ---------------------------------------------------------------------------
-# Скачивание CSV
-# ---------------------------------------------------------------------------
-def _download_csv(season: str, league_code: str) -> Optional[str]:
-    """Скачивание CSV с football-data.co.uk (urllib следует redirect 302 автоматически)."""
-    url = f"{FD_BASE}/{season}/{league_code}.csv"
-    filename = f"{season}_{league_code}.csv"
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            _p(f"[CSV] Скачивание {url} (попытка {attempt + 1}/{MAX_RETRIES})")
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = resp.read()
-                if len(data) < 100:
-                    _p(f"[CSV] Файл слишком маленький ({len(data)} байт) — пропускаем")
-                    return None
-                with open(filename, "wb") as f:
-                    f.write(data)
-                _p(f"[CSV] Скачано: {filename} ({len(data)} байт)")
-                return filename
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                _p(f"[CSV] 404 — нет файла для {league_code} сезон {season}")
-                return None
-            _p(f"[CSV] HTTP {e.code}: {e.reason}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(3 * (attempt + 1))
-        except Exception as e:
-            _p(f"[CSV] Ошибка: {e}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(3 * (attempt + 1))
-    return None
+def parse_seasons(seasons_input: str) -> list:
+    """Парсим seasons: '2425,2526,2627' → ['2425', '2526', '2627']. Пусто = [auto]."""
+    if not seasons_input or not seasons_input.strip():
+        return [auto_season()]
+    return [s.strip() for s in seasons_input.split(",") if s.strip()]
 
 
-# ---------------------------------------------------------------------------
-# Парсинг
-# ---------------------------------------------------------------------------
-def _parse_csv_filename(filename: str) -> Tuple[str, str]:
-    """2526_E0.csv → season='2526', league_code='E0'."""
-    base = os.path.basename(filename).replace(".csv", "")
-    parts = base.split("_")
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-    return "", ""
+def parse_leagues(leagues_input: str) -> list:
+    """Парсим leagues: 'E0,E1,SP1' → [('E0','Premier League','England'), ...]. Пусто = все."""
+    if not leagues_input or not leagues_input.strip():
+        return list(ALL_LEAGUES)
+    codes = [l.strip().upper() for l in leagues_input.split(",") if l.strip()]
+    result = []
+    for code in codes:
+        if code in LEAGUE_MAP:
+            name, country = LEAGUE_MAP[code]
+            result.append((code, name, country))
+        else:
+            print(f"[FD] Неизвестный код лиги: {code} — пропускаю")
+    return result
 
 
-def _parse_date(date_str: str, time_str: str = "") -> str:
-    """DD/MM/YYYY [+ HH:MM] → ISO 8601 UTC."""
-    if not date_str:
-        return ""
-    dt = None
-    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
-        try:
-            dt = datetime.strptime(date_str.strip(), fmt)
-            break
-        except ValueError:
-            continue
-    if dt is None:
-        return ""
-    if time_str and time_str.strip():
-        try:
-            parts = time_str.strip().split(":")
-            dt = dt.replace(hour=int(parts[0]), minute=int(parts[1]))
-        except (ValueError, IndexError):
-            pass
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _extract_odds(row: dict) -> dict:
-    """
-    Извлечение odds с приоритетом: B365 → BbAv → IW → LB → WH → VC.
-    Возвращает плоский price dict (значения могут быть пустыми).
-    """
-    for _name, h_col, d_col, a_col in ODDS_PRIORITY:
-        h = (row.get(h_col) or "").strip()
-        d = (row.get(d_col) or "").strip()
-        a = (row.get(a_col) or "").strip()
-        if h and d and a:
-            try:
-                float(h), float(d), float(a)
-                return {"home": h, "draw": d, "away": a}
-            except (ValueError, TypeError):
-                continue
-    return {"home": "", "draw": "", "away": ""}
-
-
-def _safe_int(val) -> Optional[int]:
+def safe_int(val) -> int:
     if val is None or val == "" or val == "-":
-        return None
+        return 0
     try:
         return int(float(val))
     except (ValueError, TypeError):
-        return None
+        return 0
 
 
-def _parse_stats(row: dict) -> dict:
-    """Парсинг 12 метрик из CSV колонок."""
-    stats = {}
-    mapping = [
-        ("shots_home",              "HS"),
-        ("shots_away",              "AS"),
-        ("shots_on_target_home",    "HST"),
-        ("shots_on_target_away",    "AST"),
-        ("corners_home",            "HC"),
-        ("corners_away",            "AC"),
-        ("fouls_home",              "HF"),
-        ("fouls_away",              "AF"),
-        ("yellow_home",             "HY"),
-        ("yellow_away",             "AY"),
-        ("red_home",                "HR"),
-        ("red_away",                "AR"),
-    ]
-    for field, col in mapping:
-        v = _safe_int(row.get(col))
-        if v is not None:
-            stats[field] = v
-    return stats
-
-
-def _calc_flags(score: dict, stats: dict) -> dict:
-    """extreme_result, abnormal_score, red_card_driven."""
-    flags = {
-        "extreme_result": False,
-        "abnormal_score": False,
-        "red_card_driven": False,
-    }
-    diff = abs(score.get("home", 0) - score.get("away", 0))
-    if diff >= 4:
-        flags["abnormal_score"] = True
-        flags["extreme_result"] = True
-    if stats.get("red_home", 0) or stats.get("red_away", 0):
-        flags["red_card_driven"] = True
-        flags["extreme_result"] = True
-    return flags
-
-
-def _build_source_map(upstream: str, ts: str) -> dict:
-    """Source map для history: odds (bet365, closing) + stats (match_data)."""
-    return {
-        "odds": {
-            "source": FD_SOURCE,
-            "upstream": upstream,
-            "timestamp": ts,
-            "independent": True,
-            "type": "closing",
-        },
-        "stats": {
-            "source": FD_SOURCE,
-            "upstream": "match_data",
-            "timestamp": ts,
-            "independent": True,
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# Сборка payload (26 полей)
-# ---------------------------------------------------------------------------
-def _build_payload(row: dict, season: str, league_code: str,
-                   comp_name: str, country: str) -> Optional[dict]:
-    """Сборка 26-полевого payload из строки CSV по гайду v5.0."""
-    home_team = (row.get("HomeTeam") or "").strip()
-    away_team = (row.get("AwayTeam") or "").strip()
-    if not home_team or not away_team:
-        return None
-
-    # Дата
-    date_utc = _parse_date(row.get("Date", ""), row.get("Time", ""))
-    if not date_utc:
-        return None
-
-    # FTR — только завершённые
-    ftr = (row.get("FTR") or "").strip().upper()
-    if ftr not in ("H", "D", "A"):
-        return None
-
-    # Score
+def safe_float(val) -> str:
+    if val is None or val == "" or val == "-":
+        return ""
     try:
-        score_home = int(float(row.get("FTHG", 0)))
-        score_away = int(float(row.get("FTAG", 0)))
+        return str(float(val))
     except (ValueError, TypeError):
-        return None
+        return ""
 
-    # Half-time
-    half_time_score = {}
-    hthg = _safe_int(row.get("HTHG"))
-    htag = _safe_int(row.get("HTAG"))
-    if hthg is not None:
-        half_time_score["home"] = hthg
-    if htag is not None:
-        half_time_score["away"] = htag
 
-    # Stats
-    stats = _parse_stats(row)
+def parse_date(row: dict) -> str:
+    """Date (DD/MM/YYYY) + Time (HH:MM) → ISO 8601 UTC."""
+    date_str = row.get("Date", "").strip()
+    if not date_str:
+        return ""
+    try:
+        # Формат DD/MM/YYYY
+        dt = datetime.strptime(date_str, "%d/%m/%Y")
+        time_str = row.get("Time", "").strip()
+        if time_str:
+            try:
+                t = datetime.strptime(time_str, "%H:%M")
+                dt = dt.replace(hour=t.hour, minute=t.minute)
+            except ValueError:
+                pass
+        return dt.replace(tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        try:
+            # Формат DD/MM/YY
+            dt = datetime.strptime(date_str, "%d/%m/%y")
+            return dt.replace(tzinfo=timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+        except ValueError:
+            return ""
 
-    # Flags
-    flags = _calc_flags({"home": score_home, "away": score_away}, stats)
 
-    # Odds (1x2 через хаб)
-    upstream = detect_upstream(FD_SOURCE)  # "bet365"
+def within_history_window(date_utc: str, history_days: int) -> bool:
+    """Если history_days=0 — без фильтра. Иначе — только последние N дней."""
+    if history_days <= 0:
+        return True
+    if not date_utc:
+        return False
+    try:
+        dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=history_days)
+        return dt >= cutoff
+    except (ValueError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Odds: приоритет B365 → BbAv → IW → LB → WH → VC
+# ---------------------------------------------------------------------------
+def build_1x2_odds(row: dict) -> dict:
+    """Построить odds.1x2 блок с приоритетом по источникам."""
     ts = now_msk()
-    odds_price = _extract_odds(row)
-    odds = _build_1x2(odds_price, FD_SOURCE, upstream, ts, "closing")
+    for prefix, h_col, d_col, a_col, upstream_name in ODDS_PRIORITY:
+        h = safe_float(row.get(h_col))
+        d = safe_float(row.get(d_col))
+        a = safe_float(row.get(a_col))
+        if h and d and a:
+            price = {"home": h, "draw": d, "away": a}
+            return {
+                "1x2": {
+                    "current": dict(price),
+                    "opening": dict(price),
+                    "best": dict(price),
+                    "sources": [{
+                        "source": "football_data",
+                        "upstream": upstream_name,
+                        "price": price,
+                        "timestamp": ts,
+                        "type": "closing",
+                    }],
+                }
+            }
+    return {}
 
-    # Source map
-    source_map = _build_source_map(upstream, ts)
 
-    # Canonical ID — через хаб (TEAM_ALIASES)
-    canonical_id = build_canonical_id(home_team, away_team, date_utc)
-
+# ---------------------------------------------------------------------------
+# Stats: 12 метрик
+# ---------------------------------------------------------------------------
+def build_stats(row: dict) -> dict:
     return {
-        "canonical_id":      canonical_id,
-        "home_team":         home_team,
-        "away_team":         away_team,
-        "home_clean":        clean_team_name(home_team),
-        "away_clean":        clean_team_name(away_team),
-        "competition":       comp_name,
-        "country":           country,
-        "season":            season,
-        "league_code":       league_code,
-        "date_utc":          date_utc,
-        "status":            "completed",
-        "score":             {"home": score_home, "away": score_away},
-        "half_time_score":   half_time_score,
-        "full_time_result":  ftr,
-        "referee":           (row.get("Referee") or "").strip(),
-        "version":           1,
-        "schema_version":    "v700",
-        "odds":              odds,
-        "predictions":       {},
-        "stats":             stats,
-        "h2h":               {},
-        "source_map":        source_map,
-        "source_ids":        {FD_SOURCE: league_code},
-        "sources":           [FD_SOURCE],
-        "section_history":   [],
-        "flags":             flags,
+        "shots_home": safe_int(row.get("HS")),
+        "shots_away": safe_int(row.get("AS")),
+        "shots_on_target_home": safe_int(row.get("HST")),
+        "shots_on_target_away": safe_int(row.get("AST")),
+        "corners_home": safe_int(row.get("HC")),
+        "corners_away": safe_int(row.get("AC")),
+        "fouls_home": safe_int(row.get("HF")),
+        "fouls_away": safe_int(row.get("AF")),
+        "yellow_home": safe_int(row.get("HY")),
+        "yellow_away": safe_int(row.get("AY")),
+        "red_home": safe_int(row.get("HR")),
+        "red_away": safe_int(row.get("AR")),
     }
 
 
 # ---------------------------------------------------------------------------
-# Архивация
+# Flags
 # ---------------------------------------------------------------------------
-def _archive_csv(filename: str):
-    """Перемещение CSV в archive/ после загрузки (предотвращает повторный импорт)."""
-    if not os.path.exists(filename):
-        return
+def build_flags(score: dict, stats: dict) -> dict:
+    diff = abs(score.get("home", 0) - score.get("away", 0))
+    red = (stats.get("red_home", 0) > 0 or stats.get("red_away", 0) > 0)
+    return {
+        "extreme_result": diff >= 4 or red,
+        "abnormal_score": score.get("home", 0) >= 5 or score.get("away", 0) >= 5,
+        "red_card_driven": red and diff >= 2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Скачать CSV
+# ---------------------------------------------------------------------------
+def download_csv(season: str, league_code: str) -> str:
+    """Скачать CSV с retries. Возвращает содержимое или пустую строку."""
+    url = f"{BASE_URL}/{season}/{league_code}.csv"
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"[CSV] Скачивание {url} (попытка {attempt}/{MAX_RETRIES})")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+                print(f"[CSV] Скачано: {season}_{league_code}.csv ({len(data)} байт)")
+                return data.decode("utf-8-sig", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"[CSV] 404 — файл не существует для {season}/{league_code}")
+                return ""
+            print(f"[CSV] HTTP {e.code}, попытка {attempt}")
+        except Exception as e:
+            print(f"[CSV] Ошибка: {e}, попытка {attempt}")
+        if attempt < MAX_RETRIES:
+            import time
+            time.sleep(RETRY_DELAY)
+    return ""
+
+
+def archive_csv(season: str, league_code: str, content: str) -> None:
+    """Сохранить CSV в archive/."""
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
-    dest = os.path.join(ARCHIVE_DIR, filename)
-    try:
-        shutil.move(filename, dest)
-        _p(f"[CSV] Архивирован: {dest}")
-    except Exception as e:
-        _p(f"[CSV] Ошибка архивации: {e}")
+    path = os.path.join(ARCHIVE_DIR, f"{season}_{league_code}.csv")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"[CSV] Архивирован: {path}")
 
 
 # ---------------------------------------------------------------------------
 # Обработка CSV
 # ---------------------------------------------------------------------------
-def process_csv(filepath: str, comp_name: str, country: str) -> dict:
-    """Обработка одного CSV файла."""
-    season, league_code = _parse_csv_filename(filepath)
-    if not season or not league_code:
-        _p(f"[CSV] Не удалось разобрать имя файла: {filepath}")
-        return {"matches": 0, "errors": 0, "skipped": 0}
+def process_csv(content: str, season: str, league_code: str, league_name: str,
+                country: str, history_days: int, limit: int = 0) -> dict:
+    """Парсинг CSV и запись в Redis через хаб. Возвращает статистику."""
+    stats = {"total": 0, "written": 0, "skipped": 0, "errors": 0}
 
-    _p(f"[CSV] Обработка: {filepath} (season={season}, league={league_code})")
+    reader = csv.DictReader(io.StringIO(content))
+    if reader.fieldnames is None:
+        print(f"[CSV] Пустой CSV для {league_code}")
+        return stats
 
-    matches = 0
-    errors = 0
-    skipped = 0
-    consecutive_errors = 0
+    for row in reader:
+        stats["total"] += 1
 
-    try:
-        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    payload = _build_payload(row, season, league_code, comp_name, country)
-                    if payload is None:
-                        skipped += 1
-                        continue
+        if limit > 0 and stats["written"] >= limit:
+            break
 
-                    cid = payload["canonical_id"]
-                    if upsert_history_match(cid, payload):
-                        matches += 1
-                        consecutive_errors = 0
-                    else:
-                        errors += 1
-                        consecutive_errors += 1
-                        if consecutive_errors >= 10:
-                            _p("[CSV] 10 ошибок подряд — останавливаем файл")
-                            break
-                except Exception as e:
-                    errors += 1
-                    consecutive_errors += 1
-                    if errors <= 5:
-                        _p(f"[CSV] Ошибка в строке: {e}")
-                    if consecutive_errors >= 10:
-                        _p("[CSV] 10 ошибок подряд — останавливаем файл")
-                        break
-    except Exception as e:
-        _p(f"[CSV] Ошибка чтения файла: {e}")
-        return {"matches": matches, "errors": errors, "skipped": skipped}
+        home_team = row.get("HomeTeam", "").strip()
+        away_team = row.get("AwayTeam", "").strip()
+        if not home_team or not away_team:
+            stats["skipped"] += 1
+            continue
 
-    _p(f"[CSV] Готово: {matches} матчей, {skipped} пропущено, {errors} ошибок")
-    return {"matches": matches, "errors": errors, "skipped": skipped}
+        date_utc = parse_date(row)
+        if not date_utc:
+            stats["skipped"] += 1
+            continue
+
+        if not within_history_window(date_utc, history_days):
+            stats["skipped"] += 1
+            continue
+
+        score = {
+            "home": safe_int(row.get("FTHG")),
+            "away": safe_int(row.get("FTAG")),
+        }
+        half_time_score = {
+            "home": safe_int(row.get("HTHG")),
+            "away": safe_int(row.get("HTAG")),
+        }
+        full_time_result = row.get("FTR", "").strip()
+        referee = row.get("Referee", "").strip()
+
+        odds = build_1x2_odds(row)
+        match_stats = build_stats(row)
+        flags = build_flags(score, match_stats)
+
+        canonical_id = build_canonical_id(home_team, away_team, date_utc)
+
+        payload = {
+            "canonical_id": canonical_id,
+            "home_team": home_team,
+            "away_team": away_team,
+            "competition": league_name,
+            "country": country,
+            "season": season,
+            "league_code": league_code,
+            "date_utc": date_utc,
+            "status": "completed",
+            "score": score,
+            "half_time_score": half_time_score,
+            "full_time_result": full_time_result,
+            "referee": referee,
+            "version": 1,
+            "schema_version": "v700",
+            "odds": odds,
+            "predictions": {},
+            "stats": match_stats,
+            "h2h": {},
+            "source_map": {
+                "odds": {
+                    "source": "football_data",
+                    "upstream": "bet365" if odds else "unknown",
+                    "type": "closing",
+                },
+                "stats": {
+                    "source": "football_data",
+                    "upstream": "match_data",
+                },
+            },
+            "source_ids": {"football_data": league_code},
+            "sources": ["football_data"],
+            "section_history": [],
+            "flags": flags,
+        }
+
+        try:
+            ok = upsert_history_match(canonical_id, payload)
+            if ok:
+                stats["written"] += 1
+            else:
+                stats["errors"] += 1
+        except Exception as e:
+            print(f"[CSV] Ошибка записи {canonical_id}: {e}")
+            stats["errors"] += 1
+
+    return stats
 
 
 # ---------------------------------------------------------------------------
 # Главная функция
 # ---------------------------------------------------------------------------
-def collect_football_data() -> Dict[str, Any]:
-    """Главная функция коллектора."""
-    _p("[FD] Football-Data Collector v5.0 (CSV) started")
-    _p(f"[FD] Источник: football-data.co.uk")
+def main():
+    parser = argparse.ArgumentParser(description="Football-Data Collector v5.0 (CSV)")
+    parser.add_argument("--seasons", default="", help="Сезоны через запятую (напр. 2425,2526,2627)")
+    parser.add_argument("--leagues", default="", help="Лиги через запятую (напр. E0,E1,SP1)")
+    parser.add_argument("--history-days", type=int, default=0, help="Окно истории (0 = весь CSV)")
+    parser.add_argument("--limit", type=int, default=0, help="Лимит матчей на лигу (для теста)")
+    args = parser.parse_args()
 
-    if not is_redis_available():
-        _p("[FD] Redis недоступен — остановка")
-        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+    seasons = parse_seasons(args.seasons)
+    leagues = parse_leagues(args.leagues)
 
-    season = SEASON or _auto_season()
-    _p(f"[FD] Сезон: {season}")
-    _p(f"[FD] Лиг: {len(COMPETITIONS)}")
+    print(f"[FD] Football-Data Collector v5.0 (CSV) started")
+    print(f"[FD] Источник: football-data.co.uk")
+    print(f"[FD] Сезоны: {', '.join(seasons)}")
+    print(f"[FD] Лиг: {len(leagues)}")
+    print(f"[FD] History days: {args.history_days} ({'без фильтра' if args.history_days == 0 else f'последние {args.history_days} дней'})")
+    if args.limit > 0:
+        print(f"[FD] Лимит матчей на лигу: {args.limit}")
+    print()
 
-    total_stored = 0
-    total_errors = 0
-    total_skipped = 0
+    grand_total = {"total": 0, "written": 0, "skipped": 0, "errors": 0}
 
-    for league_code, comp_name, country in COMPETITIONS:
-        _p(f"\n[FD] --- {comp_name} ({league_code}) ---")
+    for season in seasons:
+        print(f"[FD] {'='*50}")
+        print(f"[FD] Сезон {season}")
+        print(f"[FD] {'='*50}")
 
-        filename = _download_csv(season, league_code)
-        if filename is None:
-            continue
+        for league_code, league_name, country in leagues:
+            print(f"[FD] --- {league_name} ({league_code}) ---")
 
-        result = process_csv(filename, comp_name, country)
-        total_stored += result["matches"]
-        total_errors += result["errors"]
-        total_skipped += result.get("skipped", 0)
+            content = download_csv(season, league_code)
+            if not content:
+                print(f"[FD] Нет данных для {league_code} в сезоне {season}")
+                print()
+                continue
 
-        _archive_csv(filename)
-        time.sleep(0.5)
+            archive_csv(season, league_code, content)
 
-    _p(f"\n[FD] === ИТОГ ===")
-    _p(f"[FD] Сохранено матчей: {total_stored}")
-    _p(f"[FD] Пропущено:       {total_skipped}")
-    _p(f"[FD] Ошибок:          {total_errors}")
+            print(f"[CSV] Обработка: {season}_{league_code}.csv (season={season}, league={league_code})")
+            result = process_csv(
+                content, season, league_code, league_name, country,
+                args.history_days, args.limit,
+            )
 
-    save_meta(
-        "football_data_loader",
-        stored_matches=total_stored,
-        total_events=total_stored + total_skipped,
-        error_count=total_errors,
-        skipped=total_skipped,
-        season=season,
-    )
+            print(f"[CSV] Готово: {result['written']} матчей, {result['skipped']} пропущено, {result['errors']} ошибок")
+            print()
 
-    return {
-        "stored_matches": total_stored,
-        "total_events": total_stored + total_skipped,
-        "error_count": total_errors,
-    }
+            for k in grand_total:
+                grand_total[k] += result[k]
+
+        # Сохранить мета после каждого сезона
+        save_meta("football_data", season=season, leagues=len(leagues), **grand_total)
+
+    print(f"[FD] {'='*50}")
+    print(f"[FD] ИТОГО")
+    print(f"[FD] {'='*50}")
+    print(f"[FD] Всего строк:  {grand_total['total']}")
+    print(f"[FD] Записано:     {grand_total['written']}")
+    print(f"[FD] Пропущено:    {grand_total['skipped']}")
+    print(f"[FD] Ошибок:       {grand_total['errors']}")
+    print(f"[FD] Done.")
 
 
 if __name__ == "__main__":
-    collect_football_data()
+    main()
