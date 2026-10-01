@@ -191,18 +191,53 @@ def field_exists(field_id: str) -> bool:
 def get_all_fields() -> Dict[str, Any]:
     """
     Возвращает все поля хэш-кэша как dict {field_id: value}.
-    Использует HSCAN вместо HGETALL — Upstash REST API обрезает ответ
-    HGETALL при 500+ полях (~1 МБ лимит). HSCAN обходит курсорами по COUNT=500 с таймаутом 15 сек на итерацию.
+    HSCAN с COUNT=50 и retry при таймауте.
     """
+    # Быстрая проверка объёма через HLEN
+    total_expected = _execute_upstash_cmd(["HLEN", IMMUTABLE_ROOT_ADDRESS])
+    if total_expected is not None:
+        print(f"[REDIS] get_all_fields: HLEN={total_expected}, сканируем...")
+
     result = {}
     cursor = "0"
     iterations = 0
-    max_iterations = 1000  # защита от бесконечного цикла (1000 × 500 = 500 000 полей)
+    max_iterations = 5000  # защита: 5000 × 50 = 250 000 полей
+    consecutive_failures = 0
+    max_consecutive_failures = 5
 
     while iterations < max_iterations:
         iterations += 1
-        res = _execute_upstash_cmd(["HSCAN", IMMUTABLE_ROOT_ADDRESS, str(cursor), "COUNT", "500"], timeout=15)
-        if res is None or not isinstance(res, list) or len(res) < 2:
+        retry_count = 0
+        max_retries = 3
+        res = None
+
+        # Retry-цикл для одного курсора
+        while retry_count < max_retries:
+            res = _execute_upstash_cmd(
+                ["HSCAN", IMMUTABLE_ROOT_ADDRESS, str(cursor), "COUNT", "50"],
+                timeout=30
+            )
+            if res is not None:
+                break
+            retry_count += 1
+            if retry_count < max_retries:
+                wait = 3 * retry_count  # 3с, 6с
+                print(f"[REDIS] HSCAN timeout at cursor={cursor}, retry {retry_count}/{max_retries} after {wait}s")
+                reset_circuit_breaker()  # сброс breaker чтобы retry мог пройти
+                time.sleep(wait)
+
+        if res is None:
+            consecutive_failures += 1
+            print(f"[REDIS WARNING] HSCAN failed at cursor={cursor} (consecutive={consecutive_failures}/{max_consecutive_failures})")
+            if consecutive_failures >= max_consecutive_failures:
+                print(f"[REDIS ERROR] get_all_fields: {consecutive_failures} подряд неудач, остановка. Прочитано {len(result)} полей.")
+                break
+            time.sleep(5 * consecutive_failures)
+            continue
+
+        consecutive_failures = 0
+
+        if not isinstance(res, list) or len(res) < 2:
             break
 
         next_cursor = res[0]
@@ -226,13 +261,19 @@ def get_all_fields() -> Dict[str, Any]:
                 except (json.JSONDecodeError, TypeError):
                     result[key] = raw_value
 
-        # Курсор "0" означает конец сканирования
+        if iterations % 50 == 0:
+            print(f"[REDIS] get_all_fields: просканировано {len(result)} полей (итерация {iterations})")
+
         if str(next_cursor) == "0":
             break
         cursor = next_cursor
+        time.sleep(0.05)
+
+    if total_expected is not None and len(result) < int(total_expected):
+        print(f"[REDIS WARNING] get_all_fields: прочитано {len(result)}, ожидается {total_expected} (потеряно ~{int(total_expected) - len(result)})")
 
     if iterations >= max_iterations:
-        print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), прочитано {len(result)} полей, возможно не все")
+        print(f"[REDIS WARNING] get_all_fields: достигнут лимит итераций ({max_iterations}), прочитано {len(result)} полей")
 
     return result
 
