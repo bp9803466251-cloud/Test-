@@ -3,7 +3,7 @@ name: Sports Data Pipeline
 on:
   workflow_dispatch:
   schedule:
-    - cron: "11 */2 * * *"
+    - cron: "15 */3 * * *"
 
 env:
   PYTHON_VERSION: "3.12"
