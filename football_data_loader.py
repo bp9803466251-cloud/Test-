@@ -766,60 +766,79 @@ def _init_redis():
     return False
 
 
-# Circuit Breaker state
-_cb_errors = 0
-_cb_active_until = 0.0
-_CB_THRESHOLD = 3
-_CB_COOLDOWN = 30.0
+_CIRCUIT_BREAKER_UNTIL = 0
+_CONSECUTIVE_ERRORS = 0
 
-def _exec_with_retry(cmd, max_retries=5):
-    """Выполняет команду Redis с retry и Circuit Breaker."""
-    global _cb_errors, _cb_active_until
-    for attempt in range(max_retries):
-        now = time.time()
-        if now < _cb_active_until:
-            wait = int(_cb_active_until - now)
-            _p(f"[REDIS WARNING] Circuit Breaker активен — запросы заблокированы (осталось {wait}s)")
-            time.sleep(min(wait + 0.5, 30))
-            continue
-        try:
-            result = _exec_upstash(cmd)
-            _cb_errors = 0
-            return result
-        except Exception as e:
-            _cb_errors += 1
-            err_str = str(e)
-            _p(f"[REDIS SYSTEM ERROR] Ошибка команды {cmd[0]} для поля '{cmd[2] if len(cmd) > 2 else '?'}': {err_str}")
-            if _cb_errors >= _CB_THRESHOLD:
-                _cb_active_until = time.time() + _CB_COOLDOWN
-                _p(f"[REDIS ALERT] Circuit Breaker сработал! Ошибок подряд: {_cb_errors}")
-                _cb_errors = 0
-            if attempt < max_retries - 1:
-                backoff = min(2 ** attempt, 30)
-                _p(f"[REDIS WARN] None result (attempt {attempt + 1}/{max_retries}), waiting {backoff}s before retry...")
-                time.sleep(backoff)
-    return None
+
+def _check_circuit():
+    """Возвращает True если Circuit Breaker активен."""
+    global _CIRCUIT_BREAKER_UNTIL
+    if _CIRCUIT_BREAKER_UNTIL > time.time():
+        remaining = int(_CIRCUIT_BREAKER_UNTIL - time.time())
+        _p(f"[REDIS WARNING] Circuit Breaker активен — запросы заблокированы (осталось {remaining}s)")
+        return True
+    return False
+
+
+def _trip_circuit():
+    """Срабатывает Circuit Breaker после 3 ошибок подряд."""
+    global _CIRCUIT_BREAKER_UNTIL, _CONSECUTIVE_ERRORS
+    _CONSECUTIVE_ERRORS += 1
+    if _CONSECUTIVE_ERRORS >= 3:
+        _CIRCUIT_BREAKER_UNTIL = time.time() + 30
+        _p(f"[REDIS ALERT] Circuit Breaker сработал! Ошибок подряд: {_CONSECUTIVE_ERRORS}")
+        _CONSECUTIVE_ERRORS = 0
+
+
+def _reset_circuit():
+    """Сброс счётчика ошибок при успехе."""
+    global _CONSECUTIVE_ERRORS
+    _CONSECUTIVE_ERRORS = 0
 
 
 def _exec_upstash(cmd):
-    """POST-запрос с JSON-телом — нет лимитов по длине URL."""
-    url = _REDIS_URL.rstrip("/") + "/"
+    """POST-запрос с JSON-телом + retry (5 попыток, backoff 2->4->8->16->30s)."""
+    url = _REDIS_URL.rstrip("/")
     body = json.dumps(cmd).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {_REDIS_TOKEN}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        resp_body = resp.read().decode("utf-8")
-        data = json.loads(resp_body)
-        if "error" in data:
-            raise RuntimeError(f"Upstash error: {data['error']}")
-        return data.get("result")
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        if _check_circuit():
+            time.sleep(2)
+            continue
+        try:
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {_REDIS_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read().decode("utf-8")).get("result")
+                _reset_circuit()
+                return result
+        except urllib.error.HTTPError as e:
+            _trip_circuit()
+            if attempt < max_retries:
+                wait = min(2 ** attempt, 30)
+                _p(f"[REDIS SYSTEM ERROR] Ошибка команды {cmd[0]} для поля {cmd[2] if len(cmd) > 2 else '?'}: {e}")
+                _p(f"[REDIS WARN] None result (attempt {attempt}/{max_retries}), waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                _p(f"[REDIS ERROR] {cmd[0]} failed after {max_retries} attempts: {e}")
+                return None
+        except Exception as e:
+            _trip_circuit()
+            if attempt < max_retries:
+                wait = min(2 ** attempt, 30)
+                _p(f"[REDIS WARN] {e} (attempt {attempt}/{max_retries}), waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                _p(f"[REDIS ERROR] {cmd[0]} failed: {e}")
+                return None
+    return None
 
 
 def _exec(cmd):
@@ -827,7 +846,7 @@ def _exec(cmd):
         import redis_hub
         return redis_hub._execute_upstash_cmd(cmd)
     elif _REDIS_MODE == "upstash":
-        return _exec_with_retry(cmd)
+        return _exec_upstash(cmd)
     return None
 
 
@@ -841,14 +860,14 @@ def save_batch_to_redis(batch):
     result = _exec(["HSET", "GatekeeperAI"] + hset_args)
     if result is not None:
         return len(batch)
-    # Если весь батч упал — пробуем по одному
+    # Fallback: пробуем по одному
     _p(f"  [REDIS WARN] Batch failed, trying one-by-one...")
     saved = 0
     for history_key, json_wrapper in batch:
         r = _exec(["HSET", "GatekeeperAI", history_key, json_wrapper])
         if r is not None:
             saved += 1
-        time.sleep(0.2)
+        time.sleep(0.1)
     return saved
 
 
@@ -866,7 +885,11 @@ def save_indexes_batch(index_entries):
         }
         hset_args.append(index_key)
         hset_args.append(json.dumps(wrapper, ensure_ascii=False))
-    _exec(["HSET", "GatekeeperAI"] + hset_args)
+    for attempt in range(3):
+        result = _exec(["HSET", "GatekeeperAI"] + hset_args)
+        if result is not None:
+            return
+        time.sleep(2 ** attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -941,7 +964,7 @@ def process_csv(filepath, dry_run=False):
             for date_str, cids in date_index.items():
                 date_key = f"history:index:{date_str}"
                 all_index_entries.append((date_key, cids))
-            idx_batch_size = 10
+            idx_batch_size = 20
             for i in range(0, len(all_index_entries), idx_batch_size):
                 chunk = all_index_entries[i:i + idx_batch_size]
                 save_indexes_batch(chunk)
