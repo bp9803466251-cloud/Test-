@@ -41,8 +41,13 @@ jobs:
         run: pip install requests
 
       - name: Run Football Data Collector
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          python football_data_to_redis.py             --seasons "${SEASONS_INPUT}"             --leagues "${LEAGUES_INPUT}"             --history-days ${HISTORY_DAYS_INPUT}
+          python -u football_data_to_redis.py \
+            --seasons "${SEASONS_INPUT}" \
+            --leagues "${LEAGUES_INPUT}" \
+            --history-days ${HISTORY_DAYS_INPUT}
 
       - name: Summary
         if: always()
