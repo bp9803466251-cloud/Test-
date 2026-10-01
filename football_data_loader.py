@@ -767,83 +767,29 @@ def _init_redis():
 
 
 def _exec_upstash(cmd):
-    """POST-запрос к Upstash REST API с JSON-телом (без ограничений длины URL)."""
+    """POST-запрос к Upstash REST API (нет лимита на длину URL)."""
     url = _REDIS_URL.rstrip("/") + "/"
     body = json.dumps(cmd).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
+        method="POST",
         headers={
             "Authorization": f"Bearer {_REDIS_TOKEN}",
             "Content-Type": "application/json",
         },
-        method="POST",
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
-        resp_body = resp.read().decode("utf-8")
-        return json.loads(resp_body).get("result")
+        result = json.loads(resp.read().decode("utf-8"))
+        return result.get("result")
 
 
-# Circuit Breaker state
-_cb_active = False
-_cb_until = 0
-_cb_errors = 0
-
-
-def _exec(cmd, retries=5):
-    global _cb_active, _cb_until, _cb_errors
+def _exec(cmd):
     if _REDIS_MODE == "redis_hub":
         import redis_hub
         return redis_hub._execute_upstash_cmd(cmd)
     elif _REDIS_MODE == "upstash":
-        for attempt in range(1, retries + 1):
-            # Check circuit breaker
-            if _cb_active and time.time() < _cb_until:
-                remaining = int(_cb_until - time.time())
-                _p(f"  [REDIS WARNING] Circuit Breaker активен — запросы заблокированы (осталось {remaining}s)")
-                wait = min(remaining + 1, 30)
-                time.sleep(wait)
-                continue
-
-            if _cb_active and time.time() >= _cb_until:
-                _cb_active = False
-                _cb_errors = 0
-                _p("  [REDIS INFO] Circuit Breaker сброшен, продолжаем...")
-
-            try:
-                result = _exec_upstash(cmd)
-                _cb_errors = 0
-                if _cb_active:
-                    _cb_active = False
-                    _p("  [REDIS INFO] Circuit Breaker сброшен после успеха")
-                return result
-            except urllib.error.HTTPError as e:
-                _cb_errors += 1
-                if e.code == 429 or e.code == 503:
-                    # Rate limited
-                    if _cb_errors >= 3:
-                        _cb_active = True
-                        _cb_until = time.time() + 30
-                        _p(f"  [REDIS ALERT] Circuit Breaker сработал! Ошибок подряд: {_cb_errors}")
-                    backoff = min(2 ** attempt, 30)
-                    _p(f"  [REDIS WARN] Rate limited (HTTP {e.code}), attempt {attempt}/{retries}, waiting {backoff}s...")
-                    time.sleep(backoff)
-                else:
-                    _p(f"  [REDIS SYSTEM ERROR] Ошибка команды {cmd[0]}: HTTP Error {e.code}: {e.reason}")
-                    if attempt < retries:
-                        backoff = min(2 ** attempt, 16)
-                        _p(f"  [REDIS WARN] None result (attempt {attempt}/{retries})")
-                        _p(f"  [REDIS WARN] Waiting {backoff}s before retry...")
-                        time.sleep(backoff)
-            except Exception as e:
-                _cb_errors += 1
-                _p(f"  [REDIS SYSTEM ERROR] Ошибка команды {cmd[0]} для поля '{cmd[2] if len(cmd) > 2 else '?'}': {e}")
-                if attempt < retries:
-                    backoff = min(2 ** attempt, 16)
-                    _p(f"  [REDIS WARN] None result (attempt {attempt}/{retries})")
-                    _p(f"  [REDIS WARN] Waiting {backoff}s before retry...")
-                    time.sleep(backoff)
-        return None
+        return _exec_upstash(cmd)
     return None
 
 
@@ -854,12 +800,20 @@ def save_batch_to_redis(batch):
     for history_key, json_wrapper in batch:
         hset_args.append(history_key)
         hset_args.append(json_wrapper)
-    result = _exec(["HSET", "GatekeeperAI"] + hset_args)
-    return len(batch) if result is not None else 0
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        result = _exec(["HSET", "GatekeeperAI"] + hset_args)
+        if result is not None:
+            return len(batch)
+        wait = min(2 ** attempt, 30)
+        _p(f"  [REDIS WARN] None result (attempt {attempt}/{max_retries}), waiting {wait}s...")
+        time.sleep(wait)
+    _p(f"  [REDIS ERROR] Failed after {max_retries} retries, batch lost ({len(batch)} items)")
+    return 0
 
 
 def save_indexes_batch(index_entries):
-    """Сохраняет несколько индексов в одном HSET (быстро)."""
+    """Сохраняет несколько индексов в одном HSET (с retry)."""
     if not index_entries:
         return
     hset_args = []
@@ -872,7 +826,13 @@ def save_indexes_batch(index_entries):
         }
         hset_args.append(index_key)
         hset_args.append(json.dumps(wrapper, ensure_ascii=False))
-    _exec(["HSET", "GatekeeperAI"] + hset_args)
+    for attempt in range(1, 4):
+        result = _exec(["HSET", "GatekeeperAI"] + hset_args)
+        if result is not None:
+            return
+        wait = min(2 ** attempt, 15)
+        _p(f"  [INDEX WARN] None result (attempt {attempt}/3), waiting {wait}s...")
+        time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
