@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       seasons:
-        description: 'Сезоны через запятую (напр. 2425,2526). Пусто = авто (2627)'
+        description: 'Сезоны через запятую (пусто = авто)'
         required: false
         default: '2526'
       leagues:
-        description: 'Лиги через запятую (напр. E0,E1,SP1). Пусто = все 22'
+        description: 'Лиги через запятую (пусто = все 22)'
         required: false
         default: ''
       history_days:
-        description: 'Окно истории в днях (0 = весь CSV без фильтра)'
+        description: 'Окно истории в днях (0 = весь CSV)'
         required: false
         default: '0'
 
@@ -20,6 +20,14 @@ jobs:
   load:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+
+    env:
+      SEASONS_INPUT: ${{ github.event.inputs.seasons }}
+      LEAGUES_INPUT: ${{ github.event.inputs.leagues }}
+      HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,23 +38,17 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install redis
+        run: pip install requests
 
       - name: Run Football Data Collector
-        env:
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-          REDIS_TOKEN: ${{ secrets.REDIS_TOKEN }}
         run: |
-          python football_data_to_redis.py \
-            --seasons "${{ github.event.inputs.seasons }}" \
-            --leagues "${{ github.event.inputs.leagues }}" \
-            --history-days ${{ github.event.inputs.history_days }}
+          python football_data_to_redis.py             --seasons "${SEASONS_INPUT}"             --leagues "${LEAGUES_INPUT}"             --history-days ${HISTORY_DAYS_INPUT}
 
-      - name: Show summary
+      - name: Summary
         if: always()
         run: |
           echo "=== Football Data Loader Summary ==="
-          echo "Seasons: ${{ github.event.inputs.seasons }}"
-          echo "Leagues: ${{ github.event.inputs.leagues || 'all 22' }}"
-          echo "History days: ${{ github.event.inputs.history_days }}"
+          echo "Seasons: ${SEASONS_INPUT}"
+          echo "Leagues: ${LEAGUES_INPUT}"
+          echo "History days: ${HISTORY_DAYS_INPUT}"
           
