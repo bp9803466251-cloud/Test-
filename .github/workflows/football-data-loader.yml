@@ -4,46 +4,61 @@ on:
   workflow_dispatch:
     inputs:
       season:
-        description: 'Сезон (оставьте пустым для текущего)'
+        description: 'Сезон в формате YY/YY (напр. 2526). Пусто = автоопределение'
         required: false
         default: ''
       history_days:
-        description: 'Количество дней истории'
+        description: 'Окно истории в днях (0 = весь CSV без фильтра)'
         required: false
-        default: '30'
-      rate_delay:
-        description: 'Задержка между запросами (сек)'
-        required: false
-        default: '0.15'
+        default: '365'
 
 jobs:
-  load-football-data:
+  load:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install --quiet curl_cffi 2>/dev/null || true
+          pip install --quiet -r requirements.txt 2>/dev/null || true
 
-      - name: Set environment variables
+      - name: Run collector
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          FOOTBALL_DATA_SEASON: ${{ github.event.inputs.season }}
+          FOOTBALL_DATA_HISTORY_DAYS: ${{ github.event.inputs.history_days }}
         run: |
-          echo "FOOTBALL_DATA_API_KEY=${{ secrets.FOOTBALL_DATA_API_KEY }}" >> $GITHUB_ENV
-          echo "FOOTBALL_DATA_SEASON=${{ inputs.season }}" >> $GITHUB_ENV
-          echo "FOOTBALL_DATA_HISTORY_DAYS=${{ inputs.history_days }}" >> $GITHUB_ENV
-          echo "FOOTBALL_DATA_RATE_DELAY=${{ inputs.rate_delay }}" >> $GITHUB_ENV
+          SEASON_INPUT="${{ github.event.inputs.season }}"
+          HISTORY_INPUT="${{ github.event.inputs.history_days }}"
+          
+          CMD="python football_data_to_redis.py"
+          if [ -n "$SEASON_INPUT" ]; then
+            CMD="$CMD --season $SEASON_INPUT"
+          fi
+          if [ -n "$HISTORY_INPUT" ] && [ "$HISTORY_INPUT" != "0" ]; then
+            CMD="$CMD --history-days $HISTORY_INPUT"
+          fi
+          
+          echo "[WORKFLOW] Running: $CMD"
+          $CMD
 
-      - name: Run Football Data Collector
+      - name: Run diagnostics
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          python football_data_to_redis.py
-
-      - name: Run Seasons Check
-        run: |
-          python seasons_check.py
+          python redis_diagnostics.py
           
