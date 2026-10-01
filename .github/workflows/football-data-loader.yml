@@ -3,19 +3,23 @@ name: Football Data Loader
 on:
   workflow_dispatch:
     inputs:
-      season:
-        description: 'Сезон в формате YY/YY (напр. 2526). Пусто = автоопределение'
+      seasons:
+        description: 'Сезоны через запятую (напр. 2425,2526). Пусто = авто (2627)'
+        required: false
+        default: '2526'
+      leagues:
+        description: 'Лиги через запятую (напр. E0,E1,SP1). Пусто = все 22'
         required: false
         default: ''
       history_days:
         description: 'Окно истории в днях (0 = весь CSV без фильтра)'
         required: false
-        default: '365'
+        default: '0'
 
 jobs:
   load:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,39 +30,23 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install --quiet curl_cffi 2>/dev/null || true
-          pip install --quiet -r requirements.txt 2>/dev/null || true
+        run: pip install redis
 
-      - name: Run collector
+      - name: Run Football Data Collector
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          FOOTBALL_DATA_SEASON: ${{ github.event.inputs.season }}
-          FOOTBALL_DATA_HISTORY_DAYS: ${{ github.event.inputs.history_days }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          REDIS_TOKEN: ${{ secrets.REDIS_TOKEN }}
         run: |
-          SEASON_INPUT="${{ github.event.inputs.season }}"
-          HISTORY_INPUT="${{ github.event.inputs.history_days }}"
-          
-          CMD="python football_data_to_redis.py"
-          if [ -n "$SEASON_INPUT" ]; then
-            CMD="$CMD --season $SEASON_INPUT"
-          fi
-          if [ -n "$HISTORY_INPUT" ] && [ "$HISTORY_INPUT" != "0" ]; then
-            CMD="$CMD --history-days $HISTORY_INPUT"
-          fi
-          
-          echo "[WORKFLOW] Running: $CMD"
-          $CMD
+          python football_data_to_redis.py \
+            --seasons "${{ github.event.inputs.seasons }}" \
+            --leagues "${{ github.event.inputs.leagues }}" \
+            --history-days ${{ github.event.inputs.history_days }}
 
-      - name: Run diagnostics
-        env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+      - name: Show summary
+        if: always()
         run: |
-          python redis_diagnostics.py
+          echo "=== Football Data Loader Summary ==="
+          echo "Seasons: ${{ github.event.inputs.seasons }}"
+          echo "Leagues: ${{ github.event.inputs.leagues || 'all 22' }}"
+          echo "History days: ${{ github.event.inputs.history_days }}"
           
