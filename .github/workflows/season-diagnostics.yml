@@ -1,0 +1,53 @@
+name: Season Diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим запуска"
+        required: false
+        default: "seasons"
+        type: choice
+        options:
+          - seasons
+          - full
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Run Season Check
+      if: github.event.inputs.mode == 'seasons' || github.event.inputs.mode == ''
+      env:
+        UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+        UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+        SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: python seasons_check.py
+
+    - name: Run Full Diagnostics
+      if: github.event.inputs.mode == 'full'
+      env:
+        UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+        UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+        SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+        BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+        SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+        ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
+        FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: python source_diagnostics.py
+      
