@@ -741,26 +741,68 @@ _REDIS_TOKEN = None
 
 def _init_redis():
     global _REDIS_MODE, _REDIS_URL, _REDIS_TOKEN
+
+    # --- Пытаемся извлечь URL и токен из redis_hub и использовать POST ---
+    try:
+        import redis_hub
+        func = getattr(redis_hub, "_execute_upstash_cmd", None)
+        if func and hasattr(func, "__globals__"):
+            g = func.__globals__
+            for key, val in g.items():
+                if isinstance(val, str) and val.startswith("http"):
+                    _REDIS_URL = val.rstrip("/")
+                if isinstance(val, str) and len(val) > 10:
+                    kl = key.lower()
+                    if "token" in kl or "pass" in kl or ("key" in kl and len(val) > 15):
+                        _REDIS_TOKEN = val
+        # Также проверяем атрибуты модуля напрямую
+        for attr in ("REDIS_URL", "_REDIS_URL", "UPSTASH_REDIS_REST_URL", "url"):
+            v = getattr(redis_hub, attr, None)
+            if isinstance(v, str) and v.startswith("http"):
+                _REDIS_URL = v.rstrip("/")
+        for attr in ("REDIS_TOKEN", "_REDIS_TOKEN", "UPSTASH_REDIS_REST_TOKEN", "token"):
+            v = getattr(redis_hub, attr, None)
+            if isinstance(v, str) and len(v) > 10:
+                _REDIS_TOKEN = v
+        if _REDIS_URL and _REDIS_TOKEN:
+            _REDIS_MODE = "upstash"
+            _p("[REDIS] Using Upstash REST API (POST) — credentials from redis_hub")
+            # Тестовое PING
+            test = _exec_upstash(["PING"])
+            if test is not None:
+                _p("[REDIS] POST connection verified")
+                return True
+            else:
+                _p("[REDIS] POST test failed — falling back")
+                _REDIS_URL = None
+                _REDIS_TOKEN = None
+                _REDIS_MODE = None
+    except Exception as e:
+        _p(f"[REDIS] Could not extract credentials from redis_hub: {e}")
+
+    # --- Пробуем переменные окружения ---
+    for url_env, token_env in [
+        ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
+        ("SHARED_UPSTASH_REDIS_REST_URL", "SHARED_UPSTASH_REDIS_REST_TOKEN"),
+    ]:
+        _REDIS_URL = os.environ.get(url_env, "")
+        _REDIS_TOKEN = os.environ.get(token_env, "")
+        if _REDIS_URL and _REDIS_TOKEN:
+            _REDIS_URL = _REDIS_URL.rstrip("/")
+            _REDIS_MODE = "upstash"
+            _p(f"[REDIS] Using Upstash REST API (POST) via {url_env}")
+            return True
+
+    # --- Fallback: redis_hub (если ничего не вышло) ---
     try:
         import redis_hub
         redis_hub._execute_upstash_cmd(["PING"])
         _REDIS_MODE = "redis_hub"
-        _p("[REDIS] Using redis_hub")
+        _p("[REDIS] WARNING: Using redis_hub (GET — large payloads may fail with HTTP 400)")
         return True
     except Exception:
         pass
-    _REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-    _REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
-    if _REDIS_URL and _REDIS_TOKEN:
-        _REDIS_MODE = "upstash"
-        _p("[REDIS] Using Upstash REST API")
-        return True
-    _REDIS_URL = os.environ.get("SHARED_UPSTASH_REDIS_REST_URL", "")
-    _REDIS_TOKEN = os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN", "")
-    if _REDIS_URL and _REDIS_TOKEN:
-        _REDIS_MODE = "upstash"
-        _p("[REDIS] Using shared Upstash REST API")
-        return True
+
     _REDIS_MODE = None
     _p("[REDIS] No Redis backend available")
     return False
@@ -807,7 +849,11 @@ def _exec_upstash(cmd):
         except urllib.error.HTTPError as e:
             _cb_errors += 1
             if e.code == 400:
-                _p(f"  [REDIS SYSTEM ERROR] Ошибка команды {cmd[0]} для поля {cmd[2] if len(cmd) > 2 else '?'}: HTTP Error {e.code}: {e.reason}")
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")[:200]
+                except Exception:
+                    err_body = ""
+                _p(f"  [REDIS SYSTEM ERROR] HTTP 400 for {cmd[2] if len(cmd) > 2 else '?'}: {err_body}")
             else:
                 _p(f"  [REDIS SYSTEM ERROR] HTTP Error {e.code}: {e.reason}")
             if _cb_errors >= _CB_THRESHOLD:
@@ -989,7 +1035,7 @@ def process_csv(filepath, dry_run=False):
 
 def main():
     _p("=" * 60)
-    _p("  football_data_loader.py -- v5.1 / POST + retry + circuit-breaker")
+    _p("  football_data_loader.py -- v5.2 / POST-fix + credential-extraction")
     _p(f"  Time: {now_msk()}")
     _p("=" * 60)
 
