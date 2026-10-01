@@ -63,13 +63,42 @@ UPSTREAM_MAP = {
 }
 
 ODDS_PRIORITY = [
+    # --- Closing odds (приоритет — кэфы закрытия, точнее для анализа) ---
+    # Новый формат CSV (2019/20+)
+    ("PSCH", "PSCD", "PSCA", "pinnacle_closing"),
+    ("B365CH", "B365CD", "B365CA", "bet365_closing"),
+    ("BWCH", "BWCD", "BWCA", "bwh_closing"),
+    ("IWCH", "IWCD", "IWCA", "interwetten_closing"),
+    ("WHCH", "WHCD", "WHCA", "william_hill_closing"),
+    ("VCCH", "VCCD", "VCCA", "vc_bet_closing"),
+    ("MaxCH", "MaxCD", "MaxCA", "max_closing"),
+    ("AvgCH", "AvgCD", "AvgCA", "avg_closing"),
+    # --- Opening odds (fallback если closing нет) ---
     ("B365H", "B365D", "B365A", "bet365"),
-    ("BbAvH", "BbAvD", "BbAvA", "betbrain_avg"),
+    ("AvgH", "AvgD", "AvgA", "avg"),
+    ("MaxH", "MaxD", "MaxA", "max"),
     ("IWH", "IWD", "IWA", "interwetten"),
-    ("LBH", "LBD", "LBA", "ladbrokes"),
     ("WHH", "WHD", "WHA", "william_hill"),
     ("VCH", "VCD", "VCA", "vc_bet"),
+    ("PSH", "PSD", "PSA", "pinnacle"),
+    # --- Legacy (старый формат CSV до 2019) ---
+    ("BbAvH", "BbAvD", "BbAvA", "betbrain_avg"),
+    ("BbMxH", "BbMxD", "BbMxA", "betbrain_max"),
+    ("LBH", "LBD", "LBA", "ladbrokes"),
+    ("SBH", "SBD", "SBA", "sportingbet"),
+    ("GBH", "GBD", "GBA", "gamebookers"),
 ]
+
+ODDS_CLOSING_COLS = {
+    "PSCH", "PSCD", "PSCA",
+    "B365CH", "B365CD", "B365CA",
+    "BWCH", "BWCD", "BWCA",
+    "IWCH", "IWCD", "IWCA",
+    "WHCH", "WHCD", "WHCA",
+    "VCCH", "VCCD", "VCCA",
+    "MaxCH", "MaxCD", "MaxCA",
+    "AvgCH", "AvgCD", "AvgCA",
+}
 
 # ---------------------------------------------------------------------------
 # TEAM_ALIASES
@@ -559,59 +588,102 @@ def parse_match_stats(row, ts):
 
 
 def parse_odds(row, ts):
-    current = {}
-    source_name = None
-    for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
+    def _extract(h_col, d_col, a_col):
         h = (row.get(h_col) or "").strip()
         d = (row.get(d_col) or "").strip()
         a = (row.get(a_col) or "").strip()
         if h and d and a and h != "-" and d != "-" and a != "-":
             try:
                 float(h); float(d); float(a)
-                current = {"home": h, "draw": d, "away": a}
-                source_name = bk_name
-                break
+                return {"home": h, "draw": d, "away": a}
             except ValueError:
-                continue
-    if not current:
+                pass
         return None
-    opening = dict(current)
+
+    # --- Closing odds (приоритет) ---
+    closing = {}
+    closing_source = None
+    for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
+        if h_col in ODDS_CLOSING_COLS:
+            val = _extract(h_col, d_col, a_col)
+            if val:
+                closing = val
+                closing_source = bk_name
+                break
+
+    # --- Opening odds ---
+    opening = {}
+    opening_source = None
+    for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
+        if h_col not in ODDS_CLOSING_COLS:
+            val = _extract(h_col, d_col, a_col)
+            if val:
+                opening = val
+                opening_source = bk_name
+                break
+
+    # --- Fallback: если closing нет, используем opening как closing ---
+    if not closing and opening:
+        closing = dict(opening)
+        closing_source = opening_source
+
+    if not closing:
+        return None
+
+    # --- Собираем all_odds для best (максимальные кэфы) ---
     all_odds = {}
     for h_col, d_col, a_col, bk_name in ODDS_PRIORITY:
-        h = (row.get(h_col) or "").strip()
-        d = (row.get(d_col) or "").strip()
-        a = (row.get(a_col) or "").strip()
-        if h and d and a and h != "-" and d != "-" and a != "-":
-            try:
-                fh, fd, fa = float(h), float(d), float(a)
-                all_odds.setdefault("home", []).append(fh)
-                all_odds.setdefault("draw", []).append(fd)
-                all_odds.setdefault("away", []).append(fa)
-            except ValueError:
-                continue
+        val = _extract(h_col, d_col, a_col)
+        if val:
+            fh = float(val["home"])
+            fd = float(val["draw"])
+            fa = float(val["away"])
+            all_odds.setdefault("home", []).append(fh)
+            all_odds.setdefault("draw", []).append(fd)
+            all_odds.setdefault("away", []).append(fa)
+
     if all_odds:
         best = {
-            "home": str(max(all_odds.get("home", [float(current["home"])]))),
-            "draw": str(max(all_odds.get("draw", [float(current["draw"])]))),
-            "away": str(max(all_odds.get("away", [float(current["away"])]))),
+            "home": str(max(all_odds.get("home", [float(closing["home"])]))),
+            "draw": str(max(all_odds.get("draw", [float(closing["draw"])]))),
+            "away": str(max(all_odds.get("away", [float(closing["away"])]))),
         }
     else:
-        best = dict(current)
+        best = dict(closing)
+
+    sources = []
+    if closing_source:
+        sources.append({
+            "source": "football_data",
+            "upstream": closing_source,
+            "price": closing,
+            "timestamp": ts,
+            "type": "closing",
+        })
+    if opening and opening_source and opening_source != closing_source:
+        sources.append({
+            "source": "football_data",
+            "upstream": opening_source,
+            "price": opening,
+            "timestamp": ts,
+            "type": "opening",
+        })
+
+    odds_type = "closing" if closing_source and any(
+        closing_source.startswith(bk) for bk in
+        ("pinnacle_closing", "bet365_closing", "bwh_closing", "interwetten_closing",
+         "william_hill_closing", "vc_bet_closing", "max_closing", "avg_closing")
+    ) else "opening"
+
     return {
         "1x2": {
-            "current": current,
-            "opening": opening,
+            "current": closing,
+            "opening": opening if opening else dict(closing),
             "best": best,
-            "sources": [{
-                "source": "football_data",
-                "upstream": "bet365",
-                "price": current,
-                "timestamp": ts,
-                "type": "closing",
-            }],
-        }
+            "sources": sources,
+        },
+        "_odds_type": odds_type,
     }
-
 
 def compute_flags(score, stats):
     flags = {}
@@ -672,10 +744,10 @@ def build_payload(row, season, league_code, ts):
     source_map = {
         "odds": {
             "source": "football_data",
-            "upstream": "bet365",
+            "upstream": odds.get("sources", [{}])[0].get("upstream", "bet365") if odds else "bet365",
             "timestamp": ts,
             "independent": True,
-            "type": "closing",
+            "type": odds.get("_odds_type", "closing") if odds else "closing",
         },
         "stats": {
             "source": "football_data",
