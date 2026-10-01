@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-football_data_loader.py - load CSV to Redis, GatekeeperAI v5.0
+football_data_loader.py — загрузка CSV в Redis в формате GatekeeperAI v5.0
 
-26-field payload, unified 1x2 odds, TEAM_ALIASES, stats from 12 columns,
-source_map, flags, indexes history:team:* / history:league:* / history:index:*
+26 полей payload, единый формат odds 1x2, TEAM_ALIASES, stats из 12 колонок,
+source_map, flags, индексы history:team:* / history:league:* / history:index:*
 
-Usage:
-  python football_data_loader.py                    # load all CSV from csv_data/
-  python football_data_loader.py --dir csv_data     # specify directory
-  python football_data_loader.py --season 2526      # only one season
-  python football_data_loader.py --league E0         # only one league
-  python football_data_loader.py --dry-run          # no Redis writes
+Запуск:
+  python football_data_loader.py                    # загрузить все CSV из csv_data/
+  python football_data_loader.py --dir csv_data     # указать директорию
+  python football_data_loader.py --season 2526      # только один сезон
+  python football_data_loader.py --league E0         # только одну лигу
+  python football_data_loader.py --dry-run          # без записи в Redis
 """
 
 import os
@@ -25,7 +25,7 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------------------
-# Constants
+# Константы
 # ---------------------------------------------------------------------------
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -441,7 +441,7 @@ TEAM_ALIASES = {
 }
 
 # ---------------------------------------------------------------------------
-# Utils
+# Утилиты
 # ---------------------------------------------------------------------------
 def now_msk():
     return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
@@ -771,7 +771,7 @@ def _exec_upstash(cmd):
         urllib.parse.quote(str(c), safe="") for c in cmd
     )
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {_REDIS_TOKEN}"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         body = resp.read().decode("utf-8")
         return json.loads(body).get("result")
 
@@ -796,16 +796,21 @@ def save_batch_to_redis(batch):
     return len(batch) if result is not None else 0
 
 
-def save_index(index_key, cid_list):
-    if not cid_list:
+def save_indexes_batch(index_entries):
+    """Сохраняет несколько индексов в одном HSET (быстро)."""
+    if not index_entries:
         return
-    wrapper = {
-        "version": "v700-prod",
-        "sender_repo": "football_data_loader",
-        "timestamp": now_msk(),
-        "payload": cid_list,
-    }
-    _exec(["HSET", "GatekeeperAI", index_key, json.dumps(wrapper, ensure_ascii=False)])
+    hset_args = []
+    for index_key, cid_list in index_entries:
+        wrapper = {
+            "version": "v700-prod",
+            "sender_repo": "football_data_loader",
+            "timestamp": now_msk(),
+            "payload": cid_list,
+        }
+        hset_args.append(index_key)
+        hset_args.append(json.dumps(wrapper, ensure_ascii=False))
+    _exec(["HSET", "GatekeeperAI"] + hset_args)
 
 
 # ---------------------------------------------------------------------------
@@ -821,7 +826,7 @@ def process_csv(filepath, dry_run=False):
 
     stats_summary = {"total": 0, "loaded": 0, "errors": 0}
     batch = []
-    batch_size = 10
+    batch_size = 50
     team_index = {}
     league_index = []
     date_index = {}
@@ -856,12 +861,12 @@ def process_csv(filepath, dry_run=False):
                 if len(batch) >= batch_size:
                     saved = save_batch_to_redis(batch)
                     stats_summary["loaded"] += saved
-                    _p(f"  [BATCH] Loaded {stats_summary['loaded']}/{stats_summary['total']}...", end="\r")
+                    _p(f"  [BATCH] {stats_summary['loaded']}/{stats_summary['total']}...", end="\r")
                     batch = []
                     time.sleep(0.05)
             else:
                 stats_summary["loaded"] += 1
-            if stats_summary["total"] % 100 == 0:
+            if stats_summary["total"] % 200 == 0:
                 _p(f"  [PROG] Parsed {stats_summary['total']} rows, loaded {stats_summary['loaded']}...")
         f.close()
 
@@ -871,20 +876,23 @@ def process_csv(filepath, dry_run=False):
 
         if not dry_run and league_index:
             _p(f"  [INDEX] Creating indexes for {len(league_index)} matches...")
+            all_index_entries = []
             league_key = f"history:league:{league_code}"
-            save_index(league_key, league_index)
-            time.sleep(0.05)
-            team_items = list(team_index.items())
-            for i in range(0, len(team_items), 10):
-                batch_team = team_items[i:i+10]
-                for team, cids in batch_team:
-                    team_key = f"history:team:{team}"
-                    save_index(team_key, cids)
-                time.sleep(0.05)
+            all_index_entries.append((league_key, league_index))
+            for team, cids in team_index.items():
+                team_key = f"history:team:{team}"
+                all_index_entries.append((team_key, cids))
             for date_str, cids in date_index.items():
                 date_key = f"history:index:{date_str}"
-                save_index(date_key, cids)
-                time.sleep(0.02)
+                all_index_entries.append((date_key, cids))
+            idx_batch_size = 50
+            for i in range(0, len(all_index_entries), idx_batch_size):
+                chunk = all_index_entries[i:i + idx_batch_size]
+                save_indexes_batch(chunk)
+                if (i // idx_batch_size) % 10 == 0:
+                    _p(f"  [INDEX] {min(i + idx_batch_size, len(all_index_entries))}/{len(all_index_entries)}...", end="\r")
+                time.sleep(0.05)
+            _p(f"  [INDEX] Done: {len(all_index_entries)} indexes created")
 
         _p(f"  [DONE] {os.path.basename(filepath)}: total={stats_summary['total']}, "
             f"loaded={stats_summary['loaded']}, errors={stats_summary['errors']}")
