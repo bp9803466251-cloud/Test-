@@ -136,6 +136,12 @@ class RedisClient:
         self.MAX_PIPELINE = 50  # max commands per pipeline
         self.BATCH_DELAY = 0.15  # 150ms between batches
 
+    def _headers(self):
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+
     def _post(self, body, path=""):
         if self.cb.is_open():
             wait = self.cb.remaining_cooldown()
@@ -160,6 +166,11 @@ class RedisClient:
             err_body = e.read().decode("utf-8", errors="replace")
             print(f"[REDIS ERROR] HTTP {e.code}: {err_body}")
             return None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            self.cb.record_failure()
+            print(f"[REDIS ERROR] {e}")
+            return None
+
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             self.cb.record_failure()
             print(f"[REDIS ERROR] {e}")
