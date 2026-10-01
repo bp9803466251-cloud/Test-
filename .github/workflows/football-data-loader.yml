@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       season:
-        description: 'Сезон (напр. 2024 — пусто = текущий)'
+        description: 'Сезон (оставьте пустым для текущего)'
         required: false
         default: ''
       history_days:
-        description: 'Дней истории (по умолчанию 30)'
+        description: 'Количество дней истории'
         required: false
         default: '30'
       rate_delay:
@@ -17,34 +17,33 @@ on:
         default: '0.15'
 
 jobs:
-  load-history:
+  load-football-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          pip install -q -r requirements.txt 2>/dev/null || true
-          pip install -q redis 2>/dev/null || true
+          pip install -r requirements.txt
 
-      - name: Run football_data_to_redis.py
-        env:
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
-          FOOTBALL_DATA_SEASON: ${{ github.event.inputs.season }}
-          FOOTBALL_DATA_HISTORY_DAYS: ${{ github.event.inputs.history_days }}
-          FOOTBALL_DATA_RATE_DELAY: ${{ github.event.inputs.rate_delay }}
-        run: python football_data_to_redis.py
+      - name: Set environment variables
+        run: |
+          echo "FOOTBALL_DATA_API_KEY=${{ secrets.FOOTBALL_DATA_API_KEY }}" >> $GITHUB_ENV
+          echo "FOOTBALL_DATA_SEASON=${{ inputs.season }}" >> $GITHUB_ENV
+          echo "FOOTBALL_DATA_HISTORY_DAYS=${{ inputs.history_days }}" >> $GITHUB_ENV
+          echo "FOOTBALL_DATA_RATE_DELAY=${{ inputs.rate_delay }}" >> $GITHUB_ENV
 
-      - name: Run seasons_check.py
-        env:
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-        run: python seasons_check.py
-        
+      - name: Run Football Data Collector
+        run: |
+          python football_data_to_redis.py
+
+      - name: Run Seasons Check
+        run: |
+          python seasons_check.py
+          
