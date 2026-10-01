@@ -136,7 +136,7 @@ class RedisClient:
         self.MAX_PIPELINE = 50  # max commands per pipeline
         self.BATCH_DELAY = 0.15  # 150ms between batches
 
-        def _post(self, body, path=""):
+    def _post(self, body, path=""):
         if self.cb.is_open():
             wait = self.cb.remaining_cooldown()
             if wait > 0:
