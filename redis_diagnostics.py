@@ -6,6 +6,8 @@ import sys
 import json
 import time
 import traceback
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 
@@ -13,19 +15,69 @@ def _p(msg):
     print(msg, flush=True)
 
 
-try:
-    import redis_hub
-    _p("[DIAG] Import redis_hub: OK")
-except Exception as e:
-    _p(f"[FATAL] Cannot import redis_hub: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+# ---------------------------------------------------------------------------
+# Redis backend init (redis_hub → Upstash REST → shared Upstash)
+# ---------------------------------------------------------------------------
+_REDIS_MODE = None
+_REDIS_URL = None
+_REDIS_TOKEN = None
 
-try:
-    import gatekeeper_hub
-    _p("[DIAG] Import gatekeeper_hub: OK")
-except Exception as e:
-    _p(f"[WARN] Cannot import gatekeeper_hub: {e}")
+
+def _init_redis():
+    """Инициализация Redis: redis_hub (Termux) → Upstash REST API (CI)."""
+    global _REDIS_MODE, _REDIS_URL, _REDIS_TOKEN
+
+    try:
+        import redis_hub
+        redis_hub._execute_upstash_cmd(["PING"])
+        _REDIS_MODE = "redis_hub"
+        _p("[DIAG] Redis backend: redis_hub")
+        return True
+    except Exception:
+        pass
+
+    _REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+    _REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+    if _REDIS_URL and _REDIS_TOKEN:
+        _REDIS_MODE = "upstash"
+        _p("[DIAG] Redis backend: Upstash REST API")
+        return True
+
+    _REDIS_URL = os.environ.get("SHARED_UPSTASH_REDIS_REST_URL", "")
+    _REDIS_TOKEN = os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN", "")
+    if _REDIS_URL and _REDIS_TOKEN:
+        _REDIS_MODE = "upstash"
+        _p("[DIAG] Redis backend: shared Upstash REST API")
+        return True
+
+    _REDIS_MODE = None
+    _p("[DIAG] No Redis backend available")
+    return False
+
+
+def _exec_upstash(cmd):
+    url = _REDIS_URL.rstrip("/") + "/" + "/".join(
+        urllib.parse.quote(str(c), safe="") for c in cmd
+    )
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {_REDIS_TOKEN}"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body).get("result")
+
+
+def _exec(cmd):
+    try:
+        if _REDIS_MODE == "redis_hub":
+            import redis_hub
+            return redis_hub._execute_upstash_cmd(cmd)
+        elif _REDIS_MODE == "upstash":
+            return _exec_upstash(cmd)
+        else:
+            _p("[ERROR] No Redis backend initialised")
+            return None
+    except Exception as e:
+        _p(f"[REDIS ERROR] {e}")
+        return None
 
 
 def _safe_json(val):
@@ -50,59 +102,72 @@ def _unwrap(raw):
     return raw
 
 
-def _exec(cmd):
-    try:
-        return redis_hub._execute_upstash_cmd(cmd)
-    except Exception as e:
-        _p(f"[ERROR] _execute_upstash_cmd({cmd[0]}) failed: {e}")
-        traceback.print_exc()
-        return None
+def _hscan_all(hash_name, match_pattern=None):
+    """Итерация по большому хэшу через HSCAN (без таймаута HKEYS)."""
+    cursor = "0"
+    all_keys = []
+    while True:
+        cmd = ["HSCAN", hash_name, str(cursor)]
+        if match_pattern:
+            cmd.append("MATCH")
+            cmd.append(match_pattern)
+        cmd.append("COUNT")
+        cmd.append("500")
+        result = _exec(cmd)
+        if result is None:
+            _p(f"[WARN] HSCAN returned None at cursor={cursor}")
+            break
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                break
+        if not isinstance(result, list) or len(result) < 2:
+            break
+        cursor = str(result[0])
+        kv = result[1]
+        if isinstance(kv, list):
+            field_names = kv[::2]
+            all_keys.extend(field_names)
+        if cursor == "0" or cursor == 0:
+            break
+        time.sleep(0.05)
+    return all_keys
 
 
 def load_all_fields():
-    _p("[LOAD] Getting HKEYS...")
-    keys = _exec(["HKEYS", "GatekeeperAI"])
-    if keys is None:
-        _p("[FATAL] HKEYS returned None")
-        return {}
-    if isinstance(keys, str):
-        try:
-            keys = json.loads(keys)
-        except Exception:
-            keys = [keys]
-    _p(f"[LOAD] HKEYS: {len(keys)} keys")
-    if not keys:
-        return {}
-
+    """Загружает все поля хэша через HSCAN (не таймаутит на больших хэшах)."""
+    _p("[LOAD] Scanning via HSCAN...")
+    cursor = "0"
     all_fields = {}
-    batch_size = 50
-    total = len(keys)
-
-    for i in range(0, total, batch_size):
-        batch = keys[i:i + batch_size]
-        bn = i // batch_size + 1
-        tb = (total + batch_size - 1) // batch_size
-
-        vals = _exec(["HMGET", "GatekeeperAI"] + batch)
-        if vals is None:
-            _p(f"[WARN] HMGET batch {bn}/{tb} returned None, skipping")
-            time.sleep(1)
-            continue
-
-        if isinstance(vals, str):
+    batch_num = 0
+    while True:
+        cmd = ["HSCAN", "GatekeeperAI", str(cursor), "COUNT", "500"]
+        result = _exec(cmd)
+        if result is None:
+            _p(f"[WARN] HSCAN returned None at cursor={cursor}")
+            break
+        if isinstance(result, str):
             try:
-                vals = json.loads(vals)
+                result = json.loads(result)
             except Exception:
-                pass
-
-        if isinstance(vals, list):
-            for k, v in zip(batch, vals):
+                break
+        if not isinstance(result, list) or len(result) < 2:
+            break
+        cursor = str(result[0])
+        kv_pairs = result[1]
+        if isinstance(kv_pairs, list):
+            for i in range(0, len(kv_pairs), 2):
+                k = kv_pairs[i]
+                v = kv_pairs[i + 1] if i + 1 < len(kv_pairs) else None
                 if v is not None:
                     all_fields[k] = _safe_json(v)
-
-        if bn % 20 == 0 or bn == tb:
-            _p(f"[LOAD] Batch {bn}/{tb} — {len(all_fields)} fields loaded")
-        time.sleep(0.2)
+        batch_num += 1
+        if batch_num % 50 == 0:
+            _p(f"[LOAD] Scanned {len(all_fields)} fields so far...")
+        if cursor == "0" or cursor == 0:
+            break
+        time.sleep(0.05)
 
     _p(f"[LOAD] Done: {len(all_fields)} fields")
     return all_fields
@@ -273,45 +338,24 @@ def run_test():
     r = _exec(["PING"])
     _p(f"  Result: {r!r}")
 
-    _p("\n--- 2. is_redis_available ---")
-    try:
-        avail = redis_hub.is_redis_available()
-        _p(f"  Available: {avail}")
-    except Exception as e:
-        _p(f"  Error: {e}")
-
-    _p("\n--- 3. HLEN ---")
+    _p("\n--- 2. HLEN ---")
     r = _exec(["HLEN", "GatekeeperAI"])
     _p(f"  HLEN: {r}")
 
-    _p("\n--- 4. HKEYS (first 10) ---")
-    r = _exec(["HKEYS", "GatekeeperAI"])
-    if r is None:
-        _p("  HKEYS returned None!")
+    _p("\n--- 3. HSCAN (first batch) ---")
+    result = _exec(["HSCAN", "GatekeeperAI", "0", "COUNT", "10"])
+    if result is None:
+        _p("  HSCAN returned None!")
         return
-    if isinstance(r, str):
+    if isinstance(result, str):
         try:
-            r = json.loads(r)
+            result = json.loads(result)
         except Exception:
-            r = [r]
-    _p(f"  Total: {len(r)}")
-    _p(f"  First 10: {r[:10]}")
-
-    _p("\n--- 5. Hub function tests ---")
-    try:
-        cid = gatekeeper_hub.build_canonical_id("Chelsea", "Arsenal", "2026-09-30T15:00:00Z")
-        _p(f"  build_canonical_id: {cid}")
-    except Exception as e:
-        _p(f"  build_canonical_id ERROR: {e}")
-
-    try:
-        m = gatekeeper_hub.get_match(cid) if cid else None
-        _p(f"  get_match({cid}): {'OK' if m else 'None (not in cache)'}")
-        if m:
-            o = gatekeeper_hub.get_all_odds(m)
-            _p(f"  get_all_odds: sources={len(o.get('sources', []))}, verification={o.get('verification', '?')}")
-    except Exception as e:
-        _p(f"  get_match/get_all_odds ERROR: {e}")
+            result = [result, []]
+    if isinstance(result, list) and len(result) >= 2:
+        kv = result[1] if isinstance(result[1], list) else []
+        keys = kv[::2]
+        _p(f"  First batch keys: {keys[:10]}")
 
     _p("\n=== TEST COMPLETE ===")
 
@@ -538,93 +582,57 @@ def run_history():
 
 
 def run_purge(hard=False):
-    """Полная очистка Redis — удаляет ВСЕ ключи из хеша GatekeeperAI."""
+    """Полная очистка Redis — удаляет весь хэш GatekeeperAI одной командой DEL."""
     _p("=== PURGE MODE ===")
     _p("[PURGE] This will DELETE ALL keys from GatekeeperAI hash!")
 
-    keys = _exec(["HKEYS", "GatekeeperAI"])
-    if keys is None:
-        _p("[FATAL] HKEYS returned None")
+    hlen = _exec(["HLEN", "GatekeeperAI"])
+    if hlen is None:
+        _p("[FATAL] HLEN returned None — cannot reach Redis")
         return
-    if isinstance(keys, str):
-        try:
-            keys = json.loads(keys)
-        except Exception:
-            keys = [keys]
-    if not keys:
-        _p("[PURGE] No keys found. Already empty.")
+    hlen = int(hlen) if hlen else 0
+
+    if hlen == 0:
+        _p("[PURGE] HLEN=0, already empty.")
         return
 
-    _p(f"[PURGE] Found {len(keys)} keys to delete")
+    _p(f"[PURGE] HLEN = {hlen} fields")
 
-    # Breakdown
-    prefixes = {}
-    for k in keys:
-        p = k.split(":")[0] if ":" in k else k
-        prefixes[p] = prefixes.get(p, 0) + 1
-    _p("[PURGE] Breakdown:")
-    for p in sorted(prefixes.keys(), key=lambda x: -prefixes[x]):
-        _p(f"  {p}: = {prefixes[p]}")
+    _p("[PURGE] Executing DEL GatekeeperAI...")
+    result = _exec(["DEL", "GatekeeperAI"])
+    if result is None:
+        _p("[FATAL] DEL failed")
+        return
 
-    # Batched HDEL — 100 keys per call
-    batch_size = 100
-    total = len(keys)
-    deleted = 0
-    batches_done = 0
+    _p(f"[PURGE] DEL result: {result}")
 
-    for i in range(0, total, batch_size):
-        batch = keys[i:i + batch_size]
-        result = _exec(["HDEL", "GatekeeperAI"] + batch)
-        if result is None:
-            _p(f"[PURGE] HDEL batch failed at offset {i}, skipping")
-            time.sleep(1)
-            continue
-        deleted += len(batch)
-        batches_done += 1
-        if batches_done % 10 == 0 or deleted >= total:
-            _p(f"[PURGE] Deleted {deleted}/{total}...")
-        time.sleep(0.15)
-
-    _p(f"[PURGE] Done: {deleted} keys deleted.")
-
-    # Verify
     remaining = _exec(["HLEN", "GatekeeperAI"])
     _p(f"[PURGE] HLEN after purge: {remaining}")
     _p("=== PURGE COMPLETE ===")
 
 
 def run_flush(hard=False):
-    """Очистка match:* ключей (hard) или live:* ключей (soft)."""
+    """Очистка match:* ключей (hard) или live:* ключей (soft) через HSCAN."""
     if hard:
         _p("=== FLUSH MODE (hard=True) ===")
     else:
         _p("=== FLUSH MODE (hard=False) ===")
 
-    keys = _exec(["HKEYS", "GatekeeperAI"])
-    if keys is None:
-        _p("[FATAL] HKEYS returned None")
-        return
-    if isinstance(keys, str):
-        try:
-            keys = json.loads(keys)
-        except Exception:
-            keys = [keys]
-    if not keys:
-        _p("[FLUSH] No keys found.")
-        return
-
     if hard:
-        to_delete = [k for k in keys if k.startswith("match:")]
-        _p(f"[FLUSH] HARD: deleting {len(to_delete)} match:* keys...")
+        _p("[FLUSH] Scanning for match:* keys via HSCAN...")
+        keys = _hscan_all("GatekeeperAI", match_pattern="match:*")
+        to_delete = [k for k in keys if k.startswith("match:") and not k.startswith("match:index:")]
+        _p(f"[FLUSH] HARD: found {len(to_delete)} match:* keys to delete...")
     else:
-        to_delete = [k for k in keys if k.startswith("live:")]
-        _p(f"[FLUSH] SOFT: deleting {len(to_delete)} live: keys...")
+        _p("[FLUSH] Scanning for live:* keys via HSCAN...")
+        keys = _hscan_all("GatekeeperAI", match_pattern="live:*")
+        to_delete = keys
+        _p(f"[FLUSH] SOFT: found {len(to_delete)} live:* keys to delete...")
 
     if not to_delete:
         _p("[FLUSH] Nothing to delete.")
         return
 
-    # Batched HDEL
     batch_size = 100
     total = len(to_delete)
     deleted = 0
@@ -641,7 +649,7 @@ def run_flush(hard=False):
         batches_done += 1
         if batches_done % 10 == 0 or deleted >= total:
             _p(f"[FLUSH] Deleted {deleted}/{total}...")
-        time.sleep(0.15)
+        time.sleep(0.05)
 
     _p(f"[FLUSH] Done: {deleted} keys deleted.")
     _p("=== FLUSH COMPLETE ===")
@@ -668,7 +676,6 @@ def run_diagnostics():
     if other[:10]:
         _p(f"Other keys sample: {other[:10]}")
 
-    # Odds format check for match:*
     if match:
         _check_odds_format(match, fields)
 
@@ -680,7 +687,6 @@ if __name__ == "__main__":
     _p(f"[DIAG] CWD: {os.getcwd()}")
     _p(f"[DIAG] Args: {sys.argv}")
 
-    # Parse args — first --mode wins, rest are flags
     mode = ""
     flags = set()
     for arg in sys.argv[1:]:
@@ -694,6 +700,10 @@ if __name__ == "__main__":
     _p(f"[DIAG] Mode: {mode}")
     if flags:
         _p(f"[DIAG] Flags: {sorted(flags)}")
+
+    if not _init_redis():
+        _p("[FATAL] No Redis backend available")
+        sys.exit(1)
 
     try:
         if mode == "test":
