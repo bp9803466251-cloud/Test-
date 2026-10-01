@@ -609,7 +609,7 @@ def run_purge(hard=False):
     hlen = int(hlen) if hlen else 0
     _p(f"[PURGE] HLEN = {hlen}")
 
-    if "yes" not in sys.argv:
+    if "--yes" not in sys.argv:
         _p("[PURGE] Use --purge --yes to confirm")
         return
 
