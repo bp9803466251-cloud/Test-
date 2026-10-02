@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v6.0 (CSV) — ALL columns, GatekeeperAI v5.0
+Football-Data Collector v6.1 (CSV) — ALL columns, GatekeeperAI v5.7.18
 Источник: football-data.co.uk
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
 
-Schema: v700-prod
-CSV:    106 колонок (opening + closing odds, O/U 2.5, Asian Handicap)
+Schema: v710-prod
+CSV:    120 колонок (opening + closing odds, O/U 2.5, Asian Handicap)
 Stats:  12 метрик + _source + _updated_at
 Odds:   1x2 (opening+closing per-bookmaker), O/U 2.5, Asian Handicap
 Raw:    ALL CSV columns stored in csv_raw{}
@@ -27,8 +27,8 @@ from datetime import datetime, timezone
 # CONFIG
 # ============================================================================
 
-VERSION = "6.0.0"
-SCHEMA_VERSION = "v700"
+VERSION = "6.1.0"
+SCHEMA_VERSION = "v710"
 
 REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
@@ -64,10 +64,9 @@ LEAGUES = {
 BOOKMAKERS_1X2 = [
     ("B365", "bet365"),
     ("BW",   "bwin"),
-    ("IW",   "interwetten"),
+    ("BF",   "betfair"),
     ("PS",   "pinnacle"),
     ("WH",   "william_hill"),
-    ("VC",   "vc_bet"),
 ]
 
 # Team name aliases for canonical_id
@@ -404,7 +403,9 @@ def build_source_map(ts):
             "upstream": "pinnacle",
             "timestamp": ts,
             "independent": True,
-            "type": "closing",
+            "types": ["opening", "closing"],
+            "sharp_benchmark": "pinnacle",
+            "soft_bookmakers": ["bet365", "bwin", "william_hill", "betfair"],
         },
         "stats": {
             "source": "football_data",
@@ -600,6 +601,7 @@ def build_payload(row, season, league_code):
         "schema_version": SCHEMA_VERSION,
         "odds": odds_block,
         "predictions": {},
+        "value_analysis": {},
         "stats": stats,
         "h2h": {},
         "form": None,
@@ -627,7 +629,7 @@ def download_csv(season, league_code, max_retries=3):
     for attempt in range(1, max_retries + 1):
         print(f"[CSV] Download {url} (attempt {attempt}/{max_retries})")
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "FD-Collector/6.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "FD-Collector/6.1"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = resp.read()
                 if len(data) < 50:
@@ -717,7 +719,7 @@ class FootballDataCollector:
 
         print(f"[CSV] Done: {matches_in_league} matches, {skipped} skipped, {errors} errors")
 
-        if league_code in ["E0", "E1", "E2", "E3", "D1", "I1", "SP1", "F1"]:
+        if league_code in ["E0", "E1", "E2", "E3", "EC", "SC0", "SC1", "D1", "D2", "I1", "I2", "SP1", "SP2", "F1", "F2", "N1", "B1", "P1", "T1", "G1"]:
             archive_csv(season, league_code, csv_data)
 
     def _save_meta(self, season, league_code, matches, skipped, errors):
@@ -752,7 +754,7 @@ class FootballDataCollector:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Football-Data Collector v6.0")
+    parser = argparse.ArgumentParser(description="Football-Data Collector v6.1")
     parser.add_argument("--seasons", type=str, default="", help="Seasons comma-separated")
     parser.add_argument("--leagues", type=str, default="", help="Leagues comma-separated")
     parser.add_argument("--season", type=str, default="", help="Single season (legacy)")
@@ -777,7 +779,7 @@ def main():
         leagues = list(LEAGUES.keys())
 
     print(f"[FD] Football-Data Collector v{VERSION} (CSV) started")
-    print(f"[FD] Schema: {SCHEMA_VERSION} (GatekeeperAI v5.0)")
+    print(f"[FD] Schema: {SCHEMA_VERSION} (GatekeeperAI v5.7.18)")
     print(f"[FD] Source: football-data.co.uk")
     print(f"[FD] Seasons: {', '.join(seasons)}")
     print(f"[FD] Leagues: {len(leagues)}")
