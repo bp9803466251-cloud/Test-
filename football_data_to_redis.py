@@ -1,9 +1,25 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v6.2 (CSV) — ALL columns, GatekeeperAI v710
+Football-Data Collector v6.3 (CSV) — ALL columns, GatekeeperAI v710
 Источник: football-data.co.uk
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
+
+v6.3:
+  - SET history:match:* (не HSET) — match hub get_key
+  - canonical_id: .replace(" ", "_") — match hub format
+  - Team SET keys: .replace(" ", "_") — match hub update_history_indexes
+  - save_meta: SET football_data:meta (не HSET) — match diagnostics get_key
+  - save_meta: +stored_matches, +error_count, +last_run_at — match diagnostics
+  - TEAM_ALIASES: ~130 алиасов — sync с hub v2.1
+  - download_csv: 3 попытки (2 retry) с backoff
+  - self.errors: инкрементируется при ошибках парсинга
+  - history_days: self.skipped += 1 (не silent drop)
+  - build_payload: +h2h: {}
+  - parse_date: +%Y/%m/%d
+  - archive_csv: всегда (даже в dry-run)
+  - build_ou25: убран мёртвый параметр suffix
+  - Удалены мёртвые импорты: time, timedelta, scan_keys, delete_keys, dbsize
 
 Schema: v710
 CSV:    120 колонок (opening + closing odds, O/U 2.5, Asian Handicap)
@@ -18,19 +34,18 @@ import io
 import json
 import os
 import sys
-import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # Единый транспортный слой
-from redis_hub import PipelineBatch, scan_keys, delete_keys, dbsize, is_redis_available
+from redis_hub import PipelineBatch, is_redis_available
 
 # ============================================================================
 # CONFIG
 # ============================================================================
 
-VERSION = "6.2.0"
+VERSION = "6.3.0"
 SCHEMA_VERSION = "v710"
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
@@ -69,8 +84,9 @@ BOOKMAKERS_1X2 = [
     ("BF",   "betfair"),
 ]
 
-# Team name aliases — синхронизированы с gatekeeper_hub.py v2.0
+# Team name aliases — синхронизированы с gatekeeper_hub.py v2.1
 TEAM_ALIASES = {
+    # Premier League
     "manchester united": "manchester united",
     "man united": "manchester united",
     "man utd": "manchester united",
@@ -94,6 +110,84 @@ TEAM_ALIASES = {
     "brighton": "brighton hove albion",
     "leicester city": "leicester city",
     "leicester": "leicester city",
+    "norwich city": "norwich city",
+    "norwich": "norwich city",
+    # La Liga
+    "atletico madrid": "atletico madrid",
+    "atletico": "atletico madrid",
+    "athletico madrid": "atletico madrid",
+    "real betis": "real betis",
+    "betis": "real betis",
+    "rayo vallecano": "rayo vallecano",
+    "real sociedad": "real sociedad",
+    "real sociedad de futbol": "real sociedad",
+    "athletic bilbao": "athletic bilbao",
+    "athletic club": "athletic bilbao",
+    # Serie A
+    "internazionale": "internazionale",
+    "inter milan": "internazionale",
+    "inter": "internazionale",
+    "ac milan": "ac milan",
+    "milan": "ac milan",
+    "hellas verona": "hellas verona",
+    "verona": "hellas verona",
+    # Bundesliga
+    "bayern munich": "bayern munich",
+    "bayern": "bayern munich",
+    "fc bayern": "bayern munich",
+    "borussia dortmund": "borussia dortmund",
+    "dortmund": "borussia dortmund",
+    "bayer leverkusen": "bayer leverkusen",
+    "leverkusen": "bayer leverkusen",
+    "borussia monchengladbach": "borussia monchengladbach",
+    "monchengladbach": "borussia monchengladbach",
+    "vfl wolfsburg": "vfl wolfsburg",
+    "wolfsburg": "vfl wolfsburg",
+    "sc freiburg": "sc freiburg",
+    "freiburg": "sc freiburg",
+    "vfb stuttgart": "vfb stuttgart",
+    "stuttgart": "vfb stuttgart",
+    "1 fc union berlin": "1 fc union berlin",
+    "1. fc union berlin": "1 fc union berlin",
+    "union berlin": "1 fc union berlin",
+    "1 fc koln": "1 fc koln",
+    "1. fc koln": "1 fc koln",
+    "koln": "1 fc koln",
+    "fc augsburg": "fc augsburg",
+    "augsburg": "fc augsburg",
+    "vfl bochum": "vfl bochum",
+    "bochum": "vfl bochum",
+    "sv werder bremen": "sv werder bremen",
+    "werder bremen": "sv werder bremen",
+    "bremen": "sv werder bremen",
+    "tsg hoffenheim": "tsg hoffenheim",
+    "hoffenheim": "tsg hoffenheim",
+    "fc schalke 04": "fc schalke 04",
+    "schalke": "fc schalke 04",
+    "hertha bsc": "hertha bsc",
+    "hertha": "hertha bsc",
+    "hamburger sv": "hamburger sv",
+    "hamburg": "hamburger sv",
+    # Ligue 1
+    "paris saint-germain": "paris saint-germain",
+    "paris saint germain": "paris saint-germain",
+    "psg": "paris saint-germain",
+    "saint-etienne": "saint-etienne",
+    "st etienne": "saint-etienne",
+    # Scottish
+    "st mirren": "st mirren",
+    "st. mirren": "st mirren",
+    "st mirren fc": "st mirren",
+    "celtic": "celtic",
+    "celtic fc": "celtic",
+    "rangers": "rangers",
+    "rangers fc": "rangers",
+    # Other
+    "sporting cp": "sporting cp",
+    "sporting lisbon": "sporting cp",
+    "sporting": "sporting cp",
+    "club brugge": "club brugge",
+    "brugge": "club brugge",
 }
 
 
@@ -111,15 +205,15 @@ def clean_team_name(name):
     return TEAM_ALIASES.get(n, n)
 
 def build_canonical_id(home_team, away_team, date_utc):
-    home_clean = clean_team_name(home_team)
-    away_clean = clean_team_name(away_team)
+    home_clean = clean_team_name(home_team).replace(" ", "_")
+    away_clean = clean_team_name(away_team).replace(" ", "_")
     date_short = date_utc[:10].replace("-", "")
     return f"{home_clean}__{away_clean}__{date_short}"
 
 def parse_date(raw):
     if not raw:
         return None
-    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%Y/%m/%d"):
         try:
             dt = datetime.strptime(raw.strip(), fmt)
             return dt.strftime("%Y-%m-%dT00:00:00Z")
@@ -176,7 +270,7 @@ def build_price(row, h_key, d_key, a_key):
         return {"home": h, "draw": d, "away": a}
     return None
 
-def build_ou25(row, suffix, b365_prefix, p_prefix, max_prefix, avg_prefix):
+def build_ou25(row, b365_prefix, p_prefix, max_prefix, avg_prefix):
     """Build Over/Under 2.5 block."""
     result = {}
     for name, prefix in [("bet365", b365_prefix), ("pinnacle", p_prefix),
@@ -283,8 +377,8 @@ def build_odds_block(row, ts):
     max_closing = build_price(row, "MaxCH", "MaxCD", "MaxCA")
     avg_closing = build_price(row, "AvgCH", "AvgCD", "AvgCA")
 
-    ou25_opening = build_ou25(row, "", "B365", "P", "Max", "Avg")
-    ou25_closing = build_ou25(row, "C", "B365C", "PC", "MaxC", "AvgC")
+    ou25_opening = build_ou25(row, "B365", "P", "Max", "Avg")
+    ou25_closing = build_ou25(row, "B365C", "PC", "MaxC", "AvgC")
 
     ah_opening = build_ah(row, "", "B365", "P", "Max", "Avg")
     ah_closing = build_ah(row, "C", "B365C", "PC", "MaxC", "AvgC")
@@ -413,6 +507,7 @@ def build_payload(row, season, league_code):
         "odds": odds_block,
         "predictions": {},
         "value_analysis": {},
+        "h2h": {},
         "stats": stats,
         "source_map": source_map,
         "flags": flags,
@@ -435,28 +530,42 @@ class FootballDataCollector:
         self.matches_processed = 0
         self.errors = 0
         self.skipped = 0
+        self._meta_entries = {}
 
     def download_csv(self, season, league_code):
-        """Download CSV for a season+league from football-data.co.uk."""
+        """Download CSV for a season+league from football-data.co.uk. 3 попытки."""
         url = f"{BASE_URL}/{season}/{league_code}.csv"
-        req = urllib.request.Request(url, headers={"User-Agent": f"FootballDataCollector/{VERSION}"})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                content = resp.read().decode("utf-8", errors="replace")
-            return content
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                print(f"  [SKIP] {season}/{league_code} — сезон ещё не начался (404)")
+        for attempt in range(3):
+            req = urllib.request.Request(url, headers={"User-Agent": f"FootballDataCollector/{VERSION}"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    content = resp.read().decode("utf-8", errors="replace")
+                return content
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    print(f"  [SKIP] {season}/{league_code} — сезон ещё не начался (404)")
+                    return None
+                if attempt < 2:
+                    wait = 3 * (attempt + 1)
+                    print(f"  [RETRY] HTTP {e.code} for {url}, ждём {wait}s...")
+                    import time as _time
+                    _time.sleep(wait)
+                    continue
+                print(f"  [ERROR] HTTP {e.code} for {url}")
                 return None
-            print(f"  [ERROR] HTTP {e.code} for {url}")
-            return None
-        except (urllib.error.URLError, OSError) as e:
-            print(f"  [ERROR] {e} for {url}")
-            return None
+            except (urllib.error.URLError, OSError) as e:
+                if attempt < 2:
+                    wait = 3 * (attempt + 1)
+                    print(f"  [RETRY] {e} for {url}, ждём {wait}s...")
+                    import time as _time
+                    _time.sleep(wait)
+                    continue
+                print(f"  [ERROR] {e} for {url}")
+                return None
+        return None
 
     def archive_csv(self, season, league_code, content):
-        """Save raw CSV to /tmp for archival (all 22 leagues)."""
-        import os
+        """Save raw CSV to /tmp for archival (all 22 leagues, always — even dry-run)."""
         archive_dir = os.environ.get("ARCHIVE_DIR", "/tmp/football_data_archive")
         os.makedirs(archive_dir, exist_ok=True)
         path = os.path.join(archive_dir, f"{season}_{league_code}.csv")
@@ -473,7 +582,13 @@ class FootballDataCollector:
             if limit and count >= limit:
                 break
 
-            payload = build_payload(row, season, league_code)
+            try:
+                payload = build_payload(row, season, league_code)
+            except Exception as e:
+                self.errors += 1
+                print(f"    [PARSE ERROR] {e}")
+                continue
+
             if payload is None:
                 self.skipped += 1
                 continue
@@ -485,14 +600,15 @@ class FootballDataCollector:
                         payload["date_utc"].replace("Z", "+00:00")
                     )
                     if (now - match_dt).days > history_days:
+                        self.skipped += 1
                         continue
                 except (ValueError, TypeError):
                     pass
 
             key = f"history:match:{payload['canonical_id']}"
 
-            # HSET individual key with data field
-            self.batch.add("HSET", key, "data", json.dumps(payload, ensure_ascii=False))
+            # SET individual key (string, не HSET hash) — match hub get_key
+            self.batch.add("SET", key, json.dumps(payload, ensure_ascii=False))
 
             # ZADD league index
             try:
@@ -505,7 +621,7 @@ class FootballDataCollector:
             self.batch.add("ZADD", f"history:league:{league_code}", str(score),
                             payload["canonical_id"])
 
-            # SADD team indexes
+            # SADD team indexes (.replace(" ", "_") — match hub format)
             home_clean = payload["home_clean"].replace(" ", "_")
             away_clean = payload["away_clean"].replace(" ", "_")
             self.batch.add("SADD", f"history:team:{home_clean}", payload["canonical_id"])
@@ -519,20 +635,29 @@ class FootballDataCollector:
         return count
 
     def save_meta(self, season, league_code, matches, errors):
-        """Save metadata about this run."""
+        """Save metadata about this run (накапливается, пишется через flush_meta)."""
         ts = now_iso()
+        field = f"{season}_{league_code}"
         meta = {
             "season": season,
             "league_code": league_code,
             "matches": matches,
+            "stored_matches": matches,
             "errors": errors,
+            "error_count": errors,
             "last_run": ts,
+            "last_run_at": ts,
             "version": VERSION,
             "schema_version": SCHEMA_VERSION,
         }
+        self._meta_entries[field] = meta
+
+    def flush_meta(self):
+        """Write all accumulated meta as single SET (string key)."""
+        if not self._meta_entries:
+            return
         key = "football_data:meta"
-        field = f"{season}_{league_code}"
-        self.batch.add("HSET", key, field, json.dumps(meta, ensure_ascii=False))
+        self.batch.add("SET", key, json.dumps(self._meta_entries, ensure_ascii=False))
         self.batch.flush()
 
 
@@ -600,9 +725,8 @@ def main():
                 total_errors += 1
                 continue
 
-            # Archive
-            if not args.dry_run:
-                collector.archive_csv(season, league_code, csv_content)
+            # Archive (always, even in dry-run — полезно для отладки)
+            collector.archive_csv(season, league_code, csv_content)
 
             # Process
             matches = collector.process_csv(
@@ -612,9 +736,11 @@ def main():
             total_matches += matches
             print(f"    Matches: {matches}")
 
-            # Save meta
-            if not args.dry_run:
-                collector.save_meta(season, league_code, matches, 0)
+            # Save meta (накапливается)
+            collector.save_meta(season, league_code, matches, collector.errors)
+
+    # Flush accumulated meta
+    collector.flush_meta()
 
     # Final flush
     batch.flush()
@@ -622,13 +748,14 @@ def main():
     print(f"\n=== DONE ===")
     print(f"  Total matches: {total_matches}")
     print(f"  Total errors: {total_errors}")
-    print(f"  Skipped (invalid): {collector.skipped}")
+    print(f"  Collector errors: {collector.errors}")
+    print(f"  Skipped (invalid/old): {collector.skipped}")
     print(f"  Pipeline batches: {batch.total_batches}")
     print(f"  Pipeline commands: {batch.total_sent}")
     if args.dry_run:
         print(f"  (dry-run: nothing written to Redis)")
 
-    return 0 if total_errors == 0 else 1
+    return 0 if total_errors == 0 and collector.errors == 0 else 1
 
 
 if __name__ == "__main__":
