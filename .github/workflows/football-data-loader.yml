@@ -1,12 +1,12 @@
-name: Football Data Loader v6.2
+name: Football Data Loader v6.3
 
 on:
   workflow_dispatch:
     inputs:
       seasons:
-        description: 'Сезоны через запятую (пусто = авто)'
+        description: 'Сезоны через запятую (пусто = авто по текущей дате)'
         required: false
-        default: '2526'
+        default: ''
       leagues:
         description: 'Лиги через запятую (пусто = все 22)'
         required: false
@@ -19,6 +19,11 @@ on:
         description: 'Лимит матчей на лигу (0 = все)'
         required: false
         default: '0'
+      dry_run:
+        description: 'Dry-run (без записи в Redis)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   load:
@@ -30,6 +35,7 @@ jobs:
       LEAGUES_INPUT: ${{ github.event.inputs.leagues }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days }}
       LIMIT_INPUT: ${{ github.event.inputs.limit }}
+      DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
 
@@ -41,158 +47,264 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
 
-      - name: Install dependencies
-        run: pip install requests
-
-      - name: Run Football Data Collector v6.2
+      - name: Run Football Data Collector v6.3
         env:
           PYTHONUNBUFFERED: "1"
         run: |
+          DRY_FLAG=""
+          if [ "${DRY_RUN_INPUT}" = "true" ]; then
+            DRY_FLAG="--dry-run"
+          fi
           python -u football_data_to_redis.py \
             --seasons "${SEASONS_INPUT}" \
             --leagues "${LEAGUES_INPUT}" \
             --history-days ${HISTORY_DAYS_INPUT} \
-            --limit ${LIMIT_INPUT}
+            --limit ${LIMIT_INPUT} \
+            ${DRY_FLAG}
 
       - name: Verify Redis data
+        if: success()
         env:
           PYTHONUNBUFFERED: "1"
+        timeout-minutes: 10
         run: |
           python -c "
-          import os, json, urllib.request
-          URL = os.environ['UPSTASH_REDIS_REST_URL']
-          TOKEN = os.environ['UPSTASH_REDIS_REST_TOKEN']
-          LIMIT = '${LIMIT_INPUT}'
+          import os, json, urllib.request, sys
+          from datetime import datetime, timezone
+
+          URL = os.environ.get('UPSTASH_REDIS_REST_URL', '').rstrip('/')
+          TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
+          LIMIT = os.environ.get('LIMIT_INPUT', '0')
+
+          if not URL or not TOKEN:
+              print('ERROR: Redis credentials not configured')
+              sys.exit(1)
 
           def cmd(*args):
-              req = urllib.request.Request(URL, data=json.dumps(list(args)).encode(),
-                  headers={'Authorization': f'Bearer {TOKEN}', 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.loads(r.read()).get('result')
+              try:
+                  req = urllib.request.Request(
+                      URL,
+                      data=json.dumps(list(args)).encode(),
+                      headers={'Authorization': f'Bearer {TOKEN}',
+                               'Content-Type': 'application/json'}
+                  )
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return json.loads(r.read()).get('result')
+              except Exception as e:
+                  print(f'  [CMD ERROR] {args[0]} {args[1] if len(args)>1 else \"\"}: {e}')
+                  return None
 
-          print('=== Redis Verify (v6.2) ===')
+          print('=== Redis Verify (v6.3) ===')
           dbsize = cmd('DBSIZE')
           print(f'DBSIZE: {dbsize}')
-          leagues = '${LEAGUES_INPUT}'.split(',') if '${LEAGUES_INPUT}' else []
+          if dbsize is None:
+              print('FATAL: Redis unavailable')
+              sys.exit(1)
+
+          leagues_raw = os.environ.get('LEAGUES_INPUT', '')
+          leagues = leagues_raw.split(',') if leagues_raw else []
           if not leagues:
-              leagues = ['E0','E1','E2','E3','EC','SC0','SC1','SC2','SC3','D1','D2','I1','I2','SP1','SP2','F1','F2','N1','B1','P1','T1','G1']
-          seasons = '${SEASONS_INPUT}'.split(',') if '${SEASONS_INPUT}' else []
+              leagues = ['E0','E1','E2','E3','EC','SC0','SC1','SC2','SC3',
+                         'D1','D2','I1','I2','SP1','SP2','F1','F2',
+                         'N1','B1','P1','T1','G1']
+
+          seasons_raw = os.environ.get('SEASONS_INPUT', '')
+          seasons = seasons_raw.split(',') if seasons_raw else []
           if not seasons:
-              from datetime import datetime, timezone
               now = datetime.now(timezone.utc)
               seasons = [f'{now.year % 100:02d}{(now.year + 1) % 100:02d}']
 
+          print(f'Seasons: {seasons}')
+          print(f'Leagues: {len(leagues)}')
+
+          # --- ZCARD per league ---
           total = 0
           for lg in leagues:
               cnt = cmd('ZCARD', f'history:league:{lg}')
-              if cnt and cnt > 0:
+              if cnt and int(cnt) > 0:
                   print(f'  history:league:{lg}: {cnt} matches')
-                  total += cnt
+                  total += int(cnt)
           print(f'Total matches across leagues: {total}')
 
-          for s in seasons:
-              for lg in leagues:
-                  meta = cmd('HGET', 'football_data:meta', f'{s}_{lg}')
-                  if meta:
-                      m = json.loads(meta)
-                      print(f'  meta {s}_{lg}: matches={m.get(\"matches\")}, errors={m.get(\"errors\")}')
+          # --- football_data:meta (GET, не HGET) ---
+          meta_raw = cmd('GET', 'football_data:meta')
+          if meta_raw:
+              try:
+                  meta_all = json.loads(meta_raw)
+                  for field, m in meta_all.items():
+                      if isinstance(m, dict):
+                          print(f'  meta {field}: stored={m.get(\"stored_matches\", m.get(\"matches\"))}, '
+                                f'errors={m.get(\"error_count\", m.get(\"errors\"))}, '
+                                f'last={str(m.get(\"last_run_at\", m.get(\"last_run\", \"\")))[:19]}')
+              except (json.JSONDecodeError, TypeError) as e:
+                  print(f'  meta: parse error: {e}')
+          else:
+              print('  meta: not found (SET football_data:meta)')
 
-          first = cmd('ZRANGE', 'history:league:E0', 0, 0) if 'E0' in leagues else None
-          if first:
-              data = cmd('HGET', f'history:match:{first[0]}', 'data')
+          # --- First match details (GET, не HGET) ---
+          first = None
+          if 'E0' in leagues:
+              first = cmd('ZRANGE', 'history:league:E0', 0, 0)
+          elif leagues:
+              first = cmd('ZRANGE', f'history:league:{leagues[0]}', 0, 0)
+
+          if first and isinstance(first, list) and first:
+              cid = first[0]
+              data = cmd('GET', f'history:match:{cid}')
               if data:
-                  m = json.loads(data)
-                  print(f'First match: {m[\"home_team\"]} vs {m[\"away_team\"]}')
-                  print(f'  Score: {m[\"score\"]}')
-                  print(f'  Date UTC: {m.get(\"date_utc\")}')
-                  print(f'  Time UTC: {m.get(\"time_utc\")}')
-                  print(f'  Schema version: {m.get(\"schema_version\")}')
-                  print(f'  Total payload fields: {len(m)}')
-                  print()
-                  print('--- Odds 1x2 ---')
-                  odds = m.get('odds', {}).get('1x2', {})
-                  print(f'  Current (Pinnacle closing): {odds.get(\"current\")}')
-                  print(f'  Best (Max closing): {odds.get(\"best\")}')
-                  print(f'  Opening (Pinnacle): {odds.get(\"opening\")}')
-                  bk_open = odds.get('bookmakers_opening', {})
-                  bk_close = odds.get('bookmakers_closing', {})
-                  print(f'  Bookmakers opening: {len(bk_open)} -> {list(bk_open.keys())}')
-                  print(f'  Bookmakers closing: {len(bk_close)} -> {list(bk_close.keys())}')
-                  sources = odds.get('sources', [])
-                  print(f'  Sources entries: {len(sources)}')
-                  for s in sources:
-                      print(f'    {s.get(\"upstream\")} ({s.get(\"type\")}): {s.get(\"price\")}')
-                  print()
-                  print('--- Over/Under 2.5 ---')
-                  ou = m.get('odds', {}).get('over_under_25', {})
-                  ou_open = ou.get('opening', {})
-                  ou_close = ou.get('closing', {})
-                  print(f'  Opening: {len(ou_open)} -> {list(ou_open.keys())}')
-                  print(f'  Closing: {len(ou_close)} -> {list(ou_close.keys())}')
-                  if ou_close:
-                      ps = ou_close.get('pinnacle', {})
-                      print(f'  Pinnacle closing: over={ps.get(\"over\")}, under={ps.get(\"under\")}')
-                  print()
-                  print('--- Asian Handicap ---')
-                  ah = m.get('odds', {}).get('asian_handicap', {})
-                  ah_open = ah.get('opening', {})
-                  ah_close = ah.get('closing', {})
-                  print(f'  Opening: {len(ah_open)} -> {list(ah_open.keys())}')
-                  print(f'  Closing: {len(ah_close)} -> {list(ah_close.keys())}')
-                  if ah_close:
-                      ps = ah_close.get('pinnacle', {})
-                      print(f'  Pinnacle closing AH: {ps}')
-                  print()
-                  print('--- Stats ---')
-                  stats = m.get('stats', {})
-                  print(f'  Fields: {len(stats)}')
-                  print(f'  _source: {stats.get(\"_source\")}')
-                  print()
-                  print('--- Source Map v6.2 ---')
-                  sm = m.get('source_map', {})
-                  print(f'  Sharp benchmark: {sm.get(\"sharp_benchmark\")}')
-                  print(f'  Soft bookmakers: {sm.get(\"soft_bookmakers\")}')
-                  print(f'  Types: {sm.get(\"types\")}')
-                  print(f'  Odds upstream: {sm.get(\"odds\",{}).get(\"upstream\")}')
-                  print()
-                  print('--- value_analysis ---')
-                  print(f'  value_analysis present: {\"value_analysis\" in m}')
-                  print()
-                  print('--- csv_raw ---')
-                  raw = m.get('csv_raw', {})
-                  print(f'  csv_raw columns: {len(raw)}')
-                  if raw:
-                      print(f'  Has PSC H/D/A: {\"PSCH\" in raw}, {\"PSCD\" in raw}, {\"PSCA\" in raw}')
-                      print(f'  Has MaxC H/D/A: {\"MaxCH\" in raw}, {\"MaxCD\" in raw}, {\"MaxCA\" in raw}')
-                      print(f'  Has B365C H/D/A: {\"B365CH\" in raw}, {\"B365CD\" in raw}, {\"B365CA\" in raw}')
-                      print(f'  Has BFC H/D/A: {\"BFCH\" in raw}, {\"BFCD\" in raw}, {\"BFCA\" in raw}')
-                      print(f'  Has AHh: {\"AHh\" in raw}')
-                      print(f'  Has AHCh: {\"AHCh\" in raw}')
-                      print(f'  Has Time: {\"Time\" in raw}')
-                  if LIMIT == '1':
+                  try:
+                      m = json.loads(data)
+                  except (json.JSONDecodeError, TypeError) as e:
+                      print(f'  First match: parse error: {e}')
+                      m = None
+
+                  if m:
+                      print(f'First match: {m.get(\"home_team\")} vs {m.get(\"away_team\")}')
+                      print(f'  CID: {cid}')
+                      print(f'  home_clean: {m.get(\"home_clean\")}')
+                      print(f'  away_clean: {m.get(\"away_clean\")}')
+                      print(f'  Score: {m.get(\"score\")}')
+                      print(f'  Date UTC: {m.get(\"date_utc\")}')
+                      print(f'  Time UTC: {m.get(\"time_utc\", \"(none)\")}')
+                      print(f'  Schema version: {m.get(\"schema_version\")}')
+                      print(f'  Season: {m.get(\"season\")}')
+                      print(f'  League code: {m.get(\"league_code\")}')
+                      print(f'  h2h present: {\"h2h\" in m}')
+                      print(f'  Total payload fields: {len(m)}')
                       print()
-                      print('=' * 60)
-                      print('--- FULL PAYLOAD DUMP (limit=1) ---')
-                      print('=' * 60)
-                      full = json.dumps(m, indent=2, ensure_ascii=False)
-                      chunk = 4000
-                      for i in range(0, len(full), chunk):
-                          print(full[i:i+chunk])
+
+                      print('--- Odds 1x2 ---')
+                      odds = m.get('odds', {}).get('1x2', {})
+                      print(f'  Current (Pinnacle closing): {odds.get(\"current\")}')
+                      print(f'  Best (Max closing): {odds.get(\"best\")}')
+                      print(f'  Opening (Pinnacle): {odds.get(\"opening\")}')
+                      bk_open = odds.get('bookmakers_opening', {})
+                      bk_close = odds.get('bookmakers_closing', {})
+                      print(f'  Bookmakers opening: {len(bk_open)} -> {list(bk_open.keys())}')
+                      print(f'  Bookmakers closing: {len(bk_close)} -> {list(bk_close.keys())}')
+                      sources = odds.get('sources', [])
+                      print(f'  Sources entries: {len(sources)}')
+                      for s in sources:
+                          print(f'    {s.get(\"upstream\")} ({s.get(\"type\")}): {s.get(\"price\")}')
                       print()
-                      print(f'--- END DUMP ({len(full)} chars, {len(m)} fields) ---')
+
+                      print('--- Over/Under 2.5 ---')
+                      ou = m.get('odds', {}).get('over_under_25', {})
+                      ou_open = ou.get('opening', {})
+                      ou_close = ou.get('closing', {})
+                      print(f'  Opening: {len(ou_open)} -> {list(ou_open.keys())}')
+                      print(f'  Closing: {len(ou_close)} -> {list(ou_close.keys())}')
+                      if ou_close:
+                          ps = ou_close.get('pinnacle', {})
+                          print(f'  Pinnacle closing: over={ps.get(\"over\")}, under={ps.get(\"under\")}')
+                      print()
+
+                      print('--- Asian Handicap ---')
+                      ah = m.get('odds', {}).get('asian_handicap', {})
+                      ah_open = ah.get('opening', {})
+                      ah_close = ah.get('closing', {})
+                      print(f'  Opening: {len(ah_open)} -> {list(ah_open.keys())}')
+                      print(f'  Closing: {len(ah_close)} -> {list(ah_close.keys())}')
+                      if ah_close:
+                          ps = ah_close.get('pinnacle', {})
+                          print(f'  Pinnacle closing AH: {ps}')
+                      print()
+
+                      print('--- Stats ---')
+                      stats = m.get('stats', {})
+                      print(f'  Fields: {len(stats)}')
+                      print(f'  _source: {stats.get(\"_source\")}')
+                      print()
+
+                      print('--- Source Map ---')
+                      sm = m.get('source_map', {})
+                      print(f'  Sharp benchmark: {sm.get(\"sharp_benchmark\")}')
+                      print(f'  Soft bookmakers: {sm.get(\"soft_bookmakers\")}')
+                      print(f'  Types: {sm.get(\"types\")}')
+                      print(f'  Odds upstream: {sm.get(\"odds\",{}).get(\"upstream\")}')
+                      print()
+
+                      print('--- value_analysis ---')
+                      print(f'  value_analysis present: {\"value_analysis\" in m}')
+                      print()
+
+                      print('--- csv_raw ---')
+                      raw = m.get('csv_raw', {})
+                      print(f'  csv_raw columns: {len(raw)}')
+                      if raw:
+                          print(f'  Has PSC H/D/A: {\"PSCH\" in raw}, {\"PSCD\" in raw}, {\"PSCA\" in raw}')
+                          print(f'  Has MaxC H/D/A: {\"MaxCH\" in raw}, {\"MaxCD\" in raw}, {\"MaxCA\" in raw}')
+                          print(f'  Has B365C H/D/A: {\"B365CH\" in raw}, {\"B365CD\" in raw}, {\"B365CA\" in raw}')
+                          print(f'  Has AHh: {\"AHh\" in raw}')
+                          print(f'  Has AHCh: {\"AHCh\" in raw}')
+                          print(f'  Has Time: {\"Time\" in raw}')
+
+                      if LIMIT == '1':
+                          print()
+                          print('=' * 60)
+                          print('--- FULL PAYLOAD DUMP (limit=1) ---')
+                          print('=' * 60)
+                          full = json.dumps(m, indent=2, ensure_ascii=False)
+                          chunk = 4000
+                          for i in range(0, len(full), chunk):
+                              print(full[i:i+chunk])
+                          print()
+                          print(f'--- END DUMP ({len(full)} chars, {len(m)} fields) ---')
+              else:
+                  print(f'  First match: GET history:match:{cid} returned nil')
+                  print('  WARNING: Data not written or transport mismatch (expected SET, got HSET?)')
           elif total == 0:
               print('WARNING: NO MATCHES FOUND — data not written to Redis')
+
+          # --- Team SET check ---
+          print()
+          print('--- Team SET indexes ---')
+          if first and isinstance(first, list) and first and m:
+              home_clean = m.get('home_clean', '')
+              away_clean = m.get('away_clean', '')
+              for team_name in [home_clean, away_clean]:
+                  if team_name:
+                      members = cmd('SMEMBERS', f'history:team:{team_name}')
+                      cnt = len(members) if members else 0
+                      print(f'  history:team:{team_name}: {cnt} members')
+                      if cnt == 0:
+                          print(f'    WARNING: team SET empty — key format mismatch?')
+
+          # --- Canonical ID format check ---
+          print()
+          print('--- Canonical ID format ---')
+          if first and isinstance(first, list) and first:
+              cid_check = first[0]
+              has_spaces = ' ' in cid_check
+              has_underscores = '__' in cid_check
+              print(f'  CID: {cid_check}')
+              print(f'  Has spaces: {has_spaces} (should be False)')
+              print(f'  Has __ separator: {has_underscores} (should be True)')
+              if has_spaces:
+                  print(f'  ERROR: CID contains spaces — football_data build_canonical_id missing .replace(\" \", \"_\")')
+              if not has_underscores:
+                  print(f'  ERROR: CID missing __ separator')
+
           print()
           print('=== Verify Done ===')
           "
 
       - name: Summary
         if: always()
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          echo "=== Football Data Loader v6.2 Summary ==="
-          echo "Seasons: ${SEASONS_INPUT}"
-          echo "Leagues: ${LEAGUES_INPUT}"
+          echo "=== Football Data Loader v6.3 Summary ==="
+          echo "Seasons: ${SEASONS_INPUT:-auto}"
+          echo "Leagues: ${LEAGUES_INPUT:-all 22}"
           echo "History days: ${HISTORY_DAYS_INPUT}"
           echo "Limit: ${LIMIT_INPUT}"
+          echo "Dry run: ${DRY_RUN_INPUT}"
+          echo ""
+          if [ -n "${{ github.run_id }}" ]; then
+            echo "Run ID: ${{ github.run_id }}"
+            echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
           
