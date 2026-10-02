@@ -1,4 +1,4 @@
-name: Football Data Loader
+name: Football Data Loader v6.2
 
 on:
   workflow_dispatch:
@@ -45,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Football Data Collector v6.1
+      - name: Run Football Data Collector v6.2
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -64,12 +64,14 @@ jobs:
           URL = os.environ['UPSTASH_REDIS_REST_URL']
           TOKEN = os.environ['UPSTASH_REDIS_REST_TOKEN']
           LIMIT = '${LIMIT_INPUT}'
+
           def cmd(*args):
               req = urllib.request.Request(URL, data=json.dumps(list(args)).encode(),
                   headers={'Authorization': f'Bearer {TOKEN}', 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(req, timeout=10) as r:
+              with urllib.request.urlopen(req, timeout=30) as r:
                   return json.loads(r.read()).get('result')
-          print('=== Redis Verify (v6.1) ===')
+
+          print('=== Redis Verify (v6.2) ===')
           dbsize = cmd('DBSIZE')
           print(f'DBSIZE: {dbsize}')
           leagues = '${LEAGUES_INPUT}'.split(',') if '${LEAGUES_INPUT}' else []
@@ -80,6 +82,7 @@ jobs:
               from datetime import datetime, timezone
               now = datetime.now(timezone.utc)
               seasons = [f'{now.year % 100:02d}{(now.year + 1) % 100:02d}']
+
           total = 0
           for lg in leagues:
               cnt = cmd('ZCARD', f'history:league:{lg}')
@@ -87,29 +90,31 @@ jobs:
                   print(f'  history:league:{lg}: {cnt} matches')
                   total += cnt
           print(f'Total matches across leagues: {total}')
+
           for s in seasons:
               for lg in leagues:
                   meta = cmd('HGET', 'football_data:meta', f'{s}_{lg}')
                   if meta:
                       m = json.loads(meta)
-                      print(f'  meta {s}_{lg}: matches={m.get("matches")}, errors={m.get("errors")}')
+                      print(f'  meta {s}_{lg}: matches={m.get(\"matches\")}, errors={m.get(\"errors\")}')
+
           first = cmd('ZRANGE', 'history:league:E0', 0, 0) if 'E0' in leagues else None
           if first:
               data = cmd('HGET', f'history:match:{first[0]}', 'data')
               if data:
                   m = json.loads(data)
-                  print(f'First match: {m["home_team"]} vs {m["away_team"]}')
-                  print(f'  Score: {m["score"]}')
-                  print(f'  Date UTC: {m.get("date_utc")}')
-                  print(f'  Time UTC: {m.get("time_utc")}')
-                  print(f'  Schema version: {m.get("schema_version")}')
+                  print(f'First match: {m[\"home_team\"]} vs {m[\"away_team\"]}')
+                  print(f'  Score: {m[\"score\"]}')
+                  print(f'  Date UTC: {m.get(\"date_utc\")}')
+                  print(f'  Time UTC: {m.get(\"time_utc\")}')
+                  print(f'  Schema version: {m.get(\"schema_version\")}')
                   print(f'  Total payload fields: {len(m)}')
                   print()
                   print('--- Odds 1x2 ---')
                   odds = m.get('odds', {}).get('1x2', {})
-                  print(f'  Current (Pinnacle closing): {odds.get("current")}')
-                  print(f'  Best (Max closing): {odds.get("best")}')
-                  print(f'  Opening (Pinnacle): {odds.get("opening")}')
+                  print(f'  Current (Pinnacle closing): {odds.get(\"current\")}')
+                  print(f'  Best (Max closing): {odds.get(\"best\")}')
+                  print(f'  Opening (Pinnacle): {odds.get(\"opening\")}')
                   bk_open = odds.get('bookmakers_opening', {})
                   bk_close = odds.get('bookmakers_closing', {})
                   print(f'  Bookmakers opening: {len(bk_open)} -> {list(bk_open.keys())}')
@@ -117,24 +122,24 @@ jobs:
                   sources = odds.get('sources', [])
                   print(f'  Sources entries: {len(sources)}')
                   for s in sources:
-                      print(f'    upstream={s.get("upstream")} type={s.get("type")}: {s.get("price")}')
+                      print(f'    {s.get(\"upstream\")} ({s.get(\"type\")}): {s.get(\"price\")}')
                   print()
                   print('--- Over/Under 2.5 ---')
                   ou = m.get('odds', {}).get('over_under_25', {})
                   ou_open = ou.get('opening', {})
                   ou_close = ou.get('closing', {})
-                  print(f'  Opening sources: {len(ou_open)} -> {list(ou_open.keys())}')
-                  print(f'  Closing sources: {len(ou_close)} -> {list(ou_close.keys())}')
+                  print(f'  Opening: {len(ou_open)} -> {list(ou_open.keys())}')
+                  print(f'  Closing: {len(ou_close)} -> {list(ou_close.keys())}')
                   if ou_close:
                       ps = ou_close.get('pinnacle', {})
-                      print(f'  Pinnacle closing: over={ps.get("over")}, under={ps.get("under")}')
+                      print(f'  Pinnacle closing: over={ps.get(\"over\")}, under={ps.get(\"under\")}')
                   print()
                   print('--- Asian Handicap ---')
                   ah = m.get('odds', {}).get('asian_handicap', {})
                   ah_open = ah.get('opening', {})
                   ah_close = ah.get('closing', {})
-                  print(f'  Opening sources: {len(ah_open)} -> {list(ah_open.keys())}')
-                  print(f'  Closing sources: {len(ah_close)} -> {list(ah_close.keys())}')
+                  print(f'  Opening: {len(ah_open)} -> {list(ah_open.keys())}')
+                  print(f'  Closing: {len(ah_close)} -> {list(ah_close.keys())}')
                   if ah_close:
                       ps = ah_close.get('pinnacle', {})
                       print(f'  Pinnacle closing AH: {ps}')
@@ -142,32 +147,29 @@ jobs:
                   print('--- Stats ---')
                   stats = m.get('stats', {})
                   print(f'  Fields: {len(stats)}')
-                  print(f'  _source: {stats.get("_source")}')
-                  print(f'  _updated_at: {stats.get("_updated_at")}')
+                  print(f'  _source: {stats.get(\"_source\")}')
                   print()
-                  print('--- Source Map ---')
+                  print('--- Source Map v6.2 ---')
                   sm = m.get('source_map', {})
-                  print(f'  Odds independent: {sm.get("odds",{}).get("independent")}')
-                  print(f'  Odds timestamp: {sm.get("odds",{}).get("timestamp")}')
-                  print(f'  Sharp benchmark: {sm.get("odds",{}).get("sharp_benchmark")}')
-                  print(f'  Soft bookmakers: {sm.get("odds",{}).get("soft_bookmakers")}')
-                  print(f'  Types: {sm.get("odds",{}).get("types")}')
+                  print(f'  Sharp benchmark: {sm.get(\"sharp_benchmark\")}')
+                  print(f'  Soft bookmakers: {sm.get(\"soft_bookmakers\")}')
+                  print(f'  Types: {sm.get(\"types\")}')
+                  print(f'  Odds upstream: {sm.get(\"odds\",{}).get(\"upstream\")}')
                   print()
-                  print('--- Value Analysis ---')
-                  va = m.get('value_analysis', {})
-                  print(f'  value_analysis present: {bool(va)} ({type(va).__name__})')
+                  print('--- value_analysis ---')
+                  print(f'  value_analysis present: {\"value_analysis\" in m}')
                   print()
                   print('--- csv_raw ---')
                   raw = m.get('csv_raw', {})
                   print(f'  csv_raw columns: {len(raw)}')
                   if raw:
-                      print(f'  Has PSC H/D/A: {"PSCH" in raw}, {"PSCD" in raw}, {"PSCA" in raw}')
-                      print(f'  Has MaxC H/D/A: {"MaxCH" in raw}, {"MaxCD" in raw}, {"MaxCA" in raw}')
-                      print(f'  Has B365C H/D/A: {"B365CH" in raw}, {"B365CD" in raw}, {"B365CA" in raw}')
-                      print(f'  Has BFC H/D/A: {"BFCH" in raw}, {"BFCD" in raw}, {"BFCA" in raw}')
-                      print(f'  Has AHh: {"AHh" in raw}')
-                      print(f'  Has Time: {"Time" in raw}')
-                  # FULL DUMP at limit=1
+                      print(f'  Has PSC H/D/A: {\"PSCH\" in raw}, {\"PSCD\" in raw}, {\"PSCA\" in raw}')
+                      print(f'  Has MaxC H/D/A: {\"MaxCH\" in raw}, {\"MaxCD\" in raw}, {\"MaxCA\" in raw}')
+                      print(f'  Has B365C H/D/A: {\"B365CH\" in raw}, {\"B365CD\" in raw}, {\"B365CA\" in raw}')
+                      print(f'  Has BFC H/D/A: {\"BFCH\" in raw}, {\"BFCD\" in raw}, {\"BFCA\" in raw}')
+                      print(f'  Has AHh: {\"AHh\" in raw}')
+                      print(f'  Has AHCh: {\"AHCh\" in raw}')
+                      print(f'  Has Time: {\"Time\" in raw}')
                   if LIMIT == '1':
                       print()
                       print('=' * 60)
@@ -188,7 +190,7 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "=== Football Data Loader v6.1 Summary ==="
+          echo "=== Football Data Loader v6.2 Summary ==="
           echo "Seasons: ${SEASONS_INPUT}"
           echo "Leagues: ${LEAGUES_INPUT}"
           echo "History days: ${HISTORY_DAYS_INPUT}"
