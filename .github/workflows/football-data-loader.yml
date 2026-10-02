@@ -49,6 +49,57 @@ jobs:
             --leagues "${LEAGUES_INPUT}" \
             --history-days ${HISTORY_DAYS_INPUT}
 
+      - name: Verify Redis data
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -c "
+          import os, json, urllib.request
+          URL = os.environ['UPSTASH_REDIS_REST_URL']
+          TOKEN = os.environ['UPSTASH_REDIS_REST_TOKEN']
+          def cmd(*args):
+              req = urllib.request.Request(URL, data=json.dumps(list(args)).encode(),
+                  headers={'Authorization': f'Bearer {TOKEN}', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  return json.loads(r.read()).get('result')
+          print('=== Redis Verify ===')
+          dbsize = cmd('DBSIZE')
+          print(f'DBSIZE: {dbsize}')
+          leagues = '${LEAGUES_INPUT}'.split(',') if '${LEAGUES_INPUT}' else []
+          if not leagues:
+              leagues = ['E0','E1','E2','E3','EC','SC0','SC1','SC2','SC3','D1','D2','I1','I2','SP1','SP2','F1','F2','N1','B1','P1','T1','G1']
+          seasons = '${SEASONS_INPUT}'.split(',') if '${SEASONS_INPUT}' else []
+          if not seasons:
+              from datetime import datetime, timezone
+              now = datetime.now(timezone.utc)
+              seasons = [f'{now.year % 100:02d}{(now.year + 1) % 100:02d}']
+          total = 0
+          for lg in leagues:
+              cnt = cmd('ZCARD', f'history:league:{lg}')
+              if cnt and cnt > 0:
+                  print(f'  history:league:{lg}: {cnt} matches')
+                  total += cnt
+          print(f'Total matches across leagues: {total}')
+          for s in seasons:
+              for lg in leagues:
+                  meta = cmd('HGET', 'football_data:meta', f'{s}_{lg}')
+                  if meta:
+                      m = json.loads(meta)
+                      print(f'  meta {s}_{lg}: matches={m.get(\"matches\")}, errors={m.get(\"errors\")}')
+          first = cmd('ZRANGE', 'history:league:E0', 0, 0) if 'E0' in leagues else None
+          if first:
+              data = cmd('HGET', f'history:match:{first[0]}', 'data')
+              if data:
+                  m = json.loads(data)
+                  print(f'First match: {m[\"home_team\"]} vs {m[\"away_team\"]}')
+                  print(f'  Score: {m[\"score\"]}')
+                  print(f'  Best odds: {m.get(\"odds\",{}).get(\"1x2\",{}).get(\"best\")}')
+                  print(f'  Half-time result: {m.get(\"half_time_result\")}')
+          elif total == 0:
+              print('WARNING: NO MATCHES FOUND — data not written to Redis')
+          print('=== Verify Done ===')
+          "
+
       - name: Summary
         if: always()
         run: |
