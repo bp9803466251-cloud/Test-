@@ -15,6 +15,10 @@ on:
         description: 'Окно истории в днях (0 = весь CSV)'
         required: false
         default: '0'
+      limit:
+        description: 'Лимит матчей на лигу (0 = все)'
+        required: false
+        default: '0'
 
 jobs:
   load:
@@ -25,6 +29,7 @@ jobs:
       SEASONS_INPUT: ${{ github.event.inputs.seasons }}
       LEAGUES_INPUT: ${{ github.event.inputs.leagues }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days }}
+      LIMIT_INPUT: ${{ github.event.inputs.limit }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
 
@@ -47,7 +52,8 @@ jobs:
           python -u football_data_to_redis.py \
             --seasons "${SEASONS_INPUT}" \
             --leagues "${LEAGUES_INPUT}" \
-            --history-days ${HISTORY_DAYS_INPUT}
+            --history-days ${HISTORY_DAYS_INPUT} \
+            --limit ${LIMIT_INPUT}
 
       - name: Verify Redis data
         env:
@@ -57,6 +63,7 @@ jobs:
           import os, json, urllib.request
           URL = os.environ['UPSTASH_REDIS_REST_URL']
           TOKEN = os.environ['UPSTASH_REDIS_REST_TOKEN']
+          LIMIT = '${LIMIT_INPUT}'
           def cmd(*args):
               req = urllib.request.Request(URL, data=json.dumps(list(args)).encode(),
                   headers={'Authorization': f'Bearer {TOKEN}', 'Content-Type': 'application/json'})
@@ -160,6 +167,19 @@ jobs:
                       print(f'  Has B365C H/D/A: {\"B365CH\" in raw}, {\"B365CD\" in raw}, {\"B365CA\" in raw}')
                       print(f'  Has AHh: {\"AHh\" in raw}')
                       print(f'  Has Time: {\"Time\" in raw}')
+                  # FULL DUMP при limit=1
+                  if LIMIT == '1':
+                      print()
+                      print('=' * 60)
+                      print('--- FULL PAYLOAD DUMP (limit=1) ---')
+                      print('=' * 60)
+                      full = json.dumps(m, indent=2, ensure_ascii=False)
+                      # Разбиваем на части по 4000 символов (лимит GitHub Actions)
+                      chunk = 4000
+                      for i in range(0, len(full), chunk):
+                          print(full[i:i+chunk])
+                      print()
+                      print(f'--- END DUMP ({len(full)} chars, {len(m)} fields) ---')
           elif total == 0:
               print('WARNING: NO MATCHES FOUND — data not written to Redis')
           print()
@@ -173,4 +193,5 @@ jobs:
           echo "Seasons: ${SEASONS_INPUT}"
           echo "Leagues: ${LEAGUES_INPUT}"
           echo "History days: ${HISTORY_DAYS_INPUT}"
+          echo "Limit: ${LIMIT_INPUT}"
           
