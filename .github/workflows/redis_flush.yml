@@ -1,16 +1,36 @@
-name: Redis Flush v2.0
+name: Redis Flush v2.1
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Режим: history-only, soft, hard, purge'
+        description: 'Режим: history-only, soft, hard, purge, reset-breaker'
         required: true
-        default: 'history-only'
+        type: choice
+        options:
+          - history-only
+          - soft
+          - hard
+          - purge
+          - reset-breaker
+        default: history-only
       confirm:
-        description: 'Подтверждение (yes)'
+        description: 'Подтверждение'
         required: true
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
         default: 'no'
+      dry_run_only:
+        description: 'Только превью (без выполнения)'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: redis-flush
+  cancel-in-progress: false
 
 jobs:
   flush:
@@ -29,6 +49,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
 
       - name: Validate confirm
         run: |
@@ -39,23 +60,57 @@ jobs:
           echo "Confirm: OK"
 
       - name: Dry run (show plan)
+        if: success()
         env:
           PYTHONUNBUFFERED: "1"
+        timeout-minutes: 15
         run: |
           MODE="${{ github.event.inputs.mode }}"
-          echo "=== Redis Flush v2.0 — Dry Run ==="
+          echo "=== Redis Flush v2.1 — Dry Run ==="
           echo "Mode: $MODE"
-          python redis_diagnostics.py --dry-run --history-only --yes || true
-          python redis_diagnostics.py --json || true
+          echo ""
+
+          case "$MODE" in
+            history-only)
+              python redis_diagnostics.py --dry-run --history-only --yes
+              ;;
+            soft)
+              python redis_diagnostics.py --dry-run --flush --yes
+              ;;
+            hard)
+              python redis_diagnostics.py --dry-run --flush --hard --yes
+              ;;
+            purge)
+              python redis_diagnostics.py --dry-run --purge --yes
+              ;;
+            reset-breaker)
+              echo "Reset breaker — dry run not applicable"
+              echo "Will execute: --reset-breaker"
+              ;;
+            *)
+              echo "ERROR: Unknown mode '$MODE'"
+              exit 1
+              ;;
+          esac
+
+      - name: Stop if dry-run-only
+        if: success() && github.event.inputs.dry_run_only == 'true'
+        run: |
+          echo "=== Dry-run-only mode — skipping execution ==="
+          echo "Review the plan above. Re-run with dry_run_only=false to execute."
+          exit 0
 
       - name: Execute flush
+        if: success() && github.event.inputs.dry_run_only != 'true'
         env:
           PYTHONUNBUFFERED: "1"
+        timeout-minutes: 20
         run: |
           MODE="${{ github.event.inputs.mode }}"
-          echo "=== Redis Flush v2.0 — Execute ==="
+          echo "=== Redis Flush v2.1 — Execute ==="
           echo "Mode: $MODE"
-          
+          echo ""
+
           case "$MODE" in
             history-only)
               python redis_diagnostics.py --history-only --yes
@@ -69,6 +124,9 @@ jobs:
             purge)
               python redis_diagnostics.py --purge --yes
               ;;
+            reset-breaker)
+              python redis_diagnostics.py --reset-breaker
+              ;;
             *)
               echo "ERROR: Unknown mode '$MODE'"
               exit 1
@@ -76,9 +134,30 @@ jobs:
           esac
 
       - name: Verify after flush
+        if: success() && github.event.inputs.mode != 'reset-breaker'
+        env:
+          PYTHONUNBUFFERED: "1"
+        timeout-minutes: 10
+        run: |
+          echo "=== Post-Flush Verify ==="
+          python redis_diagnostics.py
+
+      - name: Summary
+        if: always()
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "=== Post-Flush Verify ==="
-          python redis_diagnostics.py --json || true
+          echo "=== Redis Flush v2.1 Summary ==="
+          echo "Mode: ${{ github.event.inputs.mode }}"
+          echo "Confirm: ${{ github.event.inputs.confirm }}"
+          echo "Dry run only: ${{ github.event.inputs.dry_run_only }}"
+          echo ""
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "Status: SUCCESS"
+          else
+            echo "Status: ${{ job.status }}"
+          fi
           
