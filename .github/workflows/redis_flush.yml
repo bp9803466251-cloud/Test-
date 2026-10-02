@@ -1,0 +1,84 @@
+name: Redis Flush v2.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим: history-only, soft, hard, purge'
+        required: true
+        default: 'history-only'
+      confirm:
+        description: 'Подтверждение (yes)'
+        required: true
+        default: 'no'
+
+jobs:
+  flush:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate confirm
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "yes" ]; then
+            echo "ERROR: confirm must be 'yes'"
+            exit 1
+          fi
+          echo "Confirm: OK"
+
+      - name: Dry run (show plan)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          echo "=== Redis Flush v2.0 — Dry Run ==="
+          echo "Mode: $MODE"
+          python redis_diagnostics.py --dry-run --history-only --yes || true
+          python redis_diagnostics.py --json || true
+
+      - name: Execute flush
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          echo "=== Redis Flush v2.0 — Execute ==="
+          echo "Mode: $MODE"
+          
+          case "$MODE" in
+            history-only)
+              python redis_diagnostics.py --history-only --yes
+              ;;
+            soft)
+              python redis_diagnostics.py --flush --yes
+              ;;
+            hard)
+              python redis_diagnostics.py --flush --hard --yes
+              ;;
+            purge)
+              python redis_diagnostics.py --purge --yes
+              ;;
+            *)
+              echo "ERROR: Unknown mode '$MODE'"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify after flush
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          echo "=== Post-Flush Verify ==="
+          python redis_diagnostics.py --json || true
+          
