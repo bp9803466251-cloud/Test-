@@ -262,9 +262,10 @@ jobs:
               away_clean = m.get('away_clean', '')
               for team_name in [home_clean, away_clean]:
                   if team_name:
-                      members = cmd('SMEMBERS', f'history:team:{team_name}')
+                      team_key = team_name.replace(' ', '_')
+                      members = cmd('SMEMBERS', f'history:team:{team_key}')
                       cnt = len(members) if members else 0
-                      print(f'  history:team:{team_name}: {cnt} members')
+                      print(f'  history:team:{team_key}: {cnt} members')
                       if cnt == 0:
                           print(f'    WARNING: team SET empty — key format mismatch?')
 
