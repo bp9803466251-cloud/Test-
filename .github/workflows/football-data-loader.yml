@@ -1,4 +1,4 @@
-name: Football Data Loader v6.3
+name: Football Data Loader
 
 on:
   workflow_dispatch:
@@ -49,7 +49,7 @@ jobs:
           python-version: '3.11'
           cache: pip
 
-      - name: Run Football Data Collector v6.3
+      - name: Run Football Data Collector
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -96,7 +96,7 @@ jobs:
                   print(f'  [CMD ERROR] {args[0]} {args[1] if len(args)>1 else \"\"}: {e}')
                   return None
 
-          print('=== Redis Verify (v6.3) ===')
+          print('=== Redis Verify ===')
           dbsize = cmd('DBSIZE')
           print(f'DBSIZE: {dbsize}')
           if dbsize is None:
@@ -119,7 +119,6 @@ jobs:
           print(f'Seasons: {seasons}')
           print(f'Leagues: {len(leagues)}')
 
-          # --- ZCARD per league ---
           total = 0
           for lg in leagues:
               cnt = cmd('ZCARD', f'history:league:{lg}')
@@ -128,7 +127,6 @@ jobs:
                   total += int(cnt)
           print(f'Total matches across leagues: {total}')
 
-          # --- football_data:meta (GET, не HGET) ---
           meta_raw = cmd('GET', 'football_data:meta')
           if meta_raw:
               try:
@@ -143,7 +141,6 @@ jobs:
           else:
               print('  meta: not found (SET football_data:meta)')
 
-          # --- First match details (GET, не HGET) ---
           first = None
           if 'E0' in leagues:
               first = cmd('ZRANGE', 'history:league:E0', 0, 0)
@@ -258,7 +255,6 @@ jobs:
           elif total == 0:
               print('WARNING: NO MATCHES FOUND — data not written to Redis')
 
-          # --- Team SET check ---
           print()
           print('--- Team SET indexes ---')
           if first and isinstance(first, list) and first and m:
@@ -272,7 +268,6 @@ jobs:
                       if cnt == 0:
                           print(f'    WARNING: team SET empty — key format mismatch?')
 
-          # --- Canonical ID format check ---
           print()
           print('--- Canonical ID format ---')
           if first and isinstance(first, list) and first:
@@ -283,7 +278,7 @@ jobs:
               print(f'  Has spaces: {has_spaces} (should be False)')
               print(f'  Has __ separator: {has_underscores} (should be True)')
               if has_spaces:
-                  print(f'  ERROR: CID contains spaces — football_data build_canonical_id missing .replace(\" \", \"_\")')
+                  print(f'  ERROR: CID contains spaces')
               if not has_underscores:
                   print(f'  ERROR: CID missing __ separator')
 
@@ -296,7 +291,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "=== Football Data Loader v6.3 Summary ==="
+          echo "=== Football Data Loader Summary ==="
           echo "Seasons: ${SEASONS_INPUT:-auto}"
           echo "Leagues: ${LEAGUES_INPUT:-all 22}"
           echo "History days: ${HISTORY_DAYS_INPUT}"
