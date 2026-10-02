@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v6.1 (CSV) — ALL columns, GatekeeperAI v5.7.18
+Football-Data Collector v6.2 (CSV) — ALL columns, GatekeeperAI v710
 Источник: football-data.co.uk
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
 
-Schema: v710-prod
+Schema: v710
 CSV:    120 колонок (opening + closing odds, O/U 2.5, Asian Handicap)
 Stats:  12 метрик + _source + _updated_at
 Odds:   1x2 (opening+closing per-bookmaker), O/U 2.5, Asian Handicap
 Raw:    ALL CSV columns stored in csv_raw{}
+Transport: redis_hub.PipelineBatch (единый транспортный слой)
 """
-
 import argparse
 import csv
 import io
@@ -21,17 +21,17 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# Единый транспортный слой
+from redis_hub import PipelineBatch, scan_keys, delete_keys, dbsize, is_redis_available
 
 # ============================================================================
 # CONFIG
 # ============================================================================
 
-VERSION = "6.1.0"
+VERSION = "6.2.0"
 SCHEMA_VERSION = "v710"
-
-REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
 
@@ -60,158 +60,41 @@ LEAGUES = {
     "G1":  {"name": "Super League",          "country": "Greece",     "division": 1},
 }
 
-# Bookmaker prefixes for 1X2 odds
+# Bookmaker prefixes for 1X2 odds (IW, VC removed — dead in CSV 2425+)
 BOOKMAKERS_1X2 = [
     ("B365", "bet365"),
     ("BW",   "bwin"),
-    ("BF",   "betfair"),
     ("PS",   "pinnacle"),
     ("WH",   "william_hill"),
+    ("BF",   "betfair"),
 ]
 
-# Team name aliases for canonical_id
+# Team name aliases — синхронизированы с gatekeeper_hub.py v2.0
 TEAM_ALIASES = {
+    "manchester united": "manchester united",
     "man united": "manchester united",
     "man utd": "manchester united",
-    "newcastle": "newcastle united",
-    "wolves": "wolverhampton wanderers",
+    "manchester city": "manchester city",
+    "man city": "manchester city",
+    "tottenham hotspur": "tottenham hotspur",
+    "tottenham": "tottenham hotspur",
     "spurs": "tottenham hotspur",
+    "wolverhampton": "wolverhampton wanderers",
+    "wolverhampton wanderers": "wolverhampton wanderers",
+    "wolves": "wolverhampton wanderers",
+    "newcastle united": "newcastle united",
+    "newcastle": "newcastle united",
+    "west ham united": "west ham united",
+    "west ham": "west ham united",
+    "nottm forest": "nottingham forest",
+    "nottingham forest": "nottingham forest",
     "nott'm forest": "nottingham forest",
     "nottingham": "nottingham forest",
+    "brighton hove albion": "brighton hove albion",
+    "brighton": "brighton hove albion",
+    "leicester city": "leicester city",
+    "leicester": "leicester city",
 }
-
-# ============================================================================
-# CIRCUIT BREAKER
-# ============================================================================
-
-class CircuitBreaker:
-    def __init__(self, max_errors=10, reset_timeout=60):
-        self.max_errors = max_errors
-        self.reset_timeout = reset_timeout
-        self.error_count = 0
-        self.last_error_time = 0
-        self.state = "closed"
-
-    def is_open(self):
-        if self.state == "open":
-            elapsed = time.time() - self.last_error_time
-            if elapsed >= self.reset_timeout:
-                self.state = "half_open"
-                return False
-            return True
-        return False
-
-    def record_success(self):
-        if self.state == "half_open":
-            self.state = "closed"
-        self.error_count = 0
-
-    def record_failure(self):
-        self.error_count += 1
-        self.last_error_time = time.time()
-        if self.error_count >= self.max_errors:
-            self.state = "open"
-            remaining = int(self.reset_timeout - (time.time() - self.last_error_time))
-            print(f"[REDIS WARNING] Circuit Breaker active (remaining {remaining}s)")
-
-    def reset(self):
-        self.error_count = 0
-        self.state = "closed"
-
-    def remaining_cooldown(self):
-        if self.state != "open":
-            return 0
-        elapsed = time.time() - self.last_error_time
-        return max(0, int(self.reset_timeout - elapsed))
-
-
-# ============================================================================
-# REDIS CLIENT
-# ============================================================================
-
-class RedisClient:
-    def __init__(self, url, token):
-        self.url = url.rstrip("/")
-        self.token = token
-        self.cb = CircuitBreaker(max_errors=10, reset_timeout=60)
-        self._pipeline = []
-        self._pipeline_size = 0
-        self.MAX_PIPELINE = 50
-        self.BATCH_DELAY = 0.15
-
-    def _headers(self):
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-
-    def _post(self, body, path=""):
-        if self.cb.is_open():
-            wait = self.cb.remaining_cooldown()
-            if wait > 0:
-                print(f"[REDIS WARNING] Circuit Breaker wait {wait}s")
-                time.sleep(wait)
-                self.cb.state = "half_open"
-
-        req = urllib.request.Request(
-            self.url + path,
-            data=json.dumps(body).encode(),
-            headers=self._headers(),
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
-                self.cb.record_success()
-                return data
-        except urllib.error.HTTPError as e:
-            self.cb.record_failure()
-            err_body = e.read().decode("utf-8", errors="replace")
-            print(f"[REDIS ERROR] HTTP {e.code}: {err_body}")
-            return None
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            self.cb.record_failure()
-            print(f"[REDIS ERROR] {e}")
-            return None
-
-    def _post_pipeline(self, commands):
-        if not commands:
-            return None
-        return self._post(commands, "/pipeline")
-
-    def pipe_add(self, command, *args):
-        self._pipeline.append([command] + [str(a) for a in args])
-        self._pipeline_size += 1
-        if self._pipeline_size >= self.MAX_PIPELINE:
-            return self.flush()
-        return None
-
-    def flush(self):
-        if not self._pipeline:
-            return None
-        commands = self._pipeline
-        self._pipeline = []
-        self._pipeline_size = 0
-        result = self._post_pipeline(commands)
-        time.sleep(self.BATCH_DELAY)
-        return result
-
-    def hset(self, key, field, value):
-        return self.pipe_add("HSET", key, field, value)
-
-    def sadd(self, key, *members):
-        return self.pipe_add("SADD", key, *members)
-
-    def zadd(self, key, score, member):
-        return self.pipe_add("ZADD", key, str(score), member)
-
-    def dbsize(self):
-        if self.cb.is_open():
-            return None
-        result = self._post(["DBSIZE"])
-        if result and "result" in result:
-            return result["result"]
-        return None
 
 
 # ============================================================================
@@ -296,34 +179,12 @@ def build_price(row, h_key, d_key, a_key):
 def build_ou25(row, suffix, b365_prefix, p_prefix, max_prefix, avg_prefix):
     """Build Over/Under 2.5 block."""
     result = {}
-    b365 = {}
-    o = safe_float_str(row.get(f"{b365_prefix}>2.5", ""))
-    u = safe_float_str(row.get(f"{b365_prefix}<2.5", ""))
-    if o and u:
-        b365 = {"over": o, "under": u}
-    pin = {}
-    o = safe_float_str(row.get(f"{p_prefix}>2.5", ""))
-    u = safe_float_str(row.get(f"{p_prefix}<2.5", ""))
-    if o and u:
-        pin = {"over": o, "under": u}
-    mx = {}
-    o = safe_float_str(row.get(f"{max_prefix}>2.5", ""))
-    u = safe_float_str(row.get(f"{max_prefix}<2.5", ""))
-    if o and u:
-        mx = {"over": o, "under": u}
-    avg = {}
-    o = safe_float_str(row.get(f"{avg_prefix}>2.5", ""))
-    u = safe_float_str(row.get(f"{avg_prefix}<2.5", ""))
-    if o and u:
-        avg = {"over": o, "under": u}
-    if b365:
-        result["bet365"] = b365
-    if pin:
-        result["pinnacle"] = pin
-    if mx:
-        result["max"] = mx
-    if avg:
-        result["avg"] = avg
+    for name, prefix in [("bet365", b365_prefix), ("pinnacle", p_prefix),
+                          ("max", max_prefix), ("avg", avg_prefix)]:
+        o = safe_float_str(row.get(f"{prefix}>2.5", ""))
+        u = safe_float_str(row.get(f"{prefix}<2.5", ""))
+        if o and u:
+            result[name] = {"over": o, "under": u}
     return result if result else None
 
 def build_ah(row, suffix, b365_prefix, p_prefix, max_prefix, avg_prefix):
@@ -336,34 +197,12 @@ def build_ah(row, suffix, b365_prefix, p_prefix, max_prefix, avg_prefix):
     size = safe_float_str(row.get(size_key, ""))
     if size:
         result["size"] = size
-    b365 = {}
-    h = safe_float_str(row.get(f"{b365_prefix}AHH", ""))
-    a = safe_float_str(row.get(f"{b365_prefix}AHA", ""))
-    if h and a:
-        b365 = {"home": h, "away": a}
-    pin = {}
-    h = safe_float_str(row.get(f"{p_prefix}AHH", ""))
-    a = safe_float_str(row.get(f"{p_prefix}AHA", ""))
-    if h and a:
-        pin = {"home": h, "away": a}
-    mx = {}
-    h = safe_float_str(row.get(f"{max_prefix}AHH", ""))
-    a = safe_float_str(row.get(f"{max_prefix}AHA", ""))
-    if h and a:
-        mx = {"home": h, "away": a}
-    avg = {}
-    h = safe_float_str(row.get(f"{avg_prefix}AHH", ""))
-    a = safe_float_str(row.get(f"{avg_prefix}AHA", ""))
-    if h and a:
-        avg = {"home": h, "away": a}
-    if b365:
-        result["bet365"] = b365
-    if pin:
-        result["pinnacle"] = pin
-    if mx:
-        result["max"] = mx
-    if avg:
-        result["avg"] = avg
+    for name, prefix in [("bet365", b365_prefix), ("pinnacle", p_prefix),
+                          ("max", max_prefix), ("avg", avg_prefix)]:
+        h = safe_float_str(row.get(f"{prefix}AHH", ""))
+        a = safe_float_str(row.get(f"{prefix}AHA", ""))
+        if h and a:
+            result[name] = {"home": h, "away": a}
     return result if result else None
 
 def detect_flags(stats, score):
@@ -378,7 +217,7 @@ def detect_flags(stats, score):
     }
 
 def build_stats(row, ts):
-    stats = {
+    return {
         "shots_home": safe_int(row.get("HS", 0)),
         "shots_away": safe_int(row.get("AS", 0)),
         "shots_on_target_home": safe_int(row.get("HST", 0)),
@@ -394,18 +233,15 @@ def build_stats(row, ts):
         "_source": "football_data",
         "_updated_at": ts,
     }
-    return stats
 
 def build_source_map(ts):
     return {
         "odds": {
             "source": "football_data",
-            "upstream": "pinnacle",
+            "upstream": "multi_bookmaker",
             "timestamp": ts,
             "independent": True,
-            "types": ["opening", "closing"],
-            "sharp_benchmark": "pinnacle",
-            "soft_bookmakers": ["bet365", "bwin", "william_hill", "betfair"],
+            "type": "closing",
         },
         "stats": {
             "source": "football_data",
@@ -413,6 +249,9 @@ def build_source_map(ts):
             "timestamp": ts,
             "independent": True,
         },
+        "types": ["opening", "closing"],
+        "sharp_benchmark": "pinnacle",
+        "soft_bookmakers": ["bet365", "bwin", "william_hill", "betfair"],
     }
 
 def build_csv_raw(row):
@@ -429,7 +268,6 @@ def build_csv_raw(row):
 
 def build_odds_block(row, ts):
     """Build comprehensive odds block: 1x2 (opening+closing), O/U 2.5, Asian Handicap."""
-    # --- 1X2 per-bookmaker (opening) ---
     opening_bm = {}
     closing_bm = {}
     for prefix, name in BOOKMAKERS_1X2:
@@ -440,68 +278,40 @@ def build_odds_block(row, ts):
         if cl:
             closing_bm[name] = cl
 
-    # --- Max/Avg ---
     max_opening = build_price(row, "MaxH", "MaxD", "MaxA")
     avg_opening = build_price(row, "AvgH", "AvgD", "AvgA")
     max_closing = build_price(row, "MaxCH", "MaxCD", "MaxCA")
     avg_closing = build_price(row, "AvgCH", "AvgCD", "AvgCA")
 
-    # --- O/U 2.5 ---
     ou25_opening = build_ou25(row, "", "B365", "P", "Max", "Avg")
     ou25_closing = build_ou25(row, "C", "B365C", "PC", "MaxC", "AvgC")
 
-    # --- Asian Handicap ---
     ah_opening = build_ah(row, "", "B365", "P", "Max", "Avg")
     ah_closing = build_ah(row, "C", "B365C", "PC", "MaxC", "AvgC")
 
-    # --- Determine current/opening/best ---
-    # current = Pinnacle closing (sharpest), fallback to max closing, fallback to any closing
     current = closing_bm.get("pinnacle") or max_closing
     if not current and closing_bm:
         current = list(closing_bm.values())[0]
 
-    # opening = Pinnacle opening, fallback to max opening, fallback to any opening
     opening = opening_bm.get("pinnacle") or max_opening
     if not opening and opening_bm:
         opening = list(opening_bm.values())[0]
 
-    # best = max closing (best price across bookmakers, closing)
     best = max_closing or max_opening
 
-    # --- Sources ---
     sources = []
     if opening_bm.get("pinnacle"):
-        sources.append({
-            "source": "football_data",
-            "upstream": "pinnacle",
-            "price": opening_bm["pinnacle"],
-            "timestamp": ts,
-            "type": "opening",
-        })
+        sources.append({"source": "football_data", "upstream": "pinnacle",
+                        "price": opening_bm["pinnacle"], "timestamp": ts, "type": "opening"})
     if closing_bm.get("pinnacle"):
-        sources.append({
-            "source": "football_data",
-            "upstream": "pinnacle",
-            "price": closing_bm["pinnacle"],
-            "timestamp": ts,
-            "type": "closing",
-        })
+        sources.append({"source": "football_data", "upstream": "pinnacle",
+                        "price": closing_bm["pinnacle"], "timestamp": ts, "type": "closing"})
     if not sources and opening_bm.get("bet365"):
-        sources.append({
-            "source": "football_data",
-            "upstream": "bet365",
-            "price": opening_bm["bet365"],
-            "timestamp": ts,
-            "type": "opening",
-        })
+        sources.append({"source": "football_data", "upstream": "bet365",
+                        "price": opening_bm["bet365"], "timestamp": ts, "type": "opening"})
     if not sources and closing_bm.get("bet365"):
-        sources.append({
-            "source": "football_data",
-            "upstream": "bet365",
-            "price": closing_bm["bet365"],
-            "timestamp": ts,
-            "type": "closing",
-        })
+        sources.append({"source": "football_data", "upstream": "bet365",
+                        "price": closing_bm["bet365"], "timestamp": ts, "type": "closing"})
 
     odds_1x2 = {}
     if current:
@@ -589,6 +399,7 @@ def build_payload(row, season, league_code):
         "country": league_info["country"],
         "season": str(season),
         "league_code": league_code,
+        "division": league_info["division"],
         "date_utc": date_utc,
         "time_utc": time_utc,
         "status": "completed",
@@ -603,150 +414,126 @@ def build_payload(row, season, league_code):
         "predictions": {},
         "value_analysis": {},
         "stats": stats,
-        "h2h": {},
-        "form": None,
-        "ratings": None,
-        "context": None,
         "source_map": source_map,
-        "source_ids": {"football_data": league_code},
-        "sources": ["football_data"],
-        "section_history": [],
         "flags": flags,
+        "csv_raw": csv_raw,
         "created_at": ts,
         "updated_at": ts,
-        "csv_raw": csv_raw,
     }
 
-    return payload, canonical_id, date_utc, home_clean, away_clean
+    return payload
 
 
 # ============================================================================
-# CSV DOWNLOADER
-# ============================================================================
-
-def download_csv(season, league_code, max_retries=3):
-    url = f"{BASE_URL}/{season}/{league_code}.csv"
-    for attempt in range(1, max_retries + 1):
-        print(f"[CSV] Download {url} (attempt {attempt}/{max_retries})")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "FD-Collector/6.1"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = resp.read()
-                if len(data) < 50:
-                    print(f"[CSV] File too small ({len(data)} bytes), skip")
-                    return None
-                print(f"[CSV] Downloaded: {season}_{league_code}.csv ({len(data)} bytes)")
-                return data
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
-            print(f"[CSV] Error: {e}")
-            if attempt < max_retries:
-                time.sleep(3 * attempt)
-    return None
-
-def archive_csv(season, league_code, data):
-    archive_dir = "archive"
-    if not os.path.exists(archive_dir):
-        os.makedirs(archive_dir)
-    path = os.path.join(archive_dir, f"{season}_{league_code}.csv")
-    with open(path, "wb") as f:
-        f.write(data)
-    print(f"[CSV] Archived: {path}")
-
-
-# ============================================================================
-# MAIN COLLECTOR
+# COLLECTOR
 # ============================================================================
 
 class FootballDataCollector:
-    def __init__(self, redis_client):
-        self.redis = redis_client
-        self.total_matches = 0
-        self.total_skipped = 0
-        self.total_errors = 0
-        self.total_csv_columns = 0
+    def __init__(self, batch: PipelineBatch, dry_run: bool = False):
+        self.batch = batch
+        self.dry_run = dry_run
+        self.matches_processed = 0
+        self.errors = 0
+        self.skipped = 0
 
-    def process_csv(self, csv_data, season, league_code, limit=0):
-        text = csv_data.decode("utf-8-sig") if isinstance(csv_data, bytes) else csv_data
-        reader = csv.DictReader(io.StringIO(text))
+    def download_csv(self, season, league_code):
+        """Download CSV for a season+league from football-data.co.uk."""
+        url = f"{BASE_URL}/{season}/{league_code}.csv"
+        req = urllib.request.Request(url, headers={"User-Agent": f"FootballDataCollector/{VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                content = resp.read().decode("utf-8", errors="replace")
+            return content
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"  [SKIP] {season}/{league_code} — сезон ещё не начался (404)")
+                return None
+            print(f"  [ERROR] HTTP {e.code} for {url}")
+            return None
+        except (urllib.error.URLError, OSError) as e:
+            print(f"  [ERROR] {e} for {url}")
+            return None
 
-        print(f"[CSV] Processing: {season}_{league_code}.csv (season={season}, league={league_code})")
+    def archive_csv(self, season, league_code, content):
+        """Save raw CSV to /tmp for archival (all 22 leagues)."""
+        import os
+        archive_dir = os.environ.get("ARCHIVE_DIR", "/tmp/football_data_archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        path = os.path.join(archive_dir, f"{season}_{league_code}.csv")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
 
-        if reader.fieldnames:
-            col_count = len(reader.fieldnames)
-            print(f"[CSV] Columns in CSV: {col_count}")
-            if col_count > self.total_csv_columns:
-                self.total_csv_columns = col_count
-
-        matches_in_league = 0
-        skipped = 0
-        errors = 0
+    def process_csv(self, csv_content, season, league_code, limit=0, history_days=0):
+        """Parse CSV and write matches to Redis via PipelineBatch."""
+        reader = csv.DictReader(io.StringIO(csv_content))
+        count = 0
+        now = datetime.now(timezone.utc)
 
         for row in reader:
-            if limit and matches_in_league >= limit:
+            if limit and count >= limit:
                 break
 
-            try:
-                result = build_payload(row, season, league_code)
-                if result is None:
-                    skipped += 1
-                    continue
-
-                payload, canonical_id, date_utc, home_clean, away_clean = result
-                payload_json = json.dumps(payload, ensure_ascii=False)
-
-                match_key = f"history:match:{canonical_id}"
-                self.redis.hset(match_key, "data", payload_json)
-
-                self.redis.sadd(f"history:team:{home_clean}", canonical_id)
-                self.redis.sadd(f"history:team:{away_clean}", canonical_id)
-
-                date_score = int(date_utc[:10].replace("-", ""))
-                self.redis.zadd(f"history:league:{league_code}", date_score, canonical_id)
-
-                matches_in_league += 1
-
-            except Exception as e:
-                errors += 1
-                print(f"[CSV] Error row {reader.line_num}: {e}")
+            payload = build_payload(row, season, league_code)
+            if payload is None:
+                self.skipped += 1
                 continue
 
-        self.redis.flush()
-        self._save_meta(season, league_code, matches_in_league, skipped, errors)
+            # History filter
+            if history_days > 0:
+                try:
+                    match_dt = datetime.fromisoformat(
+                        payload["date_utc"].replace("Z", "+00:00")
+                    )
+                    if (now - match_dt).days > history_days:
+                        continue
+                except (ValueError, TypeError):
+                    pass
 
-        self.total_matches += matches_in_league
-        self.total_skipped += skipped
-        self.total_errors += errors
+            key = f"history:match:{payload['canonical_id']}"
 
-        print(f"[CSV] Done: {matches_in_league} matches, {skipped} skipped, {errors} errors")
+            # HSET individual key with data field
+            self.batch.add("HSET", key, "data", json.dumps(payload, ensure_ascii=False))
 
-        if league_code in ["E0", "E1", "E2", "E3", "EC", "SC0", "SC1", "D1", "D2", "I1", "I2", "SP1", "SP2", "F1", "F2", "N1", "B1", "P1", "T1", "G1"]:
-            archive_csv(season, league_code, csv_data)
+            # ZADD league index
+            try:
+                dt = datetime.fromisoformat(
+                    payload["date_utc"].replace("Z", "+00:00")
+                )
+                score = dt.timestamp()
+            except (ValueError, TypeError):
+                score = 0
+            self.batch.add("ZADD", f"history:league:{league_code}", str(score),
+                            payload["canonical_id"])
 
-    def _save_meta(self, season, league_code, matches, skipped, errors):
-        meta_key = "football_data:meta"
-        meta_entry = json.dumps({
-            "season": str(season),
-            "league": league_code,
+            # SADD team indexes
+            home_clean = payload["home_clean"].replace(" ", "_")
+            away_clean = payload["away_clean"].replace(" ", "_")
+            self.batch.add("SADD", f"history:team:{home_clean}", payload["canonical_id"])
+            self.batch.add("SADD", f"history:team:{away_clean}", payload["canonical_id"])
+
+            count += 1
+            self.matches_processed += 1
+
+        # Flush remaining
+        self.batch.flush()
+        return count
+
+    def save_meta(self, season, league_code, matches, errors):
+        """Save metadata about this run."""
+        ts = now_iso()
+        meta = {
+            "season": season,
+            "league_code": league_code,
             "matches": matches,
-            "skipped": skipped,
             "errors": errors,
-            "csv_columns": self.total_csv_columns,
-            "timestamp": now_iso(),
-        }, ensure_ascii=False)
-
-        self.redis.hset(meta_key, f"{season}_{league_code}", meta_entry)
-        self.redis.flush()
-
-    def print_summary(self):
-        print("[FD] " + "=" * 50)
-        print("[FD] SUMMARY")
-        print("[FD] " + "=" * 50)
-        print(f"[FD] Total rows:    {self.total_matches + self.total_skipped}")
-        print(f"[FD] Written:       {self.total_matches}")
-        print(f"[FD] Skipped:       {self.total_skipped}")
-        print(f"[FD] Errors:        {self.total_errors}")
-        print(f"[FD] CSV columns:   {self.total_csv_columns}")
-        print("[FD] Done.")
+            "last_run": ts,
+            "version": VERSION,
+            "schema_version": SCHEMA_VERSION,
+        }
+        key = "football_data:meta"
+        field = f"{season}_{league_code}"
+        self.batch.add("HSET", key, field, json.dumps(meta, ensure_ascii=False))
+        self.batch.flush()
 
 
 # ============================================================================
@@ -754,81 +541,95 @@ class FootballDataCollector:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Football-Data Collector v6.1")
-    parser.add_argument("--seasons", type=str, default="", help="Seasons comma-separated")
-    parser.add_argument("--leagues", type=str, default="", help="Leagues comma-separated")
-    parser.add_argument("--season", type=str, default="", help="Single season (legacy)")
-    parser.add_argument("--league", type=str, default="", help="Single league (legacy)")
-    parser.add_argument("--history-days", type=int, default=0, help="History window days")
-    parser.add_argument("--limit", type=int, default=0, help="Match limit per league")
-    parser.add_argument("--dry-run", action="store_true", help="No Redis write")
+    parser = argparse.ArgumentParser(description=f"Football-Data Collector v{VERSION}")
+    parser.add_argument("--seasons", default="", help="Seasons comma-separated (e.g. 2425,2526)")
+    parser.add_argument("--leagues", default="", help="League codes (empty = all 22)")
+    parser.add_argument("--limit", type=int, default=0, help="Max matches per league (0 = all)")
+    parser.add_argument("--history-days", type=int, default=0,
+                        help="Only matches within N days (0 = all)")
+    parser.add_argument("--dry-run", action="store_true", help="Don't write to Redis")
     args = parser.parse_args()
 
-    seasons_str = args.seasons or args.season or ""
-    leagues_str = args.leagues or args.league or ""
+    print(f"=== Football-Data Collector v{VERSION} (schema {SCHEMA_VERSION}) ===")
+    print(f"  Dry run: {args.dry_run}")
+    print(f"  Seasons: {args.seasons or 'auto'}")
+    print(f"  Leagues: {args.leagues or 'all 22'}")
+    print(f"  Limit: {args.limit or 'none'}")
+    print(f"  History days: {args.history_days or 'all'}")
 
-    if not seasons_str:
+    # Redis check
+    if not args.dry_run:
+        if not is_redis_available():
+            print("[FATAL] Redis недоступен. Проверьте UPSTASH_REDIS_REST_URL/TOKEN.")
+            sys.exit(1)
+        print("  Redis: OK")
+    else:
+        print("  Redis: dry-run (no writes)")
+
+    # Parse seasons
+    if args.seasons:
+        seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
+    else:
         now = datetime.now(timezone.utc)
-        seasons_str = f"{now.year % 100:02d}{(now.year + 1) % 100:02d}"
-        print(f"[FD] No season specified, using current: {seasons_str}")
+        seasons = [f"{now.year % 100:02d}{(now.year + 1) % 100:02d}"]
 
-    seasons = [s.strip() for s in seasons_str.split(",") if s.strip()]
-    if leagues_str:
-        leagues = [l.strip() for l in leagues_str.split(",") if l.strip()]
+    # Parse leagues
+    if args.leagues:
+        leagues = [l.strip() for l in args.leagues.split(",") if l.strip()]
     else:
         leagues = list(LEAGUES.keys())
 
-    print(f"[FD] Football-Data Collector v{VERSION} (CSV) started")
-    print(f"[FD] Schema: {SCHEMA_VERSION} (GatekeeperAI v5.7.18)")
-    print(f"[FD] Source: football-data.co.uk")
-    print(f"[FD] Seasons: {', '.join(seasons)}")
-    print(f"[FD] Leagues: {len(leagues)}")
+    print(f"  Seasons parsed: {seasons}")
+    print(f"  Leagues parsed: {leagues} ({len(leagues)})")
 
-    if args.dry_run:
-        print("[FD] DRY RUN — no Redis write")
-        redis = None
-    else:
-        if not REDIS_URL or not REDIS_TOKEN:
-            print("[FD] ERROR: UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN not set")
-            sys.exit(1)
-        redis = RedisClient(REDIS_URL, REDIS_TOKEN)
+    # Create pipeline batch
+    batch = PipelineBatch(dry_run=args.dry_run, max_batch=50, batch_delay=0.15)
+    collector = FootballDataCollector(batch, dry_run=args.dry_run)
 
-    collector = FootballDataCollector(redis)
+    total_matches = 0
+    total_errors = 0
 
     for season in seasons:
-        print(f"[FD] === Season {season} ===")
+        print(f"\n--- Season {season} ---")
         for league_code in leagues:
-            if league_code not in LEAGUES:
-                print(f"[FD] Unknown league: {league_code}, skip")
+            league_name = LEAGUES.get(league_code, {}).get("name", league_code)
+            print(f"  [{league_code}] {league_name}...")
+
+            csv_content = collector.download_csv(season, league_code)
+            if csv_content is None:
+                total_errors += 1
                 continue
 
-            league_name = LEAGUES[league_code]["name"]
-            print(f"[FD] --- {league_name} ({league_code}) ---")
+            # Archive
+            if not args.dry_run:
+                collector.archive_csv(season, league_code, csv_content)
 
-            csv_data = download_csv(season, league_code)
-            if csv_data is None:
-                print(f"[FD] CSV not downloaded, skip {league_code}")
-                continue
+            # Process
+            matches = collector.process_csv(
+                csv_content, season, league_code,
+                limit=args.limit, history_days=args.history_days
+            )
+            total_matches += matches
+            print(f"    Matches: {matches}")
 
-            collector.process_csv(csv_data, season, league_code, limit=args.limit)
+            # Save meta
+            if not args.dry_run:
+                collector.save_meta(season, league_code, matches, 0)
 
-            if redis and redis.cb.is_open():
-                wait = redis.cb.remaining_cooldown()
-                if wait > 0:
-                    print(f"[FD] Circuit Breaker active, wait {wait}s")
-                    time.sleep(wait)
-                    redis.cb.reset()
+    # Final flush
+    batch.flush()
 
-    collector.print_summary()
+    print(f"\n=== DONE ===")
+    print(f"  Total matches: {total_matches}")
+    print(f"  Total errors: {total_errors}")
+    print(f"  Skipped (invalid): {collector.skipped}")
+    print(f"  Pipeline batches: {batch.total_batches}")
+    print(f"  Pipeline commands: {batch.total_sent}")
+    if args.dry_run:
+        print(f"  (dry-run: nothing written to Redis)")
 
-    if redis:
-        redis.flush()
-
-    print(f"\n=== Football Data Loader Summary ===")
-    print(f"Seasons: {','.join(seasons)}")
-    print(f"Leagues: {','.join(leagues)}")
-    print(f"History days: {args.history_days}")
+    return 0 if total_errors == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
