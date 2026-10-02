@@ -1,4 +1,4 @@
-name: Redis Flush v2.1
+name: Redis Flush
 
 on:
   workflow_dispatch:
@@ -66,7 +66,7 @@ jobs:
         timeout-minutes: 15
         run: |
           MODE="${{ github.event.inputs.mode }}"
-          echo "=== Redis Flush v2.1 — Dry Run ==="
+          echo "=== Redis Flush — Dry Run ==="
           echo "Mode: $MODE"
           echo ""
 
@@ -107,7 +107,7 @@ jobs:
         timeout-minutes: 20
         run: |
           MODE="${{ github.event.inputs.mode }}"
-          echo "=== Redis Flush v2.1 — Execute ==="
+          echo "=== Redis Flush — Execute ==="
           echo "Mode: $MODE"
           echo ""
 
@@ -147,7 +147,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "=== Redis Flush v2.1 Summary ==="
+          echo "=== Redis Flush Summary ==="
           echo "Mode: ${{ github.event.inputs.mode }}"
           echo "Confirm: ${{ github.event.inputs.confirm }}"
           echo "Dry run only: ${{ github.event.inputs.dry_run_only }}"
