@@ -5,19 +5,36 @@ on:
 
 env:
   PYTHON_VERSION: "3.12"
-  GK_CONFIG_FILE: "./gatekeeper_config.yaml"
+  GK_CONFIG_FILE: "gatekeeper_config.yaml"  # FIX: убран ./
+  PYTHONUNBUFFERED: "1"  # FIX: вынесен из шага
 
 permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
-  cancel-in-progress: false
+  group: collector-sharpapi  # FIX: уникальный group (был gatekeeper-redis)
+  cancel-in-progress: false  # TODO: изменить на true после внедрения idempotency_key
 
 jobs:
   run-collector:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    env:
+      # FIX: оба набора Redis ENV (был только SHARED_*)
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      # FIX: SHARP_API_KEY → SHARPAPI_API_KEY (аудит §2.11)
+      SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      # FIX: добавлены параметры коллектора (отсутствовали)
+      SHARPAPI_RATE_LIMIT_DELAY: "1.0"
+      SHARPAPI_MAX_PAGES: "5"
+      SHARPAPI_LIMIT: "100"
+      SHARPAPI_DAYS_AHEAD: "3"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,22 +43,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          cache: pip
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt  # FIX: безусловная установка (было условной)
 
       - name: Run collector
         run: python collector_sharpapi.py
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PYTHONUNBUFFERED: '1'
 
       - name: Upload logs on failure
         if: failure()
@@ -51,4 +61,16 @@ jobs:
           path: |
             *.log
           retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Collector SharpAPI Summary ==="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "Status: SUCCESS"
+          else
+            echo "Status: ${{ job.status }}"
+          fi
           
