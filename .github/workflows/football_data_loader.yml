@@ -30,10 +30,12 @@ on:
         required: false
         default: false
 
-# FIX-3: Concurrency — предотвращает двойную запись в Redis
+permissions:
+  contents: read
+
 concurrency:
   group: football-data-loader
-  cancel-in-progress: false
+  cancel-in-progress: false  # TODO: изменить на true после внедрения idempotency_key (Фаза 2)
 
 jobs:
   load:
@@ -41,19 +43,17 @@ jobs:
     timeout-minutes: 180
 
     env:
+      PYTHON_VERSION: '3.12'
       SEASONS_INPUT: ${{ github.event.inputs.seasons }}
       LEAGUES_INPUT: ${{ github.event.inputs.leagues }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days }}
       LIMIT_INPUT: ${{ github.event.inputs.limit }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
       FLUSH_INPUT: ${{ github.event.inputs.flush }}
-      # FIX-1: SHARED_* — для redis_hub (транспортный слой)
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-      # FIX-1: UPSTASH_* — для verify-шага (прямой доступ)
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-      # FIX-5: Путь к gatekeeper_config.yaml
       GK_CONFIG_FILE: gatekeeper_config.yaml
       PYTHONUNBUFFERED: "1"
 
@@ -64,18 +64,17 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          # FIX-2: 3.12 — единая версия для всех workflow
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
       - name: Install dependencies
         run: |
-          pip install pyyaml requests
+          pip install -r requirements.txt
 
       - name: Flush old keys (optional)
         if: ${{ github.event.inputs.flush == 'true' }}
         run: |
-          echo "Flushing football_data:* keys..."
+          echo "Flushing football_data:* and history:* keys..."
           python -c "
           import os, json, urllib.request
           URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '').rstrip('/')
@@ -96,24 +95,26 @@ jobs:
               )
               with urllib.request.urlopen(req, timeout=30) as r:
                   return json.loads(r.read()).get('result')
-          # SCAN + DEL football_data:* keys
-          cursor = '0'
-          deleted = 0
-          while True:
-              result = cmd('SCAN', cursor, 'MATCH', 'football_data:*', 'COUNT', 100)
-              cursor = result[0]
-              keys = result[1]
-              if keys:
-                  cmd('DEL', *keys)
-                  deleted += len(keys)
-              if cursor == '0':
-                  break
-          print(f'Flushed {deleted} football_data:* keys')
+          patterns = ['football_data:*', 'history:match:*', 'history:league:*']
+          total_deleted = 0
+          for pattern in patterns:
+              cursor = '0'
+              deleted = 0
+              while True:
+                  result = cmd('SCAN', cursor, 'MATCH', pattern, 'COUNT', 100)
+                  cursor = result[0]
+                  keys = result[1]
+                  if keys:
+                      cmd('DEL', *keys)
+                      deleted += len(keys)
+                  if cursor == '0':
+                      break
+              print(f'  {pattern}: flushed {deleted} keys')
+              total_deleted += deleted
+          print(f'Total flushed: {total_deleted} keys')
           "
 
       - name: Run Football Data Collector
-        env:
-          PYTHONUNBUFFERED: "1"
         run: |
           DRY_FLAG=""
           if [ "${DRY_RUN_INPUT}" = "true" ]; then
@@ -127,16 +128,13 @@ jobs:
             ${DRY_FLAG}
 
       - name: Verify Redis data
-        if: success()
-        env:
-          PYTHONUNBUFFERED: "1"
+        if: always()
         timeout-minutes: 10
         run: |
           python -c "
           import os, json, urllib.request, sys
           from datetime import datetime, timezone
 
-          # FIX-1: Prefer SHARED_* (redis_hub), fallback UPSTASH_*
           URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '') or os.environ.get('UPSTASH_REDIS_REST_URL', '')
           URL = URL.rstrip('/')
           TOKEN = os.environ.get('SHARED_UPSTASH_REDIS_REST_TOKEN', '') or os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
@@ -228,7 +226,6 @@ jobs:
                       print(f'  Schema version: {m.get("schema_version")}')
                       print(f'  Season: {m.get("season")}')
 
-                      # FIX-6: Verify odds are float (not str)
                       odds = m.get('odds', {}).get('1x2', {})
                       current = odds.get('current', {})
                       if current:
@@ -255,8 +252,6 @@ jobs:
 
       - name: Summary
         if: always()
-        env:
-          PYTHONUNBUFFERED: "1"
         run: |
           echo "=== Football Data Loader Summary ==="
           echo "Seasons: ${SEASONS_INPUT:-auto}"
@@ -270,3 +265,4 @@ jobs:
             echo "Run ID: ${{ github.run_id }}"
             echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
+          
