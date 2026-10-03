@@ -21,19 +21,18 @@ jobs:
       with:
         python-version: '3.12'
 
-    - name: Install Poetry
-      uses: python-poetry/poetry-action@v3
-      with:
-        virtualenvs-create: false
-
     - name: Install dependencies
       run: |
-        poetry config virtualenvs.create false
-        poetry install
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
 
     - name: Run tests
       run: |
-        poetry run pytest
+        pytest
+
+    - name: Generate HTML report
+      run: |
+        pytest --html=test-reports/report.html --self-contained-html
 
     - name: Upload test results
       uses: actions/upload-artifact@v4
