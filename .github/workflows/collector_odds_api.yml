@@ -38,12 +38,6 @@ jobs:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          ODDS_API_REGIONS: ${{ vars.ODDS_API_REGIONS || 'eu,uk' }}
-          ODDS_API_MARKETS: ${{ vars.ODDS_API_MARKETS || 'h2h' }}
-          ODDS_API_ODDS_FORMAT: ${{ vars.ODDS_API_ODDS_FORMAT || 'decimal' }}
-          ODDS_API_RATE_DELAY: ${{ vars.ODDS_API_RATE_DELAY || '1.0' }}
-          ODDS_API_MAX_RETRIES: ${{ vars.ODDS_API_MAX_RETRIES || '1' }}
-          ODDS_API_DAYS_AHEAD: '3'  # Добавлен параметр
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PYTHONUNBUFFERED: '1'
