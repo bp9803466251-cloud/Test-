@@ -1,0 +1,21 @@
+groups:
+  - name: gatekeeper_alerts
+    rules:
+      - alert: HighRequestLatency
+        expr: job:http_duration:p99 > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая задержка API"
+          description: "P99 latency превышает 2 секунды"
+
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Высокий процент ошибок"
+          description: "Более 5% ошибок в запросах"
+          
