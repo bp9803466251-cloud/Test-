@@ -1,72 +1,136 @@
-name: Sports Data Pipeline
+# ═══════════════════════════════════════════════════════════════════════
+# GatekeeperAI — Sports Pipeline (§24.7 оркестрация)
+# Stage 1 (parallel): sharpapi + odds_api
+# Stage 2:            bzzoiro       (needs: sharpapi)
+# Stage 3:            propline      (needs: sharpapi, odds_api)
+# Stage 4:            contract-tests (needs: all)
+# ═══════════════════════════════════════════════════════════════════════
+
+name: Sports Pipeline
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "15 */3 * * *"
+    inputs:
+      debug:
+        description: 'Debug mode'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
 
 env:
-  PYTHON_VERSION: "3.12"
+  PYTHON_VERSION: '3.12'
 
 permissions:
   contents: read
 
-concurrency:
-  group: gatekeeper-redis
-  cancel-in-progress: false
-
 jobs:
-  run-pipeline:
+  # ── Stage 1: Parallel — нет зависимостей ───────────────────────────
+  sharpapi:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-
-      - name: Install Dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Source Diagnostics
+      - run: python collector_sharpapi.py
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
-          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          python source_diagnostics.py
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
+          SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '1.0' }}
+          SHARPAPI_MAX_PAGES: ${{ vars.SHARPAPI_MAX_PAGES || '5' }}
 
-      - name: Run ETL Pipeline
+  odds_api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - run: python collector_odds_api.py
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
-          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          ODDS_API_RATE_DELAY: ${{ vars.ODDS_API_RATE_DELAY || '1.0' }}
+          ODDS_API_REGIONS: ${{ vars.ODDS_API_REGIONS || 'eu' }}
+          ODDS_API_MARKETS: ${{ vars.ODDS_API_MARKETS || 'h2h,totals,spreads' }}
+          ODDS_API_ODDS_FORMAT: ${{ vars.ODDS_API_ODDS_FORMAT || 'decimal' }}
+
+  # ── Stage 2: Bzzoiro — enrichment после SharpAPI ───────────────────
+  bzzoiro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [sharpapi]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - run: python collector_bzzoiro.py
+        env:
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+          BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || '2.0' }}
+          BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || '1.0' }}
+          BZZOIRO_MAX_RETRIES: ${{ vars.BZZOIRO_MAX_RETRIES || '3' }}
+
+  # ── Stage 3: Propline — value analysis после SharpAPI + OddsAPI ─────
+  propline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [sharpapi, odds_api]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - run: python collector_propline.py
+        env:
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
-          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          SEARCH_MIN_COMPLETENESS: "0.25"
-          VALUE_BET_THRESHOLD: "0.03"
-          # v700: verification по upstream, не по списку источников
-          GATEKEEPER_VERIFIED_SOURCES: "sharpapi,propline,bzzoiro,odds_api,oddsapi"
-        run: |
-          python main.py
-          
+          PROPLINE_RATE_DELAY: ${{ vars.PROPLINE_RATE_DELAY || '1.5' }}
+          PROPLINE_MAX_RETRIES: ${{ vars.PROPLINE_MAX_RETRIES || '3' }}
+
+  # ── Stage 4: Contract tests — после всех коллекторов ───────────────
+  contract-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [sharpapi, odds_api, bzzoiro, propline]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Run contract tests
+        run: make test
+      - name: Config check
+        run: make config-check
+      - name: Hub version
+        run: make check-version
+        
