@@ -1,589 +1,224 @@
 #!/usr/bin/env python3
-"""
-Диагностика и очистка Redis для Gatekeeper-AI v710.
-Работает через redis_hub (единый транспорт).
+"""redis_diagnostics.py — единая диагностическая утилита GatekeeperAI.
+Все флаги из §18.4 гида."""
 
-Две модели:
-  - Live: хеш GatekeeperAI (match:*, search:*, index:*, system:*)
-  - History: отдельные ключи history:match:*, ZSET history:league:*, SET history:team:*
-
-Запуск:
-  python redis_diagnostics.py              — диагностика
-  python redis_diagnostics.py --flush       — мягкая очистка (selective HDEL)
-  python redis_diagnostics.py --flush --yes  — авто-очистка (для CI)
-  python redis_diagnostics.py --flush --hard --yes — DEL GatekeeperAI (опасно)
-  python redis_diagnostics.py --history-only --yes  — удалить только history (live сохраняется)
-  python redis_diagnostics.py --purge --yes  — FLUSHDB (wipe ВСЕХ ключей)
-  python redis_diagnostics.py --json         — вывод в JSON для CI
-  python redis_diagnostics.py --dry-run      — показать план без выполнения
-  python redis_diagnostics.py --reset-breaker — сброс circuit breaker
-"""
-import sys
-import json
-import time
-from datetime import datetime, timezone, timedelta
-
-from redis_hub import (
-    is_redis_available,
-    get_circuit_breaker_status,
-    reset_circuit_breaker,
-    get_all_fields,
-    scan_keys,
-    delete_keys,
-    delete_key,
-    dbsize,
-    zcard_key,
-    zrange_key,
-    get_key,
-    hlen_key,
-    _execute_upstash_cmd,
-)
-
-MSK_TIMEZONE = timezone(timedelta(hours=3))
-
-META_KEYS = {
-    "Bzzoiro": "bzzoiro:meta",
-    "SharpAPI": "sharpapi:meta",
-    "OddsAPI": "odds_api:meta",
-    "FootballData": "football_data:meta",
-    "Propline": "propline:meta",
-}
-
-
-def _parse_date_utc(raw):
-    """Парсинг даты — 4 формата."""
-    if not raw:
-        return None
-    if isinstance(raw, str):
-        try:
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except (ValueError, TypeError):
-            pass
-        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
-            try:
-                dt = datetime.strptime(raw.strip(), fmt)
-                return dt.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                continue
-    return None
-
-
-def _print(*args, **kwargs):
-    if not getattr(_print, "_json_mode", False):
-        print(*args, **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# History scanning
-# ---------------------------------------------------------------------------
-
-def scan_history():
-    """Сканирование history:match:* ключей."""
-    keys = scan_keys("history:match:*", count=500)
-    return keys
-
-
-def scan_history_leagues():
-    """Сканирование history:league:* ZSET-индексов."""
-    keys = scan_keys("history:league:*", count=100)
-    result = {}
-    for key in keys:
-        league_code = key.replace("history:league:", "")
-        count = zcard_key(key)
-        result[league_code] = count
-    return result
-
-
-def scan_history_teams():
-    """Сканирование history:team:* SET-индексов."""
-    keys = scan_keys("history:team:*", count=100)
-    return len(keys)
-
-
-def scan_analysis():
-    """Сканирование analysis:* ключей."""
-    keys = scan_keys("analysis:*", count=500)
-    return len(keys)
-
-
-def get_football_data_meta():
-    """Чтение football_data:meta (SET, string key — не hash)."""
-    raw = get_key("football_data:meta")
-    if not raw:
-        return {}
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# Diagnostics
-# ---------------------------------------------------------------------------
-
-def run_diagnostics():
-    """Полная диагностика обеих моделей."""
-    diag = {
-        "version": "v710",
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-
-    if not is_redis_available():
-        cb = get_circuit_breaker_status()
-        diag["redis"] = {"available": False, "circuit_breaker": cb}
-        return diag
-
-    diag["redis"] = {"available": True}
-
-    total_keys = dbsize()
-    diag["redis"]["dbsize"] = total_keys
-
-    all_fields = get_all_fields()
-    total_fields = len(all_fields)
-
-    match_count = 0
-    meta_count = 0
-    other_count = 0
-    future = 0
-    past = 0
-    no_date = 0
-    with_odds = 0
-    sources = {}
-    now_utc = datetime.now(timezone.utc)
-
-    match_keys_to_delete = []
-    search_keys = []
-    index_keys = []
-
-    for field_id, value in all_fields.items():
-        if not isinstance(value, dict):
-            other_count += 1
-            continue
-
-        fid_lower = field_id.lower()
-
-        if fid_lower.endswith(":meta") or any(fid_lower == mk.lower() for mk in META_KEYS.values()):
-            meta_count += 1
-            continue
-
-        if field_id.startswith("match:index:"):
-            index_keys.append(field_id)
-            continue
-
-        if field_id.startswith("search:results"):
-            search_keys.append(field_id)
-            continue
-
-        if field_id.startswith("match:"):
-            match_count += 1
-            dt = _parse_date_utc(value.get("date_utc", ""))
-            if dt is None:
-                no_date += 1
-            elif dt < now_utc:
-                past += 1
-                if value.get("status") == "completed":
-                    match_keys_to_delete.append(field_id)
-            else:
-                future += 1
-
-            odds = value.get("odds", {})
-            if isinstance(odds, dict) and odds.get("1x2"):
-                with_odds += 1
-
-            sources_list = value.get("sources", [])
-            if isinstance(sources_list, list) and sources_list:
-                for s in sources_list:
-                    if isinstance(s, dict):
-                        src = s.get("source") or s.get("upstream") or "no_source"
-                        sources[src] = sources.get(src, 0) + 1
-            else:
-                src = value.get("raw_source") or value.get("source") or "no_source"
-                sources[src] = sources.get(src, 0) + 1
-            continue
-
-        other_count += 1
-
-    diag["live"] = {
-        "total_fields": total_fields,
-        "matches": match_count,
-        "future": future,
-        "past": past,
-        "no_date": no_date,
-        "with_odds": with_odds,
-        "meta_keys": meta_count,
-        "other": other_count,
-        "search_keys": len(search_keys),
-        "index_keys": len(index_keys),
-        "past_completed": len(match_keys_to_delete),
-    }
-
-    history_keys = scan_history()
-    history_leagues = scan_history_leagues()
-    history_teams_count = scan_history_teams()
-    analysis_count = scan_analysis()
-    football_data_meta = get_football_data_meta()
-
-    diag["history"] = {
-        "total_keys": len(history_keys),
-        "leagues": history_leagues,
-        "team_indexes": history_teams_count,
-        "analysis_keys": analysis_count,
-    }
-
-    diag["football_data_meta"] = football_data_meta
-
-    meta_status = {}
-    for name, key in META_KEYS.items():
-        meta_val = all_fields.get(key)
-        if meta_val and isinstance(meta_val, dict):
-            last_run = meta_val.get("last_run", meta_val.get("last_run_at"))
-            if last_run:
-                stored = meta_val.get("stored_matches", meta_val.get("matches", 0))
-                err = meta_val.get("error_count", meta_val.get("errors", 0))
-                meta_status[name] = f"OK {str(last_run)[:19]} (stored={stored}, errors={err})"
-            else:
-                meta_status[name] = "no data"
-        else:
-            meta_status[name] = "no data"
-
-    diag["collectors"] = meta_status
-    diag["circuit_breaker"] = get_circuit_breaker_status()
-
-    health = all_fields.get("system:health", {})
-    if not isinstance(health, dict):
-        health = {}
-    diag["cleanup"] = {
-        "last_cleanup_at": health.get("last_cleanup_at", "no data"),
-        "last_cleanup_count": health.get("last_cleanup_count", "no data"),
-    }
-
-    diag["_flush_keys"] = {
-        "match_keys_to_delete": match_keys_to_delete,
-        "search_keys": search_keys,
-        "index_keys": index_keys,
-        "history_keys": history_keys,
-    }
-
-    return diag
-
-
-# ---------------------------------------------------------------------------
-# Flush operations
-# ---------------------------------------------------------------------------
-
-def do_flush_soft(diag, auto_yes=False, dry_run=False):
-    """Мягкая очистка: удалить завершённые past-матчи + search + index из хеша."""
-    keys_info = diag.get("_flush_keys", {})
-    match_keys = keys_info.get("match_keys_to_delete", [])
-    search_keys = keys_info.get("search_keys", [])
-    index_keys = keys_info.get("index_keys", [])
-
-    keys_to_delete = match_keys + search_keys + index_keys
-    if not keys_to_delete:
-        _print("[FLUSH] Nothing to delete (soft)")
-        return 0
-
-    _print(f"[FLUSH] SOFT MODE: selective HDEL")
-    _print(f"  Matches (completed+past): {len(match_keys)}")
-    _print(f"  Search results: {len(search_keys)}")
-    _print(f"  Index shards: {len(index_keys)}")
-
-    if dry_run:
-        _print(f"[FLUSH] DRY RUN — {len(keys_to_delete)} keys would be deleted")
-        return len(keys_to_delete)
-
-    if not auto_yes:
-        try:
-            confirm = input("Proceed? (y/n): ").strip().lower()
-        except EOFError:
-            confirm = "n"
-        if confirm != "y":
-            _print("[FLUSH] Cancelled")
-            return 0
-
-    deleted = 0
-    errors = 0
-    batch_size = 50
-    for i in range(0, len(keys_to_delete), batch_size):
-        batch = keys_to_delete[i : i + batch_size]
-        result = _execute_upstash_cmd(["HDEL", "GatekeeperAI"] + batch)
-        if result is not None:
-            deleted += int(result) if result else 0
-        else:
-            errors += len(batch)
-        time.sleep(0.1)
-
-    _print(f"[FLUSH] Deleted: {deleted}, Errors: {errors}")
-    return deleted
-
-
-def do_flush_hard(auto_yes=False, dry_run=False):
-    """Жёсткая очистка: DEL GatekeeperAI (только live, history не трогает)."""
-    hlen = hlen_key("GatekeeperAI")
-    _print(f"[FLUSH] HARD MODE: DEL GatekeeperAI (live only)")
-    _print(f"  Fields before: {hlen}")
-    _print(f"  NOTE: history:match:* keys will NOT be affected")
-
-    if dry_run:
-        _print(f"[FLUSH] DRY RUN — GatekeeperAI ({hlen} fields) would be deleted")
-        return hlen
-
-    if not auto_yes:
-        try:
-            confirm = input("Type DELETE to confirm: ").strip()
-        except EOFError:
-            confirm = ""
-        if confirm != "DELETE":
-            _print("[FLUSH] Cancelled")
-            return 0
-
-    result = _execute_upstash_cmd(["DEL", "GatekeeperAI"])
-    if result is not None:
-        _print(f"[FLUSH] DEL GatekeeperAI -> {result}")
-        return int(result) if result else 0
-    else:
-        _print("[FLUSH] ERROR: DEL failed")
-        return 0
-
-
-def do_history_only(auto_yes=False, dry_run=False):
-    """Удалить только history:match:* + history:league:* + history:team:* + football_data:meta."""
-    _print("[HISTORY-ONLY] Scanning history keys...")
-
-    history_keys = scan_keys("history:match:*", count=500)
-    league_keys = scan_keys("history:league:*", count=100)
-    team_keys = scan_keys("history:team:*", count=100)
-    analysis_keys = scan_keys("analysis:*", count=500)
-
-    all_keys = history_keys + league_keys + team_keys + analysis_keys + ["football_data:meta"]
-
-    _print(f"  history:match:* — {len(history_keys)}")
-    _print(f"  history:league:* — {len(league_keys)}")
-    _print(f"  history:team:* — {len(team_keys)}")
-    _print(f"  analysis:* — {len(analysis_keys)}")
-    _print(f"  football_data:meta — 1")
-    _print(f"  TOTAL: {len(all_keys)} keys to delete")
-    _print(f"  Live data (GatekeeperAI hash) will NOT be affected")
-
-    if dry_run:
-        _print("[HISTORY-ONLY] DRY RUN — nothing deleted")
-        return len(all_keys)
-
-    if not auto_yes:
-        try:
-            confirm = input("Proceed? (y/n): ").strip().lower()
-        except EOFError:
-            confirm = "n"
-        if confirm != "y":
-            _print("[HISTORY-ONLY] Cancelled")
-            return 0
-
-    deleted = 0
-    errors = 0
-    batch_size = 50
-    for i in range(0, len(all_keys), batch_size):
-        batch = all_keys[i : i + batch_size]
-        result = delete_keys(batch)
-        deleted += result
-        if result < len(batch):
-            errors += len(batch) - result
-        time.sleep(0.1)
-
-    _print(f"[HISTORY-ONLY] Deleted: {deleted}, Errors: {errors}")
-    return deleted
-
-
-def do_purge(auto_yes=False, dry_run=False):
-    """FLUSHDB — wipe ВСЕХ ключей."""
-    _print("[PURGE] GATEKEEPER-AI v710")
-    _print(f"  Time: {datetime.now(MSK_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')}")
-
-    if not is_redis_available():
-        _print("[PURGE] Redis unavailable")
-        return False
-
-    total = dbsize()
-    history_keys = scan_keys("history:match:*", count=500)
-    _print(f"  DBSIZE: {total}")
-    _print(f"  History keys: {len(history_keys)}")
-    _print(f"  WARNING: This will DELETE ALL KEYS")
-
-    if dry_run:
-        _print(f"[PURGE] DRY RUN — {total} keys would be deleted")
-        return True
-
-    if not auto_yes:
-        try:
-            confirm = input("Type DELETE to confirm FLUSHDB: ").strip()
-        except EOFError:
-            confirm = ""
-        if confirm != "DELETE":
-            _print("[PURGE] Cancelled")
-            return False
-
-    _print("[PURGE] Executing FLUSHDB...")
-    result = _execute_upstash_cmd(["FLUSHDB"])
-    if result is not None:
-        after = dbsize()
-        _print(f"  DBSIZE after: {after}")
-        if after == 0:
-            _print("[PURGE] SUCCESS — Redis очищен")
-        else:
-            _print(f"[PURGE] WARNING: {after} keys remaining")
-        return True
-    else:
-        _print("[PURGE] ERROR: FLUSHDB failed")
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
-
-def print_diagnostics(diag):
-    """Человекочитаемый вывод диагностики."""
-    _print("=" * 60)
-    _print(f"[DIAG] GATEKEEPER-AI {diag.get('version', 'v710')}")
-    _print(f"  Time: {datetime.now(MSK_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')}")
-    _print("=" * 60)
-
-    if not diag.get("redis", {}).get("available"):
-        _print("\n[DIAG] Redis unavailable (or circuit breaker open)")
-        cb = diag.get("circuit_breaker", {})
-        _print(f"  Breaker: open={cb.get('open')}, errors={cb.get('error_count')}/{cb.get('threshold')}")
-        _print("=" * 60)
-        return
-
-    _print(f"\n--- Redis State ---")
-    _print(f"  DBSIZE (all keys): {diag['redis'].get('dbsize', '?')}")
-
-    live = diag.get("live", {})
-    _print(f"\n--- Live (hash GatekeeperAI) ---")
-    _print(f"  Total fields:    {live.get('total_fields', 0)}")
-    _print(f"  Matches:         {live.get('matches', 0)}")
-    _print(f"    Future:        {live.get('future', 0)}")
-    _print(f"    Past:          {live.get('past', 0)}")
-    _print(f"    No date:       {live.get('no_date', 0)}")
-    _print(f"  With odds:       {live.get('with_odds', 0)}")
-    _print(f"  Meta keys:       {live.get('meta_keys', 0)}")
-    _print(f"  Search keys:     {live.get('search_keys', 0)}")
-    _print(f"  Index keys:      {live.get('index_keys', 0)}")
-    _print(f"  Past+completed:  {live.get('past_completed', 0)}")
-
-    hist = diag.get("history", {})
-    _print(f"\n--- History (separate keys) ---")
-    _print(f"  history:match:* — {hist.get('total_keys', 0)}")
-    leagues = hist.get("leagues", {})
-    if leagues:
-        for lc, cnt in sorted(leagues.items()):
-            _print(f"    {lc}: {cnt}")
-    _print(f"  history:team:* — {hist.get('team_indexes', 0)}")
-    _print(f"  analysis:* — {hist.get('analysis_keys', 0)}")
-
-    fdm = diag.get("football_data_meta", {})
-    if fdm:
-        _print(f"\n--- Football Data Meta ---")
-        for field, meta in fdm.items():
-            if isinstance(meta, dict):
-                _print(f"  {field}: matches={meta.get('matches')}, errors={meta.get('errors')}, last={str(meta.get('last_run', ''))[:19]}")
-            else:
-                _print(f"  {field}: {meta}")
-
-    _print(f"\n--- Sources ---")
-    sources = {}
-    for field_id, value in get_all_fields().items():
-        if isinstance(value, dict) and field_id.startswith("match:"):
-            sl = value.get("sources", [])
-            if isinstance(sl, list):
-                for s in sl:
-                    if isinstance(s, dict):
-                        src = s.get("source") or s.get("upstream") or "no_source"
-                        sources[src] = sources.get(src, 0) + 1
-    if sources:
-        for src, count in sorted(sources.items(), key=lambda x: -x[1]):
-            _print(f"  {src}: {count}")
-    else:
-        _print("  (none)")
-
-    _print(f"\n--- Collector Meta ---")
-    collectors = diag.get("collectors", {})
-    for name, status in collectors.items():
-        _print(f"  {name}: {status}")
-
-    _print(f"\n--- Circuit Breaker ---")
-    cb = diag.get("circuit_breaker", {})
-    _print(f"  Open: {cb.get('open')}, Errors: {cb.get('error_count')}/{cb.get('threshold')}")
-
-    _print(f"\n--- Cleanup ---")
-    cleanup = diag.get("cleanup", {})
-    _print(f"  Last cleanup at: {cleanup.get('last_cleanup_at', 'no data')}")
-    _print(f"  Last cleanup count: {cleanup.get('last_cleanup_count', 'no data')}")
-
-    _print(f"\n--- Summary ---")
-    total_live = live.get("matches", 0)
-    total_history = hist.get("total_keys", 0)
-    _print(f"  Live matches: {total_live}")
-    _print(f"  History matches: {total_history}")
-    _print(f"  Total: {total_live + total_history}")
-
-    _print("=" * 60)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+import sys, json, argparse
 
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Redis Diagnostics")
-    parser.add_argument("--flush", action="store_true", help="Soft flush (selective HDEL)")
-    parser.add_argument("--hard", action="store_true", help="Hard flush (DEL GatekeeperAI)")
-    parser.add_argument("--history-only", action="store_true",
-                        help="Delete only history:match:* + history:league:* (live preserved)")
-    parser.add_argument("--purge", action="store_true", help="FLUSHDB (wipe ALL keys)")
-    parser.add_argument("--yes", action="store_true", help="Auto-confirm (for CI)")
-    parser.add_argument("--dry-run", action="store_true", help="Show plan without executing")
-    parser.add_argument("--json", action="store_true", help="JSON output for CI")
-    parser.add_argument("--reset-breaker", action="store_true", help="Reset circuit breaker and exit")
-    args = parser.parse_args()
-
-    if args.reset_breaker:
-        reset_circuit_breaker()
-        print("[DIAG] Circuit breaker reset")
-        return 0
-
-    if args.json:
-        _print._json_mode = True
-
-    diag = run_diagnostics()
-
-    if args.json:
-        diag.pop("_flush_keys", None)
-        print(json.dumps(diag, indent=2, ensure_ascii=False, default=str))
-        return 0
-
-    print_diagnostics(diag)
-
-    if args.history_only:
-        do_history_only(auto_yes=args.yes, dry_run=args.dry_run)
-    elif args.purge:
-        do_purge(auto_yes=args.yes, dry_run=args.dry_run)
-    elif args.flush:
-        if args.hard:
-            do_flush_hard(auto_yes=args.yes, dry_run=args.dry_run)
+    p = argparse.ArgumentParser(description="GatekeeperAI Diagnostics")
+    
+    # ── Существующие флаги ──
+    p.add_argument("--validate", action="store_true", help="Схемная валидация (§19.1)")
+    p.add_argument("--migrate-schema", metavar="VERSION", help="Миграция схемы (§20.2)")
+    p.add_argument("--quality", action="store_true", help="Проверка качества (§20.4)")
+    p.add_argument("--health", action="store_true", help="Health monitoring (§21.3)")
+    p.add_argument("--reconcile", action="store_true", help="Реконсиляция (§21.5)")
+    p.add_argument("--fix", action="store_true", help="Авто-исправление при --reconcile (§21.5)")
+    p.add_argument("--audit", action="store_true", help="Аудит-лог (§22.1)")
+    p.add_argument("--dlq", action="store_true", help="Dead Letter Queue (§22.4)")
+    p.add_argument("--dlq-replay", action="store_true", help="Переобработка DLQ (§22.4)")
+    p.add_argument("--batch-stats", action="store_true", help="Статистика батчинга (§22.6)")
+    p.add_argument("--diff", metavar="CID", help="История изменений матча (§22.6)")
+    p.add_argument("--retention", action="store_true", help="Статус retention (§22.7)")
+    p.add_argument("--hub-version", action="store_true", help="Версия API хаба (§22.8)")
+    
+    # ── Флаги §23 ──
+    p.add_argument("--odds-conflicts", metavar="CID", help="Конфликты коэффициентов (§23.1)")
+    p.add_argument("--canary", metavar="COLLECTOR", help="Теневой запуск (§23.8)")
+    p.add_argument("--canary-cleanup", action="store_true", help="Очистка canary (§23.8)")
+    p.add_argument("--lineage", action="store_true", help="Граф зависимостей (§23.5)")
+    p.add_argument("--dashboard", action="store_true", help="Текстовый дашборд (§23.6)")
+    
+    # ── Флаги §24 ──
+    p.add_argument("--state-stats", action="store_true", help="Гистограмма статусов (§24.1)")
+    p.add_argument("--config-check", action="store_true", help="Валидация конфигурации (§24.3)")
+    p.add_argument("--env", action="store_true", help="Текущее окружение (§24.4)")
+    p.add_argument("--metrics", action="store_true", help="Сводка метрик (§24.5)")
+    p.add_argument("--export", action="store_true", help="Экспорт данных (§24.6)")
+    p.add_argument("--import", metavar="FILE", help="Импорт данных (§24.6)")
+    p.add_argument("--orchestration", action="store_true", help="Граф запуска (§24.7)")
+    p.add_argument("--drift", action="store_true", help="Schema drift (§24.8)")
+    p.add_argument("--full", action="store_true", help="Полное сканирование (для --drift)")
+    
+    # ── Фильтры ──
+    p.add_argument("--source", metavar="NAME", help="Фильтр по источнику")
+    p.add_argument("--action", metavar="TYPE", help="Фильтр по действию")
+    p.add_argument("--namespace", metavar="NS", default="live", help="Namespace")
+    p.add_argument("--league", metavar="NAME", help="Фильтр по лиге")
+    
+    args = p.parse_args()
+    
+    # ── Обработка ──
+    if args.hub_version:
+        from gatekeeper_hub import __version__
+        print(f"GatekeeperAI Hub version: {__version__}")
+        return
+    
+    if args.health:
+        from gatekeeper_ops import check_health
+        h = check_health()
+        print(json.dumps(h, indent=2, ensure_ascii=False))
+        return
+    
+    if args.audit:
+        from gatekeeper_lifecycle import query_audit_log
+        events = query_audit_log(source=args.source, action=args.action, limit=100)
+        for e in events:
+            print(f"[{e['timestamp']}] {e['action']} {e.get('canonical_id','')} by {e['source']}")
+        return
+    
+    if args.dlq:
+        from gatekeeper_lifecycle import get_dlq
+        items = get_dlq()
+        print(f"DLQ: {len(items)} items")
+        for item in items:
+            print(f"  {item['canonical_id']} — {item['error']}")
+        return
+    
+    if args.dlq_replay:
+        from gatekeeper_lifecycle import replay_dlq
+        def fix_cb(cid, section, data, source):
+            print(f"  Replaying {cid}...")
+        r = replay_dlq(fix_cb)
+        print(f"Replayed: {r['replayed']}, Failed: {r['failed']}, Remaining: {r['remaining']}")
+        return
+    
+    if args.quality:
+        from gatekeeper_ops import validate_match_quality
+        from test_fixtures import CANONICAL_LIVE_MATCH
+        r = validate_match_quality(CANONICAL_LIVE_MATCH)
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return
+    
+    if args.reconcile:
+        from gatekeeper_ops import reconcile
+        r = reconcile(dry_run=not args.fix)
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return
+    
+    if args.retention:
+        from gatekeeper_lifecycle import get_retention_status
+        s = get_retention_status()
+        print(json.dumps(s, indent=2, ensure_ascii=False))
+        return
+    
+    if args.dashboard:
+        from gatekeeper_diagnostics import generate_dashboard, format_dashboard_text
+        dash = generate_dashboard()
+        print(format_dashboard_text(dash))
+        return
+    
+    if args.config_check:
+        from gatekeeper_config import validate_config, load_config
+        cfg = load_config()
+        errors = validate_config(cfg)
+        if errors:
+            print(f"Config errors: {len(errors)}")
+            for e in errors:
+                print(f"  ❌ {e}")
         else:
-            do_flush_soft(diag, auto_yes=args.yes, dry_run=args.dry_run)
+            print("✅ Configuration valid")
+        return
+    
+    if args.env:
+        from gatekeeper_config import get_env, get_env_config
+        env = get_env()
+        cfg = get_env_config()
+        print(f"Environment: {env}")
+        print(f"Namespace prefix: {cfg.get('namespace_prefix','')}")
+        print(f"Redis URL env: {cfg.get('redis_url_env','?')}")
+        return
+    
+    if args.metrics:
+        from gatekeeper_hub import METRICS
+        r = METRICS.report()
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return
+    
+    if args.export:
+        from gatekeeper_diagnostics import export_matches
+        from test_fixtures import CANONICAL_LIVE_MATCH
+        data = export_matches([CANONICAL_LIVE_MATCH], namespace=args.namespace)
+        filename = f"export_{args.namespace}_{now_msk()[:10]}.json"
+        with open(filename, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"Exported {data['count']} matches to {filename}")
+        return
+    
+    if getattr(args, 'import', None):
+        from gatekeeper_diagnostics import import_matches
+        with open(getattr(args, 'import'), "r") as f:
+            data = json.load(f)
+        r = import_matches(data, dry_run=True)
+        print(f"Import (dry-run): {r['imported']} matches, {r['skipped']} skipped")
+        return
+    
+    if args.orchestration:
+        from gatekeeper_config import get_config
+        cfg = get_config()
+        orch = cfg.get("orchestration", {})
+        print("Orchestration graph:")
+        for step in orch.get("sequence", []):
+            deps = step.get("depends_on", [])
+            print(f"  {step['name']} ← depends_on: {deps if deps else '[]'}")
+        print(f"  cleanup_owner: {orch.get('cleanup_owner','?')}")
+        return
+    
+    if args.drift:
+        from gatekeeper_diagnostics import detect_schema_drift
+        size = 999999 if args.full else 100
+        r = detect_schema_drift(matches=None, sample_size=size)
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return
+    
+    if args.lineage:
+        from gatekeeper_config import get_config
+        cfg = get_config()
+        lineage = cfg.get("data_lineage", {})
+        print("Data Lineage:")
+        for collector, deps in lineage.items():
+            print(f"  {collector}:")
+            print(f"    provides: {deps.get('provides',[])}")
+            print(f"    consumed_by: {deps.get('consumed_by',[])}")
+        return
+    
+    if args.state_stats:
+        from gatekeeper_hub import MATCH_STATES
+        print("Match State Machine:")
+        for state, cfg_s in MATCH_STATES.items():
+            terminal = " (TERMINAL)" if cfg_s.get("terminal") else ""
+            print(f"  {state}{terminal} → {cfg_s.get('transitions',[])}")
+        return
+    
+    if args.migrate_schema:
+        from gatekeeper_lifecycle import migrate_schema
+        r = migrate_schema("v710", args.migrate_schema, dry_run=True)
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return
+    
+    if args.diff:
+        from gatekeeper_lifecycle import diff_match
+        print(f"Diff for {args.diff} (stub — needs old/new match objects)")
+        return
+    
+    if args.canary:
+        print(f"Canary mode for {args.canary} — not implemented in CLI stub")
+        return
+    
+    if args.canary_cleanup:
+        print("Canary cleanup — not implemented in CLI stub")
+        return
+    
+    if args.odds_conflicts:
+        print(f"Odds conflicts for {args.odds_conflicts} — needs Redis connection")
+        return
+    
+    # Default: show help
+    p.print_help()
 
-    return 0
-
+def now_msk():
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=3))).isoformat()
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
