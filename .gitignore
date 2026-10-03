@@ -24,3 +24,51 @@ canary_*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Временные файлы
+*.tmp
+*.bak
+*.swp
+*.log
+
+# Отчеты тестирования
+htmlcov/
+.pytest_cache/
+.coverage
+coverage.xml
+
+# Build artifacts
+*.egg
+*.whl
+*.zip
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Docker
+docker-compose.override.yml
+
+# Документация
+docs/_build/
+
+# Локализация
+locale/mo/
+
+# Статистика
+stats.json
+
+# Временные директории
+temp/
+tmp/
+
+# Специфичные для проекта
+/data/
+/logs/
+/cache/
+
+# Исключения (если нужно)
+# !important-file.py
+# !data/important-data.json
