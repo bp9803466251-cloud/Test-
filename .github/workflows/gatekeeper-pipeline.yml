@@ -1,0 +1,65 @@
+name: Gatekeeper Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    env:
+      SHARED_REDIS_HOST: ${{ secrets.SHARED_REDIS_HOST }}
+      SHARED_REDIS_PORT: ${{ secrets.SHARED_REDIS_PORT }}
+      SHARED_TELEGRAM_BOT_TOKEN: ${{ secrets.SHARED_TELEGRAM_BOT_TOKEN }}
+      SHARED_TELEGRAM_CHAT_ID: ${{ secrets.SHARED_TELEGRAM_CHAT_ID }}
+      SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.local
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install --no-cache-dir -r requirements.txt
+          pip install pytest-html
+
+      - name: Create test reports directory
+        run: mkdir -p test-reports
+
+      - name: Run tests
+        run: |
+          pytest
+
+      - name: Generate test report
+        run: |
+          pytest --html=test-reports/report.html --self-contained-html
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-reports/report.html
+
+      - name: Send Telegram notification
+        uses: appleboy/telegram-action@v1
+        with:
+          to: ${{ secrets.SHARED_TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.SHARED_TELEGRAM_BOT_TOKEN }}
+          message: Pipeline успешно выполнен
+          
