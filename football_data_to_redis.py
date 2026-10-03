@@ -45,7 +45,7 @@ from redis_hub import PipelineBatch, is_redis_available
 # CONFIG
 # ============================================================================
 
-VERSION = "6.3.0"
+VERSION = "6.3.1"
 SCHEMA_VERSION = "v710"
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
@@ -75,13 +75,13 @@ LEAGUES = {
     "G1":  {"name": "Super League",          "country": "Greece",     "division": 1},
 }
 
-# Bookmaker prefixes for 1X2 odds (IW, VC removed — dead in CSV 2425+)
+# Bookmaker prefixes for 1X2 odds (IW, VC, WH removed — dead in CSV 2425+)
+# PS → PP (Pinnacle rebranded prefix), BF → BFD (Betfair 3-letter prefix)
 BOOKMAKERS_1X2 = [
     ("B365", "bet365"),
     ("BW",   "bwin"),
-    ("PS",   "pinnacle"),
-    ("WH",   "william_hill"),
-    ("BF",   "betfair"),
+    ("PP",   "pinnacle"),
+    ("BFD",  "betfair"),
 ]
 
 # Team name aliases — синхронизированы с gatekeeper_hub.py v2.1
@@ -345,7 +345,7 @@ def build_source_map(ts):
         },
         "types": ["opening", "closing"],
         "sharp_benchmark": "pinnacle",
-        "soft_bookmakers": ["bet365", "bwin", "william_hill", "betfair"],
+        "soft_bookmakers": ["bet365", "bwin", "betfair"],
     }
 
 def build_csv_raw(row):
@@ -377,11 +377,11 @@ def build_odds_block(row, ts):
     max_closing = build_price(row, "MaxCH", "MaxCD", "MaxCA")
     avg_closing = build_price(row, "AvgCH", "AvgCD", "AvgCA")
 
-    ou25_opening = build_ou25(row, "B365", "P", "Max", "Avg")
-    ou25_closing = build_ou25(row, "B365C", "PC", "MaxC", "AvgC")
+    ou25_opening = build_ou25(row, "B365", "PP", "Max", "Avg")
+    ou25_closing = build_ou25(row, "B365C", "PPC", "MaxC", "AvgC")
 
-    ah_opening = build_ah(row, "", "B365", "P", "Max", "Avg")
-    ah_closing = build_ah(row, "C", "B365C", "PC", "MaxC", "AvgC")
+    ah_opening = build_ah(row, "", "B365", "PP", "Max", "Avg")
+    ah_closing = build_ah(row, "C", "B365C", "PPC", "MaxC", "AvgC")
 
     current = closing_bm.get("pinnacle") or max_closing
     if not current and closing_bm:
@@ -539,7 +539,7 @@ class FootballDataCollector:
             req = urllib.request.Request(url, headers={"User-Agent": f"FootballDataCollector/{VERSION}"})
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    content = resp.read().decode("utf-8", errors="replace")
+                    content = resp.read().decode("utf-8-sig", errors="replace")
                 return content
             except urllib.error.HTTPError as e:
                 if e.code == 404:
