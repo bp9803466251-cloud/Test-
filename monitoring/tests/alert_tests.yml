@@ -1,0 +1,12 @@
+groups:
+  - name: test_alerts
+    rules:
+      - alert: TestHighRequestLatency
+        expr: job:http_duration:p99 > 10
+        for: 1m
+        labels:
+          severity: test
+        annotations:
+          summary: "Тестовый алерт высокой задержки"
+          description: "Это тестовый алерт"
+          
