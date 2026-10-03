@@ -28,9 +28,13 @@ on:
         required: false
         default: false
 
+permissions:
+  contents: read
+
+# FIX-3: Concurrency — предотвращает двойную запись в Redis
 concurrency:
   group: redis-flush
-  cancel-in-progress: false
+  cancel-in-progress: false  # TODO: изменить на true после внедрения idempotency_key
 
 jobs:
   flush:
@@ -38,8 +42,14 @@ jobs:
     timeout-minutes: 30
 
     env:
+      PYTHON_VERSION: '3.12'
+      # FIX-1: SHARED_* — для redis_hub (транспортный слой)
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+      # FIX-1: UPSTASH_* — fallback для прямого доступа
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -48,8 +58,11 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Validate confirm
         run: |
@@ -61,8 +74,6 @@ jobs:
 
       - name: Dry run (show plan)
         if: success()
-        env:
-          PYTHONUNBUFFERED: "1"
         timeout-minutes: 15
         run: |
           MODE="${{ github.event.inputs.mode }}"
@@ -102,8 +113,6 @@ jobs:
 
       - name: Execute flush
         if: success() && github.event.inputs.dry_run_only != 'true'
-        env:
-          PYTHONUNBUFFERED: "1"
         timeout-minutes: 20
         run: |
           MODE="${{ github.event.inputs.mode }}"
@@ -134,9 +143,7 @@ jobs:
           esac
 
       - name: Verify after flush
-        if: success() && github.event.inputs.mode != 'reset-breaker'
-        env:
-          PYTHONUNBUFFERED: "1"
+        if: always() && github.event.inputs.mode != 'reset-breaker'
         timeout-minutes: 10
         run: |
           echo "=== Post-Flush Verify ==="
@@ -144,8 +151,6 @@ jobs:
 
       - name: Summary
         if: always()
-        env:
-          PYTHONUNBUFFERED: "1"
         run: |
           echo "=== Redis Flush Summary ==="
           echo "Mode: ${{ github.event.inputs.mode }}"
