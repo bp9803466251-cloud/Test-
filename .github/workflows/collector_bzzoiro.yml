@@ -13,15 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
       BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-      BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || 0.3 }}
-      BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || 0.2 }}
-      BZZOIRO_MAX_RETRIES: ${{ vars.BZZOIRO_MAX_RETRIES || 1 }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
       PYTHONUNBUFFERED: '1'
 
     steps:
