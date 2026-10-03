@@ -1,0 +1,19 @@
+global:
+  slack_api_url: 
+    # Используйте переменную окружения
+    {{ .Env.SLACK_WEBHOOK_URL }}
+
+route:
+  group_by: ['alertname']
+  group_interval: 5m
+  repeat_interval: 24h
+  receiver: slack-notifications
+
+receivers:
+  - name: slack-notifications
+    slack_configs:
+      - send_resolved: true
+        username: Gatekeeper Alerts
+        channel: '#alerts'
+        icon_emoji: ":alarm:"
+        
