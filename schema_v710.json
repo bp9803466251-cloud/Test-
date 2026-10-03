@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatekeeperAI Match Schema",
+  "version": "v710",
+  "description": "Формальная JSON Schema для матч-объекта GatekeeperAI (§19.1)",
+  "type": "object",
+  "required": [
+    "canonical_id",
+    "home_team",
+    "away_team",
+    "date_utc",
+    "competition",
+    "country",
+    "source",
+    "schema_version",
+    "status",
+    "sources"
+  ],
+  "properties": {
+    "canonical_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9_]+__[a-z0-9_]+__\\d{8}$"
+    },
+    "home_team": {
+      "type": "string",
+      "minLength": 1
+    },
+    "away_team": {
+      "type": "string",
+      "minLength": 1
+    },
+    "date_utc": {
+      "type": "string",
+      "description": "YYYY-MM-DDTHH:MM:SS или пустая строка"
+    },
+    "competition": {
+      "type": "string"
+    },
+    "country": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "sharpapi",
+        "odds_api",
+        "bzzoiro",
+        "propline",
+        "football_data",
+        "import"
+      ]
+    },
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "v700",
+        "v710"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "scheduled",
+        "live",
+        "completed",
+        "cancelled",
+        "postponed",
+        "interrupted",
+        "archived"
+      ]
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Список источников, записавших матч"
+    },
+    "source_ids": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "score": {
+      "type": "object",
+      "properties": {
+        "home": {
+          "type": "integer"
+        },
+        "away": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "odds": {
+      "type": "object",
+      "properties": {
+        "1x2": {
+          "type": "object",
+          "properties": {
+            "current": {
+              "type": "object",
+              "properties": {
+                "home": {
+                  "type": "string"
+                },
+                "draw": {
+                  "type": "string"
+                },
+                "away": {
+                  "type": "string"
+                }
+              }
+            },
+            "opening": {
+              "type": "object",
+              "properties": {
+                "home": {
+                  "type": "string"
+                },
+                "draw": {
+                  "type": "string"
+                },
+                "away": {
+                  "type": "string"
+                }
+              }
+            },
+            "best": {
+              "type": "object",
+              "properties": {
+                "home": {
+                  "type": "string"
+                },
+                "draw": {
+                  "type": "string"
+                },
+                "away": {
+                  "type": "string"
+                }
+              }
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "predictions": {
+      "type": "object"
+    },
+    "h2h": {
+      "type": "object"
+    },
+    "stats": {
+      "type": "object"
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "ISO timestamp MSK"
+    },
+    "section_history": {
+      "type": "object"
+    },
+    "_provenance": {
+      "type": "object",
+      "description": "Per-field provenance (§21.1)"
+    },
+    "_run_id": {
+      "type": "string",
+      "description": "Run ID (§21.2)"
+    },
+    "_metrics": {
+      "type": "object",
+      "description": "Metrics (§24.5)"
+    }
+  },
+  "additionalProperties": true
+}
