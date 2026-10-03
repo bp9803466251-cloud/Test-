@@ -231,9 +231,10 @@ jobs:
                       raw = m.get('csv_raw', {})
                       print(f'  csv_raw columns: {len(raw)}')
                       if raw:
-                          print(f'  Has PSC H/D/A: {\"PSCH\" in raw}, {\"PSCD\" in raw}, {\"PSCA\" in raw}')
+                          print(f'  Has PPC H/D/A: {\"PPCH\" in raw}, {\"PPCD\" in raw}, {\"PPCA\" in raw}')
                           print(f'  Has MaxC H/D/A: {\"MaxCH\" in raw}, {\"MaxCD\" in raw}, {\"MaxCA\" in raw}')
                           print(f'  Has B365C H/D/A: {\"B365CH\" in raw}, {\"B365CD\" in raw}, {\"B365CA\" in raw}')
+                          print(f'  Has BFD H/D/A: {\"BFDH\" in raw}, {\"BFDD\" in raw}, {\"BFDA\" in raw}')
                           print(f'  Has AHh: {\"AHh\" in raw}')
                           print(f'  Has AHCh: {\"AHCh\" in raw}')
                           print(f'  Has Time: {\"Time\" in raw}')
