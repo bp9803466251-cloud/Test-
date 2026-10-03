@@ -33,19 +33,15 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-
-    - name: Install test dependencies
-      run: |
-        pip install pytest pytest-html
+        pip install pytest pytest-html pytest-cov
 
     - name: Run tests
       run: |
-        pytest tests/
-        pytest test_fixtures.py
+        pytest tests/  # Теперь указываем правильную директорию
 
     - name: Generate HTML report
       run: |
-        pytest --html=test-reports/report.html --self-contained-html
+        pytest tests/ --html=test-reports/report.html --self-contained-html
 
     - name: Upload test results
       uses: actions/upload-artifact@v4
