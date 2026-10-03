@@ -12,6 +12,17 @@ on:
           - seasons
           - full
 
+env:
+  PYTHON_VERSION: "3.12"
+  GK_CONFIG_FILE: "./gatekeeper_config.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
 jobs:
   diagnostics:
     runs-on: ubuntu-latest
@@ -24,30 +35,35 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install --upgrade pyyaml requests
 
     - name: Run Season Check
       if: github.event.inputs.mode == 'seasons' || github.event.inputs.mode == ''
       env:
-        UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-        UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
         SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
         GITHUB_REPOSITORY: ${{ github.repository }}
+        GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
       run: python seasons_check.py
 
     - name: Run Full Diagnostics
       if: github.event.inputs.mode == 'full'
       env:
-        UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-        UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
         SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
         BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-        SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+        SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
         ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
         FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
         GITHUB_REPOSITORY: ${{ github.repository }}
+        GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
       run: python source_diagnostics.py
       
