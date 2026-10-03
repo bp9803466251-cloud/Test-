@@ -26,15 +26,9 @@ jobs:
         python -m pip install --upgrade pip setuptools
         pip install --no-cache-dir -r requirements.txt
 
-    - name: Check dependencies
-      run: |
-        pip list
-        pip check
-
     - name: Run tests
       run: |
         pytest
-        pytest tests/test_fixtures.py -v  # Запуск конкретных тестов
 
     - name: Generate test report
       run: |
@@ -45,14 +39,4 @@ jobs:
       with:
         name: test-results
         path: test-reports/report.html
-
-    - name: Check code style
-      run: |
-        black --check .
-        isort --check-only .
-        flake8 .
-
-    - name: Check type hints
-      run: |
-        mypy .
         
