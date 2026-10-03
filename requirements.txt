@@ -1,14 +1,11 @@
-# GatekeeperAI Search Module v600-prod
-# Zero external dependencies — Native Only (urllib.request)
-#
-# Все используемые модули входят в стандартную библиотеку Python 3.9+:
-#   - urllib.request    (HTTP-запросы)
-#   - json              (сериализация)
-#   - os                (окружение)
-#   - datetime          (время)
-#   - html              (экранирование)
-#   - time              (задержки)
-#   - typing            (аннотации типов)
-#
-# Сторонние клиенты (redis-py, requests, aiohttp, pydantic) запрещены.
-# Файл оставлен пустым для совместимости с CI/CD, ожидающим requirements.txt.
+# GatekeeperAI — dependencies
+# Транспорт Redis — только стандартная библиотека (§1.3)
+# Внешние API — curl_cffi (§1.24)
+curl_cffi>=0.7.0
+
+# Конфигурация (§20.3, §24.3)
+PyYAML>=6.0
+
+# Парсинг (если используется)
+# beautifulsoup4>=4.12.0
+# lxml>=5.0.0
