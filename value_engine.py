@@ -1,323 +1,360 @@
-#!/usr/bin/env python3
-"""
-value_engine.py — Gatekeeper-AI v700-prod
-Value-bet движок: читает odds через хаб, считает EV, классифицирует hot/warm.
+# value_engine.py
+# Version: 3.0 — Фаза 3: real value calculation, closing odds, margin
 
-V1.0.0 — создан как замена value-части SearchModule.
-Все обращения к odds идут через gatekeeper_hub.get_all_odds() / get_current_odds().
-Утилитные функции (predictions, competition, date, source display)
-импортируются из search_module — без дублирования.
-"""
-from typing import Dict, Any, Optional, Tuple, List
-from datetime import datetime, timezone, timedelta
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
-from gatekeeper_hub import (
-    get_all_odds,
-    get_current_odds,
-    get_match,
-    get_history,
+from gatekeeper_config import MSK_TZ
+from gatekeeper_hub import is_shutdown_requested
+
+__all__ = [
+    "evaluate_match_value",
+    "evaluate_match_full",
+    "batch_evaluate",
+    "calculate_margin",
+    "extract_odds_pair",
+    "ValueEngineError",
+    "__version__",
+]
+
+__version__ = "3.0"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - [VALUE] %(message)s",
 )
-from search_module import (
-    _get_predictions,
-    _get_competition_code,
-    _parse_date_msk,
-    _dt_from_utc,
-    _source_display,
+
+logger = logging.getLogger(__name__)
+
+
+class ValueEngineError(Exception):
+    pass
+
+
+# ---- Приоритеты источников (ранг 1 = лучший) ----
+_PRIORITY_MAP = {
+    "sharpapi": 1,
+    "propline": 2,
+    "odds_api": 3,
+    "football_data": 4,
+    "bzzoiro": 8,
+}
+
+# ---- Единый порог value (из gatekeeper_config → ENV → default) ----
+try:
+    from gatekeeper_config import VALUE_THRESHOLD as _CFG_THRESHOLD
+except ImportError:
+    _CFG_THRESHOLD = None
+
+_DEFAULT_THRESHOLD = _CFG_THRESHOLD or float(
+    os.environ.get("VALUE_BET_THRESHOLD", "0.03")
 )
 
-MSK_TZ = timezone(timedelta(hours=3))
 
+# ============================================================================
+# Утилиты
+# ============================================================================
 
-def _extract_odds_tuple(current: dict) -> Tuple[float, float, float]:
-    """Преобразует {home, draw, away} в (float, float, float)."""
-    def _val(key):
-        v = current.get(key, "")
-        if v is None or v == "-" or v == "":
-            return 0.0
+def _to_float(v: Any) -> Optional[float]:
+    """Конвертирует odds-значение в float. Принимает int, float, str."""
+    if isinstance(v, (int, float)):
+        return float(v) if v > 0 else None
+    if isinstance(v, str):
+        s = v.strip().replace(",", ".")
+        if not s or s == "-":
+            return None
         try:
-            f = float(v)
-            return f if f > 1.0 else 0.0
-        except (ValueError, TypeError):
-            return 0.0
-    return (_val("home"), _val("draw"), _val("away"))
+            f = float(s)
+            return f if f > 0 else None
+        except ValueError:
+            return None
+    return None
 
 
-def _build_verification_dict(all_odds: dict) -> dict:
+def _extract_odds_tuple(odds: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
+    """Извлекает (home, draw, away) из dict odds. Все три обязательны."""
+    if not isinstance(odds, dict):
+        return None
+    h = _to_float(odds.get("home"))
+    d = _to_float(odds.get("draw"))
+    a = _to_float(odds.get("away"))
+    if h is None or d is None or a is None:
+        return None
+    return h, d, a
+
+
+def _implied_probs(odds_tuple: Tuple[float, float, float]) -> Tuple[float, float, float, float]:
     """
-    Преобразует верификацию из хаба в формат, ожидаемый main.py.
-    main.py._verification_badge ожидает dict с ключом 'level'.
+    Возвращает (home_prob, draw_prob, away_prob, margin).
+    implied_prob = 1 / odds. margin = sum(implied_probs) - 1.
     """
-    verification = all_odds.get("verification", "UNVERIFIED")
-    independent = all_odds.get("independent_sources", 0)
-    consensus = all_odds.get("betradar_consensus", False)
+    h, d, a = odds_tuple
+    hp = 1.0 / h
+    dp = 1.0 / d
+    ap = 1.0 / a
+    total = hp + dp + ap
+    margin = total - 1.0
+    return hp, dp, ap, margin
 
-    if verification == "VERIFIED" and consensus:
-        level = "CONSENSUS"
-    elif verification == "VERIFIED":
-        level = "VERIFIED"
-    elif verification == "WARNING":
-        level = "SINGLE"
-    else:
-        level = ""
+
+def _normalize_probs(p: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """Нормализует вероятности чтобы сумма = 1 (убирая margin)."""
+    h, d, a = p
+    total = h + d + a
+    if total <= 0:
+        return 0.0, 0.0, 0.0
+    return h / total, d / total, a / total
+
+
+# ============================================================================
+# Публичные функции
+# ============================================================================
+
+def calculate_margin(odds: Dict[str, Any]) -> Optional[float]:
+    """
+    Считает bookmaker margin (overround) для блока odds.
+    Возвращает margin как долю (0.05 = 5%).
+    """
+    t = _extract_odds_tuple(odds)
+    if not t:
+        return None
+    _, _, _, margin = _implied_probs(t)
+    return margin
+
+
+def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, float, float]], Optional[Tuple[float, float, float]]]:
+    """
+    Извлекает current и closing odds как два независимых тензора.
+    Возвращает (current_tuple, closing_tuple). Любой может быть None.
+
+    Closing — «истинная» цена рынка (PropLine/Pinnacle).
+    Current — коэффициент, на который можно поставить сейчас.
+    """
+    current_tuple = None
+    closing_tuple = None
+
+    current_block = all_odds.get("current")
+    if isinstance(current_block, dict):
+        current_tuple = _extract_odds_tuple(current_block)
+
+    closing_block = all_odds.get("closing")
+    if isinstance(closing_block, dict):
+        closing_tuple = _extract_odds_tuple(closing_block)
+
+    return current_tuple, closing_tuple
+
+
+def _extract_source(sources: List[Dict[str, Any]]) -> Optional[str]:
+    """Выбор лучшего источника по рангу приоритета."""
+    if not sources:
+        return None
+
+    def priority(src: Dict[str, Any]) -> int:
+        name = str(src.get("source", "")).lower()
+        return _PRIORITY_MAP.get(name, 99)
+
+    best = min(sources, key=priority)
+    return str(best.get("source"))
+
+
+def evaluate_match_full(
+    match_data: Dict[str, Any],
+    value_threshold: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Полная оценка value. Возвращает dict с деталями или None.
+
+    Логика value:
+    1. Если есть current И closing — value = разница нормализованных
+       implied probs (closing = «истина», current = где ставим).
+    2. Если есть только current — value = отклонение max prob от 1/3
+       (дисбаланс рынка), fallback без closing.
+    3. Если есть только closing — value не считается (нечего сравнивать).
+
+    Возвращает:
+        {
+            "value": float,           # значение value
+            "direction": "home"|"draw"|"away",  # где максимальное value
+            "margin": float,           # bookmaker margin на current odds
+            "closing_margin": float|None,  # margin на closing odds
+            "current_odds": (h, d, a),
+            "closing_odds": (h, d, a)|None,
+            "best_source": str|None,
+        }
+    """
+    if value_threshold is None:
+        value_threshold = _DEFAULT_THRESHOLD
+
+    all_odds = match_data.get("odds", {})
+    if not isinstance(all_odds, dict):
+        return None
+
+    current_tuple, closing_tuple = extract_odds_pair(all_odds)
+
+    # Нет ни current, ни closing — нечего оценивать
+    if not current_tuple and not closing_tuple:
+        return None
+
+    # Только closing — нечего сравнивать
+    if not current_tuple and closing_tuple:
+        logger.debug("Только closing odds — value не вычисляется")
+        return None
+
+    # Fallback: если current есть, но нет closing — используем current
+    if current_tuple and not closing_tuple:
+        return _evaluate_single(current_tuple, value_threshold, match_data, has_closing=False)
+
+    # Оба есть — считаем реальный value: current vs closing
+    return _evaluate_dual(current_tuple, closing_tuple, value_threshold, match_data)
+
+
+def _evaluate_single(
+    current: Tuple[float, float, float],
+    threshold: float,
+    match_data: Dict[str, Any],
+    has_closing: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fallback-оценка без closing odds.
+    Value = отклонение максимальной normalised prob от 1/3 (равномерного распределения).
+    """
+    hp, dp, ap, margin = _implied_probs(current)
+    h_norm, d_norm, a_norm = _normalize_probs((hp, dp, ap))
+
+    fair = 1.0 / 3.0
+    value = max(
+        abs(h_norm - fair),
+        abs(d_norm - fair),
+        abs(a_norm - fair),
+    )
+
+    if value < threshold:
+        return None
+
+    direction = max(
+        ("home", h_norm - fair),
+        ("draw", d_norm - fair),
+        ("away", a_norm - fair),
+        key=lambda x: abs(x[1]),
+    )[0]
+
+    sources = match_data.get("sources", [])
+    best_source = _extract_source(sources) if isinstance(sources, list) else None
 
     return {
-        "level": level,
-        "independent_sources": independent,
-        "betradar_consensus": consensus,
+        "value": round(value, 5),
+        "direction": direction,
+        "margin": round(margin, 5),
+        "closing_margin": None,
+        "current_odds": current,
+        "closing_odds": None,
+        "best_source": best_source,
     }
 
 
-def _extract_source(all_odds: dict, match: dict) -> str:
-    """Извлекает имя источника из all_odds.sources или fallback на match.sources."""
-    sources = all_odds.get("sources", [])
-    if isinstance(sources, list) and sources:
-        first = sources[0]
-        if isinstance(first, dict):
-            return first.get("source", "")
-    # Fallback: top-level sources в match
-    match_sources = match.get("sources", [])
-    if isinstance(match_sources, list) and match_sources:
-        return str(match_sources[0])
-    return "unknown"
-
-
-def evaluate_match(
-    match: dict,
-    cid: str,
-    value_threshold: float = 0.03,
-) -> Optional[Tuple[dict, bool]]:
+def _evaluate_dual(
+    current: Tuple[float, float, float],
+    closing: Tuple[float, float, float],
+    threshold: float,
+    match_data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
     """
-    Полный value-анализ одного матча.
+    Реальный value: сравнение current (где ставим) vs closing (истина рынка).
 
-    Возвращает (info_dict, is_hot) или None (если нет odds или матч вне окна).
-    info_dict совместим с форматом, ожидаемым main.py.
+    implied_prob = 1 / odds.
+    fair_prob = normalised implied prob (без margin).
+    value_home = fair_prob_home(closing) - fair_prob_home(current)
+    ...
+    value = max(abs(value_home), abs(value_draw), abs(value_away))
     """
-    if not isinstance(match, dict):
+    ch, cd, ca = current
+    kh, kd, ka = closing
+
+    # Implied probs
+    c_hp, c_dp, c_ap, c_margin = _implied_probs(current)
+    k_hp, k_dp, k_ap, k_margin = _implied_probs(closing)
+
+    # Normalised probs (убираем margin)
+    c_hn, c_dn, c_an = _normalize_probs((c_hp, c_dp, c_ap))
+    k_hn, k_dn, k_an = _normalize_probs((k_hp, k_dp, k_ap))
+
+    # Value = разница normalised probs (closing = истина, current = где ставим)
+    v_home = k_hn - c_hn
+    v_draw = k_dn - c_dn
+    v_away = k_an - c_an
+
+    value = max(abs(v_home), abs(v_draw), abs(v_away))
+
+    if value < threshold:
         return None
 
-    # --- Получаем odds через хаб ---
-    all_odds = get_all_odds(match)
-    current = all_odds.get("current", {})
-    o_h, o_d, o_a = _extract_odds_tuple(current)
+    direction = max(
+        ("home", v_home),
+        ("draw", v_draw),
+        ("away", v_away),
+        key=lambda x: abs(x[1]),
+    )[0]
 
-    if o_h <= 1.0 or o_d <= 1.0 or o_a <= 1.0:
-        return None
+    sources = match_data.get("sources", [])
+    best_source = _extract_source(sources) if isinstance(sources, list) else None
 
-    # --- Окно времени: ±2h назад, +48h вперёд ---
-    now = datetime.now(MSK_TZ)
-    dt = _dt_from_utc(match.get("date_utc", ""))
-    if dt is None:
-        return None
-    if dt < now - timedelta(hours=2):
-        return None
-    if dt > now + timedelta(hours=48):
-        return None
-
-    # --- Implied вероятности ---
-    imp_h = 1.0 / o_h
-    imp_d = 1.0 / o_d
-    imp_a = 1.0 / o_a
-    imp_total = imp_h + imp_d + imp_a
-    p_h = imp_h / imp_total
-    p_d = imp_d / imp_total
-    p_a = imp_a / imp_total
-
-    # --- Прогнозы ---
-    pred = _get_predictions(match)
-    has_pred = pred is not None
-    if has_pred:
-        ph_pred, pd_pred, pa_pred = pred
-
-    # --- Value-расчёт ---
-    value_side = None
-    value_ev = 0.0
-    value_odds = 0.0
-    value_prob = 0.0
-
-    if has_pred:
-        ev_h = ph_pred * o_h - 1.0
-        ev_d = pd_pred * o_d - 1.0
-        ev_a = pa_pred * o_a - 1.0
-        evs = [
-            ("HOME", ev_h, o_h, ph_pred),
-            ("DRAW", ev_d, o_d, pd_pred),
-            ("AWAY", ev_a, o_a, pa_pred),
-        ]
-        best = max(evs, key=lambda x: x[1])
-        if best[1] > value_threshold:
-            value_side = best[0]
-            value_ev = best[1]
-            value_odds = best[2]
-            value_prob = best[3]
-
-    if value_side:
-        v_side = value_side
-        v_odds = value_odds
-        v_prob = value_prob
-        is_fire = True
-    else:
-        if has_pred:
-            probs_list = [
-                ("HOME", o_h, ph_pred),
-                ("DRAW", o_d, pd_pred),
-                ("AWAY", o_a, pa_pred),
-            ]
-        else:
-            probs_list = [
-                ("HOME", o_h, p_h),
-                ("DRAW", o_d, p_d),
-                ("AWAY", o_a, p_a),
-            ]
-        best = max(probs_list, key=lambda x: x[2])
-        v_side = best[0]
-        v_odds = best[1]
-        v_prob = best[2]
-        is_fire = False
-
-    # --- Метаданные ---
-    source = _extract_source(all_odds, match)
-    odds_verification = _build_verification_dict(all_odds)
-    independent_sources = all_odds.get("independent_sources", 0)
-
-    # --- H2H / Stats ---
-    h2h = match.get("h2h", {})
-    has_h2h = isinstance(h2h, dict) and bool(h2h)
-    stats = match.get("stats", {})
-    has_stats = isinstance(stats, dict) and bool(stats)
-
-    # --- Форматирование ---
-    comp_code = _get_competition_code(
-        match.get("competition", ""),
-        match.get("country", ""),
-    )
-    date_str, time_str = _parse_date_msk(match.get("date_utc", ""))
-
-    info = {
-        "canonical_id": cid,
-        "home_team": match.get("home_team", "?"),
-        "away_team": match.get("away_team", "?"),
-        "comp_code": comp_code,
-        "date": date_str,
-        "time": time_str,
-        "dt": dt,
-        "odds": (o_h, o_d, o_a),
-        "probs": (p_h, p_d, p_a),
-        "v_side": v_side,
-        "v_odds": v_odds,
-        "v_prob": v_prob,
-        "value_ev": value_ev,
-        "is_fire": is_fire,
-        "source": source,
-        "source_display": _source_display(source),
-        "has_pred": has_pred,
-        "has_h2h": has_h2h,
-        "has_stats": has_stats,
-        "odds_verification": odds_verification,
-        "independent_sources": independent_sources,
+    return {
+        "value": round(value, 5),
+        "direction": direction,
+        "margin": round(c_margin, 5),
+        "closing_margin": round(k_margin, 5),
+        "current_odds": current,
+        "closing_odds": closing,
+        "best_source": best_source,
     }
 
-    # --- HOT = fire ИЛИ verified (2+ indep) ИЛИ sharpapi ---
-    match_sources = match.get("sources", [])
-    if not isinstance(match_sources, list):
-        match_sources = [source] if source else ["unknown"]
 
-    is_hot = (
-        is_fire
-        or odds_verification["level"] in ("VERIFIED", "CONSENSUS")
-        or "sharpapi" in [s.lower() for s in match_sources]
-    )
-
-    return (info, is_hot)
+def evaluate_match_value(
+    match_data: Dict[str, Any],
+    value_threshold: Optional[float] = None,
+) -> Optional[float]:
+    """
+    Упрощённая оценка — возвращает только значение value (float) или None.
+    Для детального результата используйте evaluate_match_full().
+    """
+    result = evaluate_match_full(match_data, value_threshold)
+    return result["value"] if result else None
 
 
 def batch_evaluate(
-    matches: Dict[str, dict],
-    value_threshold: float = 0.03,
-) -> dict:
+    matches: Dict[str, Dict[str, Any]],
+    value_threshold: Optional[float] = None,
+) -> Dict[str, Optional[float]]:
     """
-    Пакетный value-анализ. Совместим с SearchModule.process().
-
-    Возвращает {hot, warm, stats} в формате, ожидаемом main.py.
+    Пакетная оценка. Возвращает {canonical_id: value | None}.
+    Graceful shutdown: проверка is_shutdown_requested() в цикле.
     """
-    hot: List[dict] = []
-    warm: List[dict] = []
-    with_odds = 0
-    with_pred = 0
-    with_h2h = 0
-    with_stats = 0
-    value_bets = 0
+    results: Dict[str, Optional[float]] = {}
 
     for cid, match in matches.items():
-        if not isinstance(match, dict):
-            continue
+        if is_shutdown_requested():
+            logger.info("Graceful shutdown — batch_evaluate прерван")
+            break
+        results[cid] = evaluate_match_value(match, value_threshold)
 
-        result = evaluate_match(match, cid, value_threshold)
-        if result is None:
-            # Считаем odds-покрытие даже для матчей вне окна
-            all_odds = get_all_odds(match)
-            current = all_odds.get("current", {})
-            o_h, o_d, o_a = _extract_odds_tuple(current)
-            if o_h > 1.0 and o_d > 1.0 and o_a > 1.0:
-                with_odds += 1
-            pred = _get_predictions(match)
-            if pred is not None:
-                with_pred += 1
-            h2h = match.get("h2h", {})
-            if isinstance(h2h, dict) and h2h:
-                with_h2h += 1
-            stats = match.get("stats", {})
-            if isinstance(stats, dict) and stats:
-                with_stats += 1
-            continue
-
-        info, is_hot = result
-        with_odds += 1
-
-        if info["has_pred"]:
-            with_pred += 1
-        if info["has_h2h"]:
-            with_h2h += 1
-        if info["has_stats"]:
-            with_stats += 1
-        if info["is_fire"]:
-            value_bets += 1
-
-        if is_hot:
-            hot.append(info)
-        else:
-            warm.append(info)
-
-    hot.sort(key=lambda x: (-int(x["is_fire"]), -x.get("value_ev", 0), x["dt"]))
-    warm.sort(key=lambda x: x["dt"])
-    hot = hot[:10]
-    warm = warm[:10]
-
-    return {
-        "hot": hot,
-        "warm": warm,
-        "stats": {
-            "total": len(matches),
-            "with_odds": with_odds,
-            "with_pred": with_pred,
-            "with_h2h": with_h2h,
-            "with_stats": with_stats,
-            "value_bets": value_bets,
-        },
-    }
+    return results
 
 
-def evaluate_by_id(
-    canonical_id: str,
-    value_threshold: float = 0.03,
-) -> Optional[dict]:
+def batch_evaluate_full(
+    matches: Dict[str, Dict[str, Any]],
+    value_threshold: Optional[float] = None,
+) -> Dict[str, Optional[Dict[str, Any]]]:
     """
-    Анализ матча по canonical_id через get_match из хаба.
-    Возвращает info_dict или None.
+    Пакетная оценка с детальным результатом.
+    Возвращает {canonical_id: {value, direction, margin, ...} | None}.
     """
-    match = get_match(canonical_id)
-    if not match:
-        return None
-    result = evaluate_match(match, canonical_id, value_threshold)
-    if result is None:
-        return None
-    return result[0]
+    results: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    for cid, match in matches.items():
+        if is_shutdown_requested():
+            logger.info("Graceful shutdown — batch_evaluate_full прерван")
+            break
+        results[cid] = evaluate_match_full(match, value_threshold)
+
+    return results

@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-Collector Bzzoiro v700-prod (API v2 — predictions for pre-match + league pre-fetch)
+Collector Bzzoiro v2.2 (API v2 — predictions for pre-match + league pre-fetch)
+GatekeeperAI v710 — Фаза 2
+
+Изменения v2.2 (Фаза 2):
+  - run_initialization(collector="bzzoiro") — §2.6
+  - DAYS_AHEAD из ENV (BZZOIRO_DAYS_AHEAD) — sync с YAML
+  - upsert_match: +sources=["bzzoiro"], +idempotency_key — §2.2
+  - save_meta: +run_id — трассировка
+  - COLLECTOR_NAME константа
+
 Изменения v700: upstream="opta" во всех patch_match, odds в формате {current: {...}}
 
 FIX v700.1:
@@ -14,7 +23,7 @@ import time
 import json
 import argparse
 import datetime as dt
-from typing import Any
+from typing import Any, Optional
 import logging
 from collections import defaultdict
 
@@ -40,18 +49,40 @@ except ImportError:
     logging.error("gatekeeper_hub не найден")
     sys.exit(1)
 
+try:
+    from gatekeeper_hub import is_shutdown_requested as _is_shutdown
+except ImportError:
+    def _is_shutdown():
+        return False
+
+try:
+    from team_registry import normalize_team_name, build_canonical_id
+except ImportError:
+    logging.error("team_registry не найден")
+    normalize_team_name = lambda x: x.strip().lower() if x else ""
+    build_canonical_id = lambda h, a, d: f"{h}__{a}__{d[:10].replace('-','')}"
+
 _NOT_FOUND = object()
 DEBUG_EVENT_COUNT = int(os.environ.get("DEBUG_EVENT_COUNT", "3"))
+
+COLLECTOR_NAME = "bzzoiro"
 
 BZZOIRO_BASE = os.environ.get("BZZOIRO_BASE_URL", "https://sports.bzzoiro.com/api/v2")
 BZZOIRO_API_KEY = os.environ.get("BZZOIRO_API_KEY", "")
 RATE_DELAY = float(os.environ.get("BZZOIRO_RATE_DELAY", "0.3"))
 ENRICH_DELAY = float(os.environ.get("BZZOIRO_ENRICH_DELAY", "0.2"))
 MAX_RETRIES = int(os.environ.get("BZZOIRO_MAX_RETRIES", "1"))
-DAYS_AHEAD = 7
+DAYS_AHEAD = int(os.environ.get("BZZOIRO_DAYS_AHEAD", "7"))
 PAGE_LIMIT = 200
 
 BZZOIRO_UPSTREAM = "opta"
+
+__version__ = "2.2"
+__all__ = [
+    "collect_bzzoiro",
+    "collect_and_process",
+    "__version__",
+]
 
 FINISHED_STATUSES = {"finished", "completed", "ended", "cancelled", "awarded", "forfeited"}
 PREMATCH_STATUSES = ("notstarted", "", "scheduled", "postponed")
@@ -102,6 +133,17 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
             return None
 
 
+def _normalize_odds_value(val) -> Optional[float]:
+    """FIX-1: Конвертирует odds в float, None для невалидных."""
+    if val is None or val == "-" or val == "" or val == 0:
+        return None
+    try:
+        f = float(val)
+        return f if f > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _parse_event_date(ev: dict) -> dt.datetime:
     date_str = _extract_date(ev)
     if not date_str:
@@ -144,7 +186,9 @@ def _extract_score(ev: dict) -> Any:
 
 
 def _extract_best_odds(odds_data: dict) -> dict:
-    """Извлекает лучшие коэффициенты. Возвращает v700 формат {current: {home, draw, away}}."""
+    """Извлекает лучшие коэффициенты. Возвращает v710 формат {current: {home, draw, away}}.
+    FIX-1: odds как float, не str.
+    """
     if not isinstance(odds_data, dict):
         return {}
     odds = odds_data.get("odds", odds_data)
@@ -165,16 +209,14 @@ def _extract_best_odds(odds_data: dict) -> dict:
                 val = odds[k]
                 break
 
-        if val is not None and val != "-" and val != "":
-            try:
-                result[target_key] = str(float(val))
-            except (ValueError, TypeError):
-                pass
+        # FIX-1: float вместо str
+        float_val = _normalize_odds_value(val)
+        if float_val is not None:
+            result[target_key] = float_val
 
     if not result:
         return {}
 
-    # v700 формат
     return {"current": result}
 
 
@@ -220,17 +262,21 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
 
     print("=" * 60)
-    print("[BZZOIRO] Collector Bzzoiro v700-prod started.")
+    print(f"[BZZOIRO] Collector Bzzoiro v{__version__} started.")
     print("=" * 60)
 
     print("[BZZOIRO] Шаг 0: Инициализация Redis...")
-    init_metrics = run_initialization()
+    # §2.6: передаём collector= для трассировки
+    init_metrics = run_initialization(collector=COLLECTOR_NAME)
     if not init_metrics or not init_metrics.get("redis_available"):
         print("[BZZOIRO] ERROR: Redis init failed")
-        save_meta("bzzoiro", stored_matches=0, error_count=1, events_only=events_only)
+        save_meta(COLLECTOR_NAME, stored_matches=0, error_count=1,
+                  events_only=events_only, run_id="")
         return {"error": "redis_init_failed"}
 
-    print(f"[BZZOIRO] Cleanup: {init_metrics.get("cleanup_count", 0)} ключей удалено")
+    run_id = init_metrics.get("run_id", "")
+    print(f"[BZZOIRO] Run ID: {run_id}")
+    print(f"[BZZOIRO] Cleanup: {init_metrics.get('cleanup_count', 0)} ключей удалено")
 
     existing_keys = set(get_all_fields().keys())
 
@@ -245,6 +291,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     url = f"{BZZOIRO_BASE}/events?date_from={date_from}&date_to={date_to}&limit={PAGE_LIMIT}"
 
     while url:
+        # FIX-4: Graceful shutdown
+        if _is_shutdown():
+            print("[BZZOIRO] Shutdown requested — остановка загрузки событий")
+            break
+
         data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
         pages_fetched += 1
 
@@ -292,6 +343,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     if league_ids:
         print(f"[BZZOIRO] Шаг 1.5: Pre-fetch {len(league_ids)} лиг...")
         for lid in league_ids:
+            # FIX-4: Graceful shutdown
+            if _is_shutdown():
+                print("[BZZOIRO] Shutdown requested — пропуск pre-fetch лиг")
+                break
             _fetch_league_info(lid, headers)
             time.sleep(RATE_DELAY)
         print(f"[BZZOIRO] Pre-fetch лиг завершён: {len(_league_cache)} в кэше")
@@ -308,6 +363,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     seen = set()
 
     for idx, ev in enumerate(all_events):
+        # FIX-4: Graceful shutdown
+        if _is_shutdown():
+            print("[BZZOIRO] Shutdown requested — остановка записи матчей")
+            break
+
         bzzoiro_id = ev.get("id")
         if not bzzoiro_id:
             continue
@@ -317,6 +377,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         if not home_team or not away_team:
             continue
 
+        # FIX-2: Нормализация команд через team_registry
+        home_norm = normalize_team_name(home_team)
+        away_norm = normalize_team_name(away_team)
+
         status = ev.get("status", "scheduled") or "scheduled"
 
         if status in FINISHED_STATUSES:
@@ -324,7 +388,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             continue
 
         date_str = _extract_date(ev)
-        dedup_key = f"{home_team}|{away_team}|{date_str}"
+        # FIX-8: dedup_key через нормализованные имена
+        dedup_key = f"{home_norm}|{away_norm}|{date_str}"
         if dedup_key in seen:
             deduped += 1
             continue
@@ -347,15 +412,18 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         competition = league_info.get("name", "") or ev.get("stage_name", "") or ev.get("stage", "")
         country = league_info.get("country", "")
 
+        # §2.2: idempotency_key + sources для upsert_match
         result_id = upsert_match(
-            home_team=home_team,
-            away_team=away_team,
+            home_team=home_norm,
+            away_team=away_norm,
             date_utc=date_str,
             competition=competition,
             country=country,
             status=status,
-            source="bzzoiro",
-            source_ids={"bzzoiro": str(bzzoiro_id)},
+            source=COLLECTOR_NAME,
+            sources=[COLLECTOR_NAME],
+            source_ids={COLLECTOR_NAME: str(bzzoiro_id)},
+            idempotency_key=f"{run_id}:{home_norm}__{away_norm}__{date_str[:10].replace('-', '')}" if run_id else None,
         )
         if result_id:
             if f"match:{result_id}" in existing_keys:
@@ -383,6 +451,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         print(f"[BZZOIRO] Шаг 3: Обогащение {len(stored_matches)} матчей...")
 
         for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
+            # FIX-4: Graceful shutdown
+            if _is_shutdown():
+                print("[BZZOIRO] Shutdown requested — остановка enrichment")
+                break
+
             status = ev.get("status", "")
             is_prematch = status in PREMATCH_STATUSES
 
@@ -390,7 +463,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             if not is_prematch:
                 score = _extract_score(ev)
                 if score:
-                    if patch_match(cid, "score", score, source="bzzoiro", upstream=BZZOIRO_UPSTREAM):
+                    # FIX-3: idempotency_key
+                    idem_key = f"{run_id}:{cid}:score:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:score:{bzzoiro_id}"
+                    if patch_match(cid, "score", score, source=COLLECTOR_NAME,
+                                   upstream=BZZOIRO_UPSTREAM,
+                                   idempotency_key=idem_key):
                         score_enriched += 1
                     else:
                         enrichment_errors += 1
@@ -404,7 +481,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             elif odds_data and isinstance(odds_data, dict):
                 best_odds = _extract_best_odds(odds_data)
                 if best_odds:
-                    if patch_match(cid, "odds", best_odds, source="bzzoiro", upstream=BZZOIRO_UPSTREAM):
+                    # FIX-3: idempotency_key
+                    idem_key = f"{run_id}:{cid}:odds:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:odds:{bzzoiro_id}"
+                    if patch_match(cid, "odds", best_odds, source=COLLECTOR_NAME,
+                                   upstream=BZZOIRO_UPSTREAM,
+                                   idempotency_key=idem_key):
                         odds_enriched += 1
                     else:
                         enrichment_errors += 1
@@ -428,7 +509,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 elif pred_data and isinstance(pred_data, dict):
                     inner_pred = pred_data.get("prediction", pred_data)
                     if isinstance(inner_pred, dict) and inner_pred:
-                        if patch_match(cid, "predictions", inner_pred, source="bzzoiro", upstream=BZZOIRO_UPSTREAM):
+                        # FIX-3: idempotency_key
+                        idem_key = f"{run_id}:{cid}:predictions:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:predictions:{bzzoiro_id}"
+                        if patch_match(cid, "predictions", inner_pred, source=COLLECTOR_NAME,
+                                       upstream=BZZOIRO_UPSTREAM,
+                                       idempotency_key=idem_key):
                             pred_enriched += 1
                         else:
                             enrichment_errors += 1
@@ -455,7 +540,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             elif h2h_data and isinstance(h2h_data, dict):
                 inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
                 if isinstance(inner_h2h, dict) and inner_h2h:
-                    if patch_match(cid, "h2h", inner_h2h, source="bzzoiro", upstream=BZZOIRO_UPSTREAM):
+                    # FIX-3: idempotency_key
+                    idem_key = f"{run_id}:{cid}:h2h:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:h2h:{bzzoiro_id}"
+                    if patch_match(cid, "h2h", inner_h2h, source=COLLECTOR_NAME,
+                                   upstream=BZZOIRO_UPSTREAM,
+                                   idempotency_key=idem_key):
                         h2h_enriched += 1
                     else:
                         enrichment_errors += 1
@@ -481,12 +570,14 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                             if k != "stats" and not isinstance(v, dict):
                                 flat_stats[k] = v
                         if any(v is not None for v in flat_stats.values()):
-                            if patch_match(cid, "stats", flat_stats, source="bzzoiro", upstream=BZZOIRO_UPSTREAM):
+                            # FIX-3: idempotency_key
+                            idem_key = f"{run_id}:{cid}:stats:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:stats:{bzzoiro_id}"
+                            if patch_match(cid, "stats", flat_stats, source=COLLECTOR_NAME,
+                                           upstream=BZZOIRO_UPSTREAM,
+                                           idempotency_key=idem_key):
                                 stats_enriched += 1
                             else:
                                 enrichment_errors += 1
-                        else:
-                            not_found += 1
                     else:
                         not_found += 1
                 else:
@@ -498,12 +589,16 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 print(f"[BZZOIRO] Обогащение: {idx + 1}/{len(stored_matches)} (odds={odds_enriched}, pred={pred_enriched}, stats={stats_enriched}, h2h={h2h_enriched}, score={score_enriched})")
 
     # --- Итоги ---
+    shutdown_triggered = _is_shutdown()
     print(f"[BZZOIRO] Готово: матчей {len(stored_matches)} (создано {created}, обновлено {updated})")
     print(f"[BZZOIRO]   Odds: {odds_enriched}, Predictions: {pred_enriched}, Stats: {stats_enriched}, H2H: {h2h_enriched}, Score: {score_enriched}")
     print(f"[BZZOIRO]   Ошибки: {enrichment_errors}, Not Found: {not_found}")
+    if shutdown_triggered:
+        print("[BZZOIRO]   ⚠ Shutdown был запрошен — данные могут быть неполными")
 
     result = {
         "last_run": now_msk(),
+        "run_id": run_id,
         "total_events": len(all_events),
         "stored_matches": len(stored_matches),
         "created": created,
@@ -524,12 +619,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         "skipped_finished": skipped_finished,
         "deduped": deduped,
         "no_date": no_date_count,
+        "shutdown_triggered": shutdown_triggered,
     }
     print(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
 
-    # FIX: enrichment как nested dict (diagnostics читает enrichment.*),
-    #      events_only чтобы сбросить stale-флаг из прошлого запуска
-    save_meta("bzzoiro",
+    save_meta(COLLECTOR_NAME,
               total_events=len(all_events),
               stored_matches=len(stored_matches),
               created=created,
@@ -545,13 +639,20 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                   "errors": enrichment_errors,
                   "not_found": not_found,
               },
-              events_only=events_only)
+              events_only=events_only,
+              shutdown_triggered=shutdown_triggered,
+              run_id=run_id)
 
     return result
 
 
+def collect_and_process() -> dict:
+    """FIX-7: Единая точка входа для CI/CD."""
+    return collect_bzzoiro()
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Collector Bzzoiro v700-prod")
+    parser = argparse.ArgumentParser(description=f"Collector Bzzoiro v{__version__}")
     parser.add_argument("--events-only", action="store_true",
                         help="Только события, без enrichment")
     args = parser.parse_args()

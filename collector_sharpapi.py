@@ -2,6 +2,15 @@
 Коллектор SharpAPI для Gatekeeper-AI v700-prod.
 Получает матчи и коэффициенты, сохраняет в Redis через gatekeeper_hub.
 Хелперы normalize_date, is_future_match, now_msk, save_meta импортируются из хаба.
+
+v7.0 (Phase 2):
+  - SHARPAPI_API_KEY (вместо SHARP_API_KEY) — аудит §2.11
+  - idempotency_key в patch_match — аудит §2.2
+  - odds как float (вместо str) — аудит §2.1
+  - run_initialization(collector="sharpapi") — аудит §2.6
+  - team_registry.normalize_team_name — аудит §2.4
+  - graceful shutdown (is_shutdown_requested) в цикле — аудит §2.3
+  - source + sources в payload — аудит §2.2
 """
 import os
 import json
@@ -17,7 +26,25 @@ from gatekeeper_hub import (
     normalize_date, is_future_match, now_msk, save_meta,
 )
 from redis_hub import get_all_fields, delete_from_cache
+
+# Graceful shutdown — аудит §2.3
+try:
+    from gatekeeper_hub import is_shutdown_requested
+except ImportError:
+    def is_shutdown_requested():
+        return False
+
+# team_registry — аудит §2.4
+try:
+    from team_registry import normalize_team_name
+except ImportError:
+    def normalize_team_name(name: str) -> str:
+        return name.lower().strip()
+
 SHARP_API_BASE = "https://api.sharpapi.io/api/v1"
+DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "3"))
+
+COLLECTOR_NAME = "sharpapi"
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +183,11 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
     debug_printed = False
 
     for page in range(max_pages):
+        # Graceful shutdown — аудит §2.3
+        if is_shutdown_requested():
+            print("[SHARPAPI] Получен SIGTERM, останавливаем сбор страниц")
+            break
+
         url = f"{SHARP_API_BASE}/odds?sport=soccer&market=moneyline&limit={limit}"
         if cursor:
             url += f"&cursor={urllib.parse.quote(cursor)}"
@@ -212,10 +244,17 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
 
 
 def collect_sharpapi():
-    api_key = os.environ.get("SHARP_API_KEY")
+    # FIX §2.11: SHARPAPI_API_KEY вместо SHARP_API_KEY
+    api_key = os.environ.get("SHARPAPI_API_KEY")
     if not api_key:
-        print("[SHARPAPI] SHARP_API_KEY не задан")
-        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+        # Fallback на старое имя для обратной совместимости
+        api_key = os.environ.get("SHARP_API_KEY")
+        if api_key:
+            print("[SHARPAPI] Внимание: используется устаревший SHARP_API_KEY. "
+                  "Переименуйте в SHARPAPI_API_KEY.")
+        else:
+            print("[SHARPAPI] SHARPAPI_API_KEY не задан")
+            return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     headers = {
         "X-API-Key": api_key,
@@ -227,7 +266,9 @@ def collect_sharpapi():
     limit = int(os.environ.get("SHARPAPI_LIMIT", "200"))
     flush_old = os.environ.get("SHARPAPI_FLUSH_OLD", "0") == "1"
 
-    init_metrics = run_initialization()
+    # FIX §2.6: run_initialization с collector=
+    init_metrics = run_initialization(collector=COLLECTOR_NAME)
+    run_id = init_metrics.get("run_id", "unknown")
     if not init_metrics.get("redis_available", False):
         print("[SHARPAPI] Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
@@ -251,7 +292,7 @@ def collect_sharpapi():
             "skipped_past": 0,
             "deduped": 0,
         }
-        save_meta("sharpapi", **meta)
+        save_meta(COLLECTOR_NAME, **meta)
         return meta
 
     # --- Группировать odds по event_id ---
@@ -275,9 +316,14 @@ def collect_sharpapi():
         if eid not in events_map:
             league_slug = row.get("league", "")
             country, comp_name = _resolve_league(league_slug, row)
+            # FIX §2.4: нормализация команд через team_registry
+            home_raw = row.get("home_team", "")
+            away_raw = row.get("away_team", "")
             events_map[eid] = {
-                "home_team": row.get("home_team", ""),
-                "away_team": row.get("away_team", ""),
+                "home_team": normalize_team_name(home_raw) if home_raw else "",
+                "away_team": normalize_team_name(away_raw) if away_raw else "",
+                "home_team_raw": home_raw,
+                "away_team_raw": away_raw,
                 "start_time": row.get("event_start_time", "") or row.get("start_time", ""),
                 "league": comp_name or league_slug,
                 "country": country,
@@ -296,6 +342,7 @@ def collect_sharpapi():
     # --- Записать в Redis ---
     stored = 0
     skipped_past = 0
+    skipped_future = 0
     deduped = 0
     seen_keys = set()
     existing_keys = set(get_all_fields().keys())
@@ -303,6 +350,11 @@ def collect_sharpapi():
     updated = 0
 
     for eid, ev in events_map.items():
+        # Graceful shutdown — аудит §2.3
+        if is_shutdown_requested():
+            print("[SHARPAPI] Получен SIGTERM, останавливаем запись матчей")
+            break
+
         home_team = ev["home_team"]
         away_team = ev["away_team"]
         if not home_team or not away_team:
@@ -320,9 +372,22 @@ def collect_sharpapi():
             skipped_past += 1
             continue
 
+        # Upper bound: отбрасываем матчи дальше DAYS_AHEAD
+        if date_utc:
+            try:
+                match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+                if match_dt > datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD):
+                    skipped_future += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+
         ev_odds = ev["odds"]
 
-        # 1. Создать матч (без odds)
+        # FIX §2.2: idempotency_key для защиты от двойного patch
+        idempotency_key = f"{run_id}:{eid}:odds"
+
+        # 1. Создать матч (с source и sources)
         cid = upsert_match(
             home_team=home_team,
             away_team=away_team,
@@ -330,8 +395,9 @@ def collect_sharpapi():
             competition=ev["league"],
             country=ev.get("country", ""),
             status="scheduled",
-            source="sharpapi",
-            source_ids={"sharpapi": str(eid)},
+            source=COLLECTOR_NAME,
+            sources=[COLLECTOR_NAME],
+            source_ids={COLLECTOR_NAME: str(eid)},
         )
 
         if cid:
@@ -341,17 +407,27 @@ def collect_sharpapi():
             else:
                 created += 1
 
-            # 2. Patch odds в новом формате v700
-            odds_current = {
-                "home": str(ev_odds["home"]) if "home" in ev_odds else "-",
-                "draw": str(ev_odds["draw"]) if "draw" in ev_odds else "-",
-                "away": str(ev_odds["away"]) if "away" in ev_odds else "-",
-            }
-            patch_match(cid, "odds", {"current": odds_current},
-                       source="sharpapi", upstream="betradar")
+            # FIX §2.1: odds как float (вместо str)
+            # FIX §2.2: idempotency_key в patch_match
+            odds_current = {}
+            if "home" in ev_odds:
+                odds_current["home"] = float(ev_odds["home"])
+            if "draw" in ev_odds:
+                odds_current["draw"] = float(ev_odds["draw"])
+            if "away" in ev_odds:
+                odds_current["away"] = float(ev_odds["away"])
+
+            if odds_current:
+                patch_match(
+                    cid, "odds", {"current": odds_current},
+                    source=COLLECTOR_NAME,
+                    upstream="betradar",
+                    idempotency_key=idempotency_key,
+                )
 
     total_events = len(events_map)
-    print(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, пропущено (прошедшие): {skipped_past}, дедупликатов: {deduped}")
+    print(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, "
+          f"прошлое: {skipped_past}, будущее: {skipped_future}, дедупликатов: {deduped}")
 
     meta = {
         "last_run": now_msk(),
@@ -362,9 +438,11 @@ def collect_sharpapi():
         "error_count": 0,
         "pages_fetched": pages,
         "skipped_past": skipped_past,
+        "skipped_future": skipped_future,
         "deduped": deduped,
+        "run_id": run_id,
     }
-    save_meta("sharpapi", **meta)
+    save_meta(COLLECTOR_NAME, **meta)
 
     return meta
 

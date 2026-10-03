@@ -13,6 +13,8 @@ GatekeeperAI Configuration Loader (§24.3, §24.4, §24.7)
 
 import os
 import json
+import copy
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 try:
@@ -50,8 +52,29 @@ _DEFAULT_CONFIG = {
     "schema_version": "v710",
     "pipeline_batch_size": 10,
     "odds_priority": {
-        "sharpapi": 1, "odds_api": 3, "propline": 6,
-        "bzzoiro": 8, "football_data": 10,
+        "1x2": {
+            "sharpapi": 1, "odds_api": 3, "propline": 6,
+            "bzzoiro": 8, "football_data": 10,
+        },
+        "closing_1x2": {
+            "propline": 1, "football_data": 2,
+            "sharpapi": 3, "odds_api": 4, "bzzoiro": 5,
+        },
+        "over_under_25": {
+            "football_data": 1, "propline": 2,
+            "sharpapi": 3, "odds_api": 4, "bzzoiro": 5,
+        },
+        "asian_handicap": {
+            "football_data": 1, "propline": 2,
+            "sharpapi": 3, "odds_api": 4, "bzzoiro": 5,
+        },
+        "upstream_map": {
+            "sharpapi": "betradar",
+            "odds_api": "betradar",
+            "bzzoiro": "opta",
+            "propline": "pinnacle",
+            "football_data": "bet365",
+        },
     },
     "features": {
         "schema_validation": {"enabled": True, "level": "strict"},
@@ -79,7 +102,7 @@ _cached_odds_priority: dict | None = None
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """Рекурсивное слияние словарей: override перебивает base."""
-    result = base.copy()
+    result = copy.deepcopy(base)
     for key, val in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(val, dict):
             result[key] = _deep_merge(result[key], val)
@@ -116,7 +139,8 @@ def validate_config(config: dict) -> list[str]:
         if "cleanup_owner" in orch:
             seq_names = [s.get("name") for s in orch.get("sequence", [])]
             if orch["cleanup_owner"] not in seq_names:
-                errors.append(f"orchestration.cleanup_owner '{orch["cleanup_owner"]}' not in sequence")
+                owner = orch.get("cleanup_owner", "")
+                errors.append(f"orchestration.cleanup_owner {owner!r} not in sequence")
     return errors
 
 
@@ -131,13 +155,13 @@ def load_config() -> dict:
 
     if yaml is None:
         print("[gatekeeper_config] PyYAML not installed, using defaults")
-        _cached_config = _DEFAULT_CONFIG.copy()
+        _cached_config = copy.deepcopy(_DEFAULT_CONFIG)
         return _cached_config
 
     filepath = os.environ.get("GK_CONFIG_FILE", CONFIG_FILE)
     if not os.path.exists(filepath):
         print(f"[gatekeeper_config] {filepath} not found, using defaults")
-        _cached_config = _DEFAULT_CONFIG.copy()
+        _cached_config = copy.deepcopy(_DEFAULT_CONFIG)
         return _cached_config
 
     try:
@@ -145,7 +169,7 @@ def load_config() -> dict:
             raw = yaml.safe_load(f) or {}
     except yaml.YAMLError as e:
         print(f"[gatekeeper_config] YAML parse error: {e}")
-        _cached_config = _DEFAULT_CONFIG.copy()
+        _cached_config = copy.deepcopy(_DEFAULT_CONFIG)
         return _cached_config
 
     errors = validate_config(raw)
@@ -164,20 +188,13 @@ def get_config() -> dict:
     return load_config()
 
 
-def reload_config() -> dict:
-    """Принудительная перезагрузка (для тестов)."""
-    global _cached_config, _cached_odds_priority
-    _cached_config = None
-    _cached_odds_priority = None
-    return load_config()
-
 
 # ── Feature Flags (§22.3) ────────────────────────────────────────────
 def is_feature_enabled(feature_name: str) -> bool:
     """Проверяет, включён ли feature flag."""
     cfg = get_config()
     feat = cfg.get("features", {}).get(feature_name, {})
-    return feat.get("enabled", False) if isinstance(feat, dict) else False
+    return bool(feat.get("enabled", False)) if isinstance(feat, dict) else False
 
 
 def get_feature_config(feature_name: str) -> dict:
@@ -277,11 +294,24 @@ def get_source_rank(source: str, market: str = "1x2") -> int:
     return market_priorities.get(source, 999)
 
 
+# Hardcoded upstream fallback (когда YAML недоступен)
+_HARDCODED_UPSTREAM = {
+    "sharpapi": "betradar",
+    "odds_api": "betradar",
+    "bzzoiro": "opta",
+    "propline": "pinnacle",
+    "football_data": "bet365",
+}
+
+
 def get_upstream(source: str) -> str:
     """Возвращает upstream для источника (fallback из §1.20)."""
     pri = load_odds_priority()
     upstream_map = pri.get("upstream_map", {})
-    return upstream_map.get(source, "unknown")
+    if upstream_map:
+        return upstream_map.get(source, "unknown")
+    # Fallback — hardcoded map
+    return _HARDCODED_UPSTREAM.get(source, "unknown")
 
 
 # ── Namespace Composition (§23.7 + §24.4) ─────────────────────────────
@@ -323,6 +353,120 @@ def get_impact_report(source: str) -> list[str]:
     lineage = get_lineage_for_source(source)
     return lineage.get("consumed_by", [])
 
+
+
+# ── MSK Timezone (единый источник для всех модулей) ─────────────────
+MSK_TZ = timezone(timedelta(hours=3))
+
+
+def now_msk() -> str:
+    """Текущее MSK-время в ISO-формате. Единая точка для всех модулей."""
+    return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+
+
+def now_msk_short() -> str:
+    """MSK-время в коротком формате (для логов)."""
+    return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def now_utc() -> str:
+    """UTC-время в ISO-формате."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ── Redis credentials (значения, не имена ENV) ───────────────────────
+def get_redis_url() -> str:
+    """Возвращает Redis URL (значение), с fallback UPSTASH_* → SHARED_*."""
+    return (
+        os.environ.get("UPSTASH_REDIS_REST_URL") or
+        os.environ.get("SHARED_UPSTASH_REDIS_REST_URL") or
+        ""
+    )
+
+
+def get_redis_token() -> str:
+    """Возвращает Redis Token (значение), с fallback."""
+    return (
+        os.environ.get("UPSTASH_REDIS_REST_TOKEN") or
+        os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN") or
+        ""
+    )
+
+
+# ── ns_key — алиас для build_namespaced_key ─────────────────────────
+def ns_key(base: str, cid: str, domain: str = "") -> str:
+    """Алиас для build_namespaced_key (короткое имя)."""
+    return build_namespaced_key(base, cid, domain)
+
+
+# ── get_config_errors — возвращает ошибки валидации ─────────────────
+def get_config_errors() -> list:
+    """Возвращает ошибки валидации текущей конфигурации."""
+    cfg = get_config()
+    return validate_config(cfg)
+
+
+# ── get_value_threshold — единый порог value bet ────────────────────
+def get_value_threshold() -> float:
+    """Возвращает порог value bet из ENV или дефолт."""
+    val = os.environ.get("VALUE_THRESHOLD") or os.environ.get("VALUE_BET_THRESHOLD")
+    try:
+        return float(val) if val else 0.03
+    except (ValueError, TypeError):
+        return 0.03
+
+
+# ── reload callback registry ────────────────────────────────────────
+_reload_callbacks: list = []
+
+
+def register_reload_callback(callback):
+    """Регистрирует callback для сброса кеша при reload_config()."""
+    if callable(callback) and callback not in _reload_callbacks:
+        _reload_callbacks.append(callback)
+
+
+# ── Patch reload_config to call callbacks ───────────────────────────
+def reload_config() -> dict:
+    """Принудительная перезагрузка (для тестов)."""
+    global _cached_config, _cached_odds_priority
+    _cached_config = None
+    _cached_odds_priority = None
+    # Сброс callbacks (хаб, коллекторы и т.д.)
+    for cb in _reload_callbacks:
+        try:
+            cb()
+        except Exception as e:
+            print(f"[gatekeeper_config] reload callback error: {e}")
+    return load_config()
+
+
+# ── __all__ ─────────────────────────────────────────────────────────
+__all__ = [
+    # Config
+    "load_config", "get_config", "reload_config", "validate_config",
+    "get_config_errors", "get_env", "get_env_config",
+    # Features
+    "is_feature_enabled", "get_feature_config",
+    # Redis
+    "get_redis_url", "get_redis_token",
+    "get_redis_url_env", "get_redis_token_env",
+    # Namespace
+    "get_namespace_prefix", "compose_namespace", "build_namespaced_key",
+    "ns_key",
+    # Orchestration
+    "should_run_cleanup", "get_orchestration_sequence", "get_parallel_groups",
+    # Odds priority
+    "load_odds_priority", "get_source_rank", "get_upstream",
+    # Time
+    "now_msk", "now_msk_short", "now_utc", "MSK_TZ",
+    # Value
+    "get_value_threshold",
+    # Lineage
+    "get_lineage_for_source", "get_impact_report",
+    # Callbacks
+    "register_reload_callback",
+]
 
 # ── Self-test ─────────────────────────────────────────────────────────
 if __name__ == "__main__":

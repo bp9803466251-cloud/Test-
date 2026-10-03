@@ -1,20 +1,63 @@
 """
 Коллектор OddsAPI (The Odds API) для Gatekeeper-AI v700-prod.
 Получает матчи и коэффициенты. Роль: VERIFICATION (запускается вручную, реже остальных).
+
+v700.2 (Phase 2):
+  - run_initialization(collector="odds_api")
+  - idempotency_key в patch_match
+  - sources=["odds_api"] в upsert_match
+  - team_registry.normalize_team_name
+  - graceful shutdown (is_shutdown_requested)
+  - run_id из init_metrics
+  - COLLECTOR_NAME константа
+  - odds как float (не str)
+  - now_msk() вместо datetime.now(timezone.utc)
+  - save_meta с run_id
 """
 import os
+import sys
 import json
 import time
+import logging
 import urllib.request
 import urllib.error
 from typing import Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [ODDS_API] %(message)s'
+)
 
 from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
 )
 
+try:
+    from gatekeeper_hub import is_shutdown_requested
+except ImportError:
+    def is_shutdown_requested():
+        return False
+
+try:
+    from team_registry import normalize_team_name, build_canonical_id
+except ImportError:
+    logging.error("team_registry не найден")
+    normalize_team_name = lambda x: x.strip().lower() if x else ""
+    build_canonical_id = lambda h, a, d: f"{h}__{a}__{d[:10].replace('-','')}"
+
+COLLECTOR_NAME = "odds_api"
+
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+DAYS_AHEAD = int(os.environ.get("ODDS_API_DAYS_AHEAD", "3"))
+
+__version__ = "700.2"
+__all__ = [
+    "collect_odds_api",
+    "collect_and_process",
+    "__version__",
+]
 
 
 def _fetch_odds_api(url: str, max_retries: int = 1) -> Optional[dict]:
@@ -28,15 +71,15 @@ def _fetch_odds_api(url: str, max_retries: int = 1) -> Optional[dict]:
                 return {"data": data, "quota_remaining": remaining, "quota_used": used}
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                print("[ODDS_API] HTTP 429 — Rate Limit. Прерываем запросы, переходим на кэш.")
+                logging.warning("HTTP 429 — Rate Limit. Прерываем запросы, переходим на кэш.")
                 return None
-            print(f"[ODDS_API HTTP {e.code}] {e.reason}")
+            logging.warning(f"HTTP {e.code}: {e.reason}")
             if attempt < max_retries:
                 time.sleep(2)
                 continue
             return None
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-            print(f"[ODDS_API ERROR] {e}")
+            logging.warning(f"Request error: {e}")
             if attempt < max_retries:
                 time.sleep(2)
                 continue
@@ -44,16 +87,29 @@ def _fetch_odds_api(url: str, max_retries: int = 1) -> Optional[dict]:
     return None
 
 
+def _normalize_odds_value(val) -> Optional[float]:
+    """Конвертирует odds в float, None для невалидных."""
+    if val is None or val == "-" or val == "" or val == 0:
+        return None
+    try:
+        f = float(val)
+        return f if f > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def collect_odds_api() -> Dict[str, Any]:
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
-        print("[ODDS_API] ODDS_API_KEY не задан")
+        logging.error("ODDS_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
-    init_metrics = run_initialization()
+    init_metrics = run_initialization(collector=COLLECTOR_NAME)
     if not init_metrics.get("redis_available", False):
-        print("[ODDS_API] Redis недоступен")
+        logging.error("Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+
+    run_id = init_metrics.get("run_id", "")
 
     regions = os.environ.get("ODDS_API_REGIONS", "eu,uk")
     markets = os.environ.get("ODDS_API_MARKETS", "h2h")
@@ -65,22 +121,28 @@ def collect_odds_api() -> Dict[str, Any]:
     sports_url = f"{ODDS_API_BASE}/sports/?apiKey={api_key}"
     sports_data = _fetch_odds_api(sports_url, max_retries=max_retries)
     if sports_data is None:
-        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+        logging.error("Не удалось получить список спортов")
+        return {"stored_matches": 0, "total_events": 0, "error_count": 1, "run_id": run_id}
 
     sports = sports_data.get("data", [])
     football_sports = [s for s in sports if s.get("group") == "Soccer" and s.get("active", True)]
-    print(f"[ODDS_API] Активных футбольных лиг: {len(football_sports)}")
+    logging.info(f"Активных футбольных лиг: {len(football_sports)}")
 
     stored = 0
     created = 0
     updated = 0
     skipped_past = 0
+    skipped_future = 0
     total_events = 0
     quota_remaining = "?"
     quota_used = "?"
     error_count = 0
 
     for sport in football_sports:
+        if is_shutdown_requested():
+            logging.info("Graceful shutdown — прерываем цикл спортов")
+            break
+
         sport_key = sport.get("key", "")
         if not sport_key:
             continue
@@ -99,10 +161,18 @@ def collect_odds_api() -> Dict[str, Any]:
 
         events = odds_data.get("data", [])
         for ev in events:
-            home_team = ev.get("home_team", "")
-            away_team = ev.get("away_team", "")
-            if not home_team or not away_team:
+            if is_shutdown_requested():
+                logging.info("Graceful shutdown — прерываем цикл матчей")
+                break
+
+            home_team_raw = ev.get("home_team", "")
+            away_team_raw = ev.get("away_team", "")
+            if not home_team_raw or not away_team_raw:
                 continue
+
+            # §2.4: Нормализация через team_registry
+            home_team = normalize_team_name(home_team_raw)
+            away_team = normalize_team_name(away_team_raw)
 
             raw_date = ev.get("commence_time", "") or ev.get("start_time", "")
             date_utc = normalize_date(raw_date)
@@ -111,13 +181,23 @@ def collect_odds_api() -> Dict[str, Any]:
                 skipped_past += 1
                 continue
 
+            # Upper bound: отбрасываем матчи дальше DAYS_AHEAD
+            if date_utc:
+                try:
+                    match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+                    if match_dt > datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD):
+                        skipped_future += 1
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
             sport_title = ev.get("sport_title", sport.get("title", ""))
             event_id = str(ev.get("id", ""))
 
-            # Извлекаем коэффициенты из bookmakers
-            odds_home = "-"
-            odds_draw = "-"
-            odds_away = "-"
+            # Извлекаем коэффициенты из bookmakers — как float
+            odds_home: Optional[float] = None
+            odds_draw: Optional[float] = None
+            odds_away: Optional[float] = None
             bookmakers = ev.get("bookmakers", [])
             for bm in bookmakers:
                 markets_list = bm.get("markets", [])
@@ -127,26 +207,25 @@ def collect_odds_api() -> Dict[str, Any]:
                     outcomes = market.get("outcomes", [])
                     for o in outcomes:
                         name = o.get("name", "")
-                        price = o.get("price", "-")
-                        try:
-                            price_float = float(price) if price != "-" else None
-                        except (ValueError, TypeError):
-                            price_float = None
-                        if price_float is None or price_float <= 0:
+                        price = o.get("price")
+                        price_float = _normalize_odds_value(price)
+                        if price_float is None:
                             continue
-                        if name == home_team or home_team in name or name in home_team:
-                            if odds_home == "-" or price_float > float(odds_home):
-                                odds_home = str(price)
-                        elif name == "Draw" or name == "draw":
-                            if odds_draw == "-" or price_float > float(odds_draw):
-                                odds_draw = str(price)
-                        elif name == away_team or away_team in name or name in away_team:
-                            if odds_away == "-" or price_float > float(odds_away):
-                                odds_away = str(price)
+                        # Сравниваем с нормализованным именем
+                        name_norm = normalize_team_name(name)
+                        if name_norm == home_team or home_team in name_norm or name_norm in home_team:
+                            if odds_home is None or price_float > odds_home:
+                                odds_home = price_float
+                        elif name in ("Draw", "draw", "Ничья"):
+                            if odds_draw is None or price_float > odds_draw:
+                                odds_draw = price_float
+                        elif name_norm == away_team or away_team in name_norm or name_norm in away_team:
+                            if odds_away is None or price_float > odds_away:
+                                odds_away = price_float
 
             total_events += 1
 
-            # 1. Создать матч (без odds)
+            # 1. Создать матч (с sources)
             cid = upsert_match(
                 home_team=home_team,
                 away_team=away_team,
@@ -154,25 +233,29 @@ def collect_odds_api() -> Dict[str, Any]:
                 competition=sport_title,
                 country="",
                 status="scheduled",
-                source="odds_api",
-                source_ids={"odds_api": event_id},
+                source=COLLECTOR_NAME,
+                sources=[COLLECTOR_NAME],
+                source_ids={COLLECTOR_NAME: event_id},
             )
 
             if cid:
                 stored += 1
 
-                # 2. Patch odds в новом формате v700
+                # 2. Patch odds как float
                 odds_current = {
                     "home": odds_home,
                     "draw": odds_draw,
                     "away": odds_away,
                 }
+                idempotency_key = f"{run_id}:{cid}:odds"
                 patch_match(cid, "odds", {"current": odds_current},
-                           source="odds_api", upstream="betradar")
+                           source=COLLECTOR_NAME, upstream="betradar",
+                           idempotency_key=idempotency_key)
 
         time.sleep(rate_delay)
 
-    print(f"[ODDS_API] Получено матчей: {total_events}, записано: {stored}, пропущено: {skipped_past}")
+    logging.info(f"Получено матчей: {total_events}, записано: {stored}, "
+                 f"прошлое: {skipped_past}, будущее: {skipped_future}")
 
     meta = {
         "last_run": now_msk(),
@@ -181,15 +264,22 @@ def collect_odds_api() -> Dict[str, Any]:
         "created": created,
         "updated": updated,
         "skipped_past": skipped_past,
+        "skipped_future": skipped_future,
         "error_count": error_count,
         "quota_remaining": quota_remaining,
         "quota_used": quota_used,
+        "run_id": run_id,
     }
-    save_meta("odds_api", **meta)
+    save_meta(COLLECTOR_NAME, **meta)
 
     return meta
 
 
+def collect_and_process():
+    """Точка входа для импорта."""
+    return collect_odds_api()
+
+
 if __name__ == "__main__":
     result = collect_odds_api()
-    print(f"[ODDS_API] Result: {result}")
+    logging.info(f"Result: {result}")

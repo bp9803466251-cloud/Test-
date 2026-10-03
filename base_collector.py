@@ -22,16 +22,25 @@ import time
 import signal
 import json
 from datetime import datetime, timezone, timedelta
+from functools import wraps
 
 # ── Глобальное состояние shutdown ────────────────────────────────────
+# FIX-1: Делегируем в gatekeeper_hub.is_shutdown_requested()
+# чтобы patch_match/upsert_match в хабе видели тот же флаг.
+# Fallback — локальная переменная (если хаб недоступен).
 _shutdown_requested = False
 
 
 def _signal_handler(signum, frame):
     global _shutdown_requested
     _shutdown_requested = True
-    # Не print (§20.6), но для shutdown-сигнала — исключение
     sys.stderr.write(f"\n[BaseCollector] SIGTERM received, graceful shutdown...\n")
+    # Делегируем в хаб — вызываем обработчик хаба, а не лезем в приватные поля
+    try:
+        import gatekeeper_hub
+        gatekeeper_hub._handle_shutdown(signum, frame)
+    except Exception:
+        pass
 
 
 def install_shutdown_handler():
@@ -42,13 +51,26 @@ def install_shutdown_handler():
 
 def is_shutdown_requested() -> bool:
     """Проверяет, был ли запрошен graceful shutdown (§23.3)."""
+    # FIX-1: Сначала проверяем хабовский флаг
+    try:
+        import gatekeeper_hub
+        if gatekeeper_hub.is_shutdown_requested():
+            return True
+    except Exception:
+        pass
+    # Fallback — локальный флаг
     return _shutdown_requested
 
 
 def now_msk() -> str:
-    """ISO timestamp в MSK."""
-    msk = timezone(timedelta(hours=3))
-    return datetime.now(msk).isoformat()
+    """ISO timestamp в MSK. Делегирует в gatekeeper_config (единый источник)."""
+    try:
+        from gatekeeper_config import now_msk as _cfg_now_msk
+        return _cfg_now_msk()
+    except ImportError:
+        # Fallback если config недоступен
+        msk = timezone(timedelta(hours=3))
+        return datetime.now(msk).isoformat()
 
 
 class Metrics:
@@ -77,6 +99,7 @@ class Metrics:
 def timed(metrics: Metrics, name: str):
     """Декоратор для автоматического тайминга (§24.5)."""
     def decorator(func):
+        @wraps(func)
         def wrapper(*args, **kwargs):
             start = time.monotonic()
             result = func(*args, **kwargs)
@@ -155,6 +178,7 @@ class BaseCollector:
         hub = self._get_hub()
         cids = []
         for raw in raw_matches:
+            self.rate_limit_sleep()  # FIX-4: rate limiting в upsert цикле
             if is_shutdown_requested():
                 self._log("WARN", "Shutdown requested, stopping upsert",
                           processed=len(cids), remaining=len(raw_matches) - len(cids))
@@ -168,12 +192,23 @@ class BaseCollector:
                 competition = raw.get("competition", "")
                 country = raw.get("country", "")
 
+                # FIX-2: нормализация команд через team_registry
+                try:
+                    from team_registry import normalize_team_name
+                    home = normalize_team_name(home) or home
+                    away = normalize_team_name(away) or away
+                except ImportError:
+                    pass
+
                 # Extra поля (§1.13: **extra, не extra=extra)
                 extra = {}
                 for k in ("source_ids", "odds", "predictions", "h2h", "stats", "score"):
                     if k in raw:
                         extra[k] = raw[k]
 
+                # FIX-3: idempotency_key для upsert (§23.2)
+                date_key = (date_utc or "")[:10]
+                idempotency_key = f"{self.source}:{home}:{away}:{date_key}"
                 cid = hub.upsert_match(
                     home_team=home,
                     away_team=away,
@@ -181,6 +216,7 @@ class BaseCollector:
                     competition=competition,
                     country=country,
                     source=self.source,
+                    idempotency_key=idempotency_key,
                     **extra
                 )
                 if cid:
@@ -206,6 +242,7 @@ class BaseCollector:
         """
         hub = self._get_hub()
         for i, cid in enumerate(cids):
+            self.rate_limit_sleep()  # FIX-4: rate limiting в patch цикле
             if is_shutdown_requested():
                 self._log("WARN", "Shutdown requested, stopping patch",
                           processed=i, remaining=len(cids) - i)
@@ -229,11 +266,13 @@ class BaseCollector:
                     self.metrics.inc("patch_match")
                     self.metrics.time("patch_match_total", time.monotonic() - start)
 
-                # Patch stats / predictions / h2h
+                # Patch stats / predictions / h2h — FIX-3: idempotency_key для всех
                 for section in ("stats", "predictions", "h2h"):
                     if section in raw:
+                        section_idem = f"{self.source}:{cid}:{section}:{now_msk()[:10]}"
                         hub.patch_match(cid, section, raw[section],
-                                       source=self.source)
+                                       source=self.source,
+                                       idempotency_key=section_idem)
                         self.metrics.inc(f"patch_{section}")
             except Exception as e:
                 self.error_count += 1
@@ -241,20 +280,23 @@ class BaseCollector:
                 self._log("WARN", "Patch failed", cid=cid, error=str(e))
 
     def _get_upstream(self) -> str:
-        """Возвращает upstream для источника (§1.20)."""
+        """Возвращает upstream для источника (§1.20). FIX-1: из UPSTREAM_MAP хаба."""
         try:
-            from gatekeeper_config import get_upstream
-            return get_upstream(self.source)
+            import gatekeeper_hub
+            upstream_map = getattr(gatekeeper_hub, "UPSTREAM_MAP", {})
+            if upstream_map:
+                return upstream_map.get(self.source, "unknown")
         except ImportError:
-            # Fallback из UPSTREAM_MAP
-            upstream_map = {
-                "sharpapi": "betradar",
-                "odds_api": "betradar",
-                "bzzoiro": "opta",
-                "propline": "pinnacle",
-                "football_data": "bet365",
-            }
-            return upstream_map.get(self.source, "unknown")
+            pass
+        # Fallback — синхронизирован с UPSTREAM_MAP в хабе
+        upstream_map = {
+            "sharpapi": "betradar",
+            "odds_api": "betradar",
+            "bzzoiro": "opta",
+            "propline": "pinnacle",
+            "football_data": "bet365",
+        }
+        return upstream_map.get(self.source, "unknown")
 
     # ── Шаг 5: Save Meta ──────────────────────────────────────────────
     def save_meta(self):
@@ -288,15 +330,32 @@ class BaseCollector:
         """
         Главный цикл коллектора: 5 шагов.
         Подклассы вызывают collector.run() — весь алгоритм выполняется автоматически.
+        FIX-5: shutdown-чеки между шагами — при SIGTERM сохраняет мета и выходит.
         """
         self._log("INFO", "Starting collection", source=self.source)
         self.run_initialization()
 
+        if is_shutdown_requested():
+            self._log("WARN", "Shutdown before fetch", source=self.source)
+            self.save_meta()
+            return
+
         raw_matches = self.fetch_events()
         self._log("INFO", "Fetched events", count=len(raw_matches))
 
+        if is_shutdown_requested():
+            self._log("WARN", "Shutdown before upsert", source=self.source)
+            self.save_meta()
+            return
+
         cids = self.upsert_matches(raw_matches)
         self._log("INFO", "Upserted matches", created=len(cids), skipped=self.skipped)
+
+        if is_shutdown_requested():
+            self._log("WARN", "Shutdown before patch, saving partial results",
+                      source=self.source)
+            self.save_meta()
+            return
 
         self.patch_matches(cids, raw_matches)
 
@@ -329,3 +388,19 @@ class BaseCollector:
                           delay=delay, error=str(e))
                 time.sleep(delay)
         return None
+
+
+# ── Версия ────────────────────────────────────────────────────────────
+__version__ = "2.2"
+
+
+# ── Публичный API ─────────────────────────────────────────────────────
+__all__ = [
+    "BaseCollector",
+    "Metrics",
+    "timed",
+    "now_msk",
+    "is_shutdown_requested",
+    "install_shutdown_handler",
+    "__version__",
+]

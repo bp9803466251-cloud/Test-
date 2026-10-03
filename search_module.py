@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-SearchModule v6.0.0 — Gatekeeper-AI v700-prod
+SearchModule v6.1.0 — Gatekeeper-AI v8.9 — Gatekeeper-AI v700-prod
 Поиск value bets, нормализация команд, маппинг лиг.
 """
 import re
+import os
 import math
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
-MSK_TZ = timezone(timedelta(hours=3))
-VALUE_THRESHOLD = 0.03  # 3% — env VALUE_BET_THRESHOLD
+try:
+    from gatekeeper_config import now_msk as _cfg_now_msk, MSK_TZ
+except ImportError:
+    MSK_TZ = timezone(timedelta(hours=3))
+
+VALUE_THRESHOLD = float(os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
 
 
 # ---------------------------------------------------------------------------
@@ -52,35 +57,33 @@ _REPLACE = {
 
 
 def clean_team_name(name: str) -> str:
-    """Нормализация названия команды (правило 4 гида)."""
+    """
+    Нормализация названия команды (правило 4 гида).
+    FIX-1: Делегирует в team_registry.normalize_team_name() — единый источник истины.
+    Fallback — локальная логика (если team_registry недоступен).
+    """
     if not name:
         return ""
+    # FIX-1: team_registry — единый реестр (75+ алиасов, умляуты, суффиксы)
+    try:
+        from team_registry import normalize_team_name
+        return normalize_team_name(name)
+    except ImportError:
+        pass
+    # Fallback — локальная нормализация
     s = name.lower().strip()
-
-    # Замены
-    for old, new in _REPLACE.items():
-        if s == old or s.startswith(old + " "):
-            s = s.replace(old, new)
-            break
-
-    # Замена подчёркиваний на пробелы (PropLine формат)
     s = s.replace("_", " ")
-
-    # Повторная проверка замен после замены подчёркиваний
+    # Замены (без break — применяем все подходящие)
     for old, new in _REPLACE.items():
         if s == old or s.startswith(old + " "):
             s = s.replace(old, new)
-            break
-
     # Удаление слов (fc, cf, club, etc.) из любой позиции
     tokens = s.split()
     tokens = [t for t in tokens if t.strip(".,") not in _REMOVE_WORDS]
     s = " ".join(tokens)
-
     # Удаление спецсимволов
     s = re.sub(r"[^a-z0-9 ]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     return s if s else name.lower().strip()
 
 
@@ -243,6 +246,12 @@ def _get_odds(match: dict) -> Tuple[float, float, float]:
             current = section.get("current", {})
             if isinstance(current, dict) and current:
                 return _extract_odds_tuple(current)
+
+    # v700: odds.1x2.closing (fallback — Propline closing odds)
+    if isinstance(section, dict):
+        closing = section.get("closing", {})
+        if isinstance(closing, dict) and closing:
+            return _extract_odds_tuple(closing)
 
     # промежуточный: odds.current
     if "current" in odds and isinstance(odds["current"], dict):
@@ -424,7 +433,9 @@ class SearchModule:
             sources = match.get("sources", [])
             if not isinstance(sources, list) or not sources:
                 sources = ["unknown"]
-            src_raw = sources[0]
+            # FIX-6: выбираем источник с лучшим рангом (минимальный priority)
+            _priority_map = {"sharpapi": 1, "odds_api": 3, "propline": 6, "bzzoiro": 8, "football_data": 10}
+            src_raw = min(sources, key=lambda s: _priority_map.get(s.lower().strip(), 99)) if sources else "unknown"
 
             imp_h = 1.0 / o_h
             imp_d = 1.0 / o_d
@@ -528,3 +539,12 @@ class SearchModule:
                 "value_bets": value_bets,
             },
         }
+
+__version__ = "6.1"
+
+__all__ = [
+    "clean_team_name",
+    "SearchModule",
+    "VALUE_THRESHOLD",
+    "__version__",
+]

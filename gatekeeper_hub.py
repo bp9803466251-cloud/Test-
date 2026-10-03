@@ -1,17 +1,19 @@
 """
-gatekeeper_hub.py — Единый хаб GatekeeperAI.
+gatekeeper_hub.py — Единый хаб GatekeeperAI v8.9-patched.
 Центральный шлюз для создания, обновления и чтения матчей.
 
-Реализует рекомендации:
-  §19.2 — INDEX_REGISTRY, odds_priority loading
-  §22.8 — Hub function versioning (__version__)
-  §23.1 — Cross-Collector Conflict Resolution (should_overwrite)
-  §23.2 — Idempotency Keys для patch_match
-  §23.3 — Graceful Shutdown (signal handler)
-  §24.1 — Match State Machine (set_match_status)
-  §24.3 — Configuration Validation при старте
-  §24.5 — Metrics Collection (Metrics class, @timed)
-  §24.7 — Collector Orchestration (cleanup_owner)
+Патчи (v8.9-patched):
+  FIX-1: set_match_status deadlock — пишет напрямую в Redis, минуя patch_match
+  FIX-2: _clean_team_name → делегирует в team_registry (если доступен)
+  FIX-3: save_to_cache — Python-объект, не serialize_match() (double-serialization)
+  FIX-4: _normalize_incoming_odds — str() убран, сохраняет исходный тип
+  FIX-5: _merge_odds — поддержка closing секции + upstream из patch_match
+  FIX-6: cleanup_expired — реализация (была заглушка)
+  FIX-7: is_feature_enabled / should_run_cleanup — 1 аргумент (не 2)
+  FIX-8: patch_match / upsert_match — graceful shutdown check
+  FIX-9: __all__ — 30 экспортов
+  FIX-10: ns_key — fallback если gatekeeper_config не предоставляет
+  FIX-11: _load_odds_priority — nested по рынкам + reload callback
 """
 
 import os
@@ -24,20 +26,77 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 # ── Конфигурация ───────────────────────────────────────────
-from gatekeeper_config import (
-    load_config, get_config_errors, is_feature_enabled,
-    should_run_cleanup, ns_key, now_msk, now_msk_short,
-    get_redis_url, get_redis_token, get_env,
-)
+try:
+    from gatekeeper_config import (
+        load_config, is_feature_enabled,
+        should_run_cleanup, get_env,
+    )
+    # Функции, которые могут отсутствовать в старой версии config
+    try:
+        from gatekeeper_config import now_msk, now_msk_short, ns_key, MSK_TZ
+    except ImportError:
+        # Fallback — определяем локально
+        MSK_TZ = timezone(timedelta(hours=3))
+        def now_msk():
+            return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+        def now_msk_short():
+            return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        def ns_key(base, cid, domain=""):
+            # Fallback: no namespace, just compose base:cid
+            return f"{base}:{cid}" if cid else base
+    try:
+        from gatekeeper_config import get_config_errors
+    except ImportError:
+        def get_config_errors():
+            return []
+except ImportError:
+    print("[HUB CRITICAL] gatekeeper_config not found!")
+    sys.exit(1)
 
 
 # ═══════════════════════════════════════════════════════════
 # §22.8: Hub version
 # ═══════════════════════════════════════════════════════════
 
-__version__ = "8.9"
+__version__ = "8.9-patched"
 HUB_API_VERSION = "8.9"
 SCHEMA_VERSION = "v710"
+
+__all__ = [
+    # Version
+    "__version__", "HUB_API_VERSION", "SCHEMA_VERSION",
+    # Registry
+    "INDEX_REGISTRY", "UPSTREAM_MAP",
+    # Metrics
+    "METRICS", "timed",
+    # Shutdown
+    "install_shutdown_handler", "is_shutdown_requested",
+    # State Machine
+    "MATCH_STATES", "validate_state_transition", "set_match_status",
+    # Conflict Resolution
+    "should_overwrite",
+    # Logging
+    "log_event",
+    # Serialization
+    "serialize_match", "deserialize_match",
+    # Canonical ID
+    "build_canonical_id",
+    # Date
+    "normalize_date", "is_future_match",
+    # Idempotency
+    "_check_idempotency", "_stamp_idempotency",
+    # Core API
+    "upsert_match", "patch_match", "get_match_any",
+    "save_meta", "cleanup_expired",
+    # Init
+    "run_initialization", "get_run_id",
+    # Odds Helpers
+    "get_all_odds", "get_current_odds", "get_match", "get_history",
+    # Time
+    "MSK_TZ", "now_msk", "now_msk_short",
+    # Batch
+    "process_matches",
+]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -45,28 +104,21 @@ SCHEMA_VERSION = "v710"
 # ═══════════════════════════════════════════════════════════
 
 INDEX_REGISTRY = {
-    # Match data
     "match:{cid}": "Live-матч (hash)",
     "history:match:{cid}": "History-матч (hash)",
-    # Daily shards
     "index:shard:{YYYYMMDD}": "Дневной индекс (set of canonical_ids)",
-    # Per-source metadata
     "{collector}:meta": "Метаданные коллектора (hash)",
-    # Search
     "search:results:latest": "Последние результаты поиска",
-    # System keys (§21–§24)
-    "system:health": "Health status (hash) — §21.3",
-    "system:heartbeat": "Heartbeat timestamps (hash) — §21.3",
-    "system:audit_log": "Audit log (sorted set) — §22.1",
-    "system:dlq": "Dead Letter Queue (list) — §22.4",
-    "system:alerts": "Active alerts (hash) — §23.4",
-    "system:state_transitions": "Match state transitions (sorted set) — §24.1",
-    "system:metrics": "System metrics (hash) — §24.5",
-    # Namespace patterns
-    "match:{namespace}:{cid}": "Namespaced live match — §23.7",
-    "history:match:{namespace}:{cid}": "Namespaced history — §23.7",
-    # Canary
-    "match:canary:{cid}": "Canary test match — §23.8",
+    "system:health": "Health status (hash)",
+    "system:heartbeat": "Heartbeat timestamps (hash)",
+    "system:audit_log": "Audit log (sorted set)",
+    "system:dlq": "Dead Letter Queue (list)",
+    "system:alerts": "Active alerts (hash)",
+    "system:state_transitions": "Match state transitions (sorted set)",
+    "system:metrics": "System metrics (hash)",
+    "match:{namespace}:{cid}": "Namespaced live match",
+    "history:match:{namespace}:{cid}": "Namespaced history",
+    "match:canary:{cid}": "Canary test match",
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -87,11 +139,6 @@ UPSTREAM_MAP = {
 # ═══════════════════════════════════════════════════════════
 
 class Metrics:
-    """
-    In-memory метрики за запуск. Сбрасываются при каждом run_initialization().
-    §24.5
-    """
-
     def __init__(self):
         self.counters = {}
         self.timers = {}
@@ -114,7 +161,6 @@ METRICS = Metrics()
 
 
 def timed(func):
-    """Декоратор для автоматического тайминга функций. §24.5"""
     @wraps(func)
     def wrapper(*args, **kwargs):
         start = time.monotonic()
@@ -134,17 +180,12 @@ _SHUTDOWN_INSTALLED = False
 
 
 def _handle_shutdown(signum, frame):
-    """Обработчик SIGTERM/SIGINT. §23.3"""
     global _SHUTDOWN_REQUESTED
     _SHUTDOWN_REQUESTED = True
     log_event("hub", "WARN", "Shutdown requested. Finishing current batch...")
 
 
 def install_shutdown_handler():
-    """
-    Устанавливает обработчик SIGTERM/SIGINT.
-    Вызывается в run_initialization(). §23.3
-    """
     global _SHUTDOWN_INSTALLED
     if _SHUTDOWN_INSTALLED:
         return
@@ -154,7 +195,6 @@ def install_shutdown_handler():
 
 
 def is_shutdown_requested():
-    """Проверка запроса на завершение. §23.3"""
     return _SHUTDOWN_REQUESTED
 
 
@@ -174,7 +214,6 @@ MATCH_STATES = {
 
 
 def validate_state_transition(current, new_status):
-    """Проверяет допустимость перехода. §24.1"""
     state = MATCH_STATES.get(current)
     if not state:
         return new_status == "scheduled"
@@ -183,10 +222,11 @@ def validate_state_transition(current, new_status):
     return new_status in state.get("transitions", [])
 
 
+# FIX-1: set_match_status — пишет напрямую в Redis, минуя patch_match
+# Старая версия вызывала patch_match(section="status"), который возвращал False.
 def set_match_status(canonical_id, new_status, source="system"):
     """
     Единственная функция для смены статуса матча. §24.1
-    Запрещает прямой patch_match(..., "status", ...).
     Возвращает True если переход выполнен, False если запрещён.
     """
     match = get_match_any(canonical_id)
@@ -202,10 +242,26 @@ def set_match_status(canonical_id, new_status, source="system"):
                   cid=canonical_id, current=current, attempted=new_status)
         return False
 
-    # Запись через patch_match (section=status)
-    patch_match(canonical_id, "status", new_status, source=source)
+    # FIX-1: Пишем напрямую в Redis, не через patch_match
+    rh = _get_redis()
+    if not rh:
+        log_event(source, "ERROR", "set_match_status: redis_hub not available")
+        return False
 
-    # Audit log перехода (§22.1, §24.1)
+    match["status"] = new_status
+    match["version"] = match.get("version", 1) + 1
+    match["updated_at"] = now_msk()
+
+    # Определяем ключ (live или history)
+    config = load_config()
+    key = ns_key("match", canonical_id)
+    existing = rh.get_from_cache(key)
+    if not existing or not isinstance(existing, dict):
+        key = ns_key("history:match", canonical_id)
+
+    # FIX-3: Передаём Python-объект, не serialize_match()
+    rh.save_to_cache(key, match)
+
     _audit_state_transition(canonical_id, current, new_status, source)
 
     log_event(source, "INFO", "State transition",
@@ -214,13 +270,11 @@ def set_match_status(canonical_id, new_status, source="system"):
 
 
 def _audit_state_transition(cid, from_state, to_state, source):
-    """Записывает переход в system:state_transitions. §24.1"""
     try:
         from redis_hub import set_key, get_key
-        import json as _json
         key = "system:state_transitions"
         existing = get_key(key)
-        log = _json.loads(existing) if existing else []
+        log = json.loads(existing) if existing else []
         log.append({
             "cid": cid,
             "from": from_state,
@@ -228,12 +282,11 @@ def _audit_state_transition(cid, from_state, to_state, source):
             "source": source,
             "timestamp": now_msk(),
         })
-        # Храним последние 1000 переходов
         if len(log) > 1000:
             log = log[-1000:]
-        set_key(key, _json.dumps(log))
+        set_key(key, json.dumps(log))
     except Exception:
-        pass  # Best-effort audit
+        pass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -245,8 +298,23 @@ _upstream_ranks = {}
 _odds_priority_loaded = False
 
 
+# FIX-11: reload callback для сброса кеша при reload_config()
+def _reset_odds_priority_cache():
+    """Сбрасывает кеш рангов (вызывается из gatekeeper_config.reload_config)."""
+    global _source_ranks, _upstream_ranks, _odds_priority_loaded
+    _source_ranks = {}
+    _upstream_ranks = {}
+    _odds_priority_loaded = False
+
+# Регистрируем callback в config (если доступно)
+try:
+    from gatekeeper_config import register_reload_callback
+    register_reload_callback(_reset_odds_priority_cache)
+except (ImportError, AttributeError):
+    pass
+
+
 def _load_odds_priority():
-    """Загружает ранги из odds_priority.yaml. §19.2, §23.1"""
     global _source_ranks, _upstream_ranks, _odds_priority_loaded
     if _odds_priority_loaded:
         return
@@ -255,10 +323,17 @@ def _load_odds_priority():
         import yaml
         with open("odds_priority.yaml", "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        _source_ranks = data.get("source_ranks", {})
-        _upstream_ranks = data.get("upstream_ranks", {})
+
+        # FIX-11: Поддерживаем оба формата — nested по рынкам и плоский
+        if "1x2" in data or "closing_1x2" in data:
+            # Nested формат: {"1x2": {"sharpapi": 1, ...}, "upstream_map": {...}}
+            _source_ranks = data.get("1x2", data)
+            _upstream_ranks = data.get("upstream_map", {})
+        else:
+            # Плоский формат (legacy): {"source_ranks": {...}, "upstream_ranks": {...}}
+            _source_ranks = data.get("source_ranks", {})
+            _upstream_ranks = data.get("upstream_ranks", {})
     except (FileNotFoundError, ImportError):
-        # Fallback — hardcoded ranks (синхронизированы с odds_priority.yaml)
         _source_ranks = {
             "sharpapi": 1, "propline": 1,
             "odds_api": 2, "bzzoiro": 3, "football_data": 4,
@@ -271,12 +346,7 @@ def _load_odds_priority():
 
 
 def _get_source_rank(source, upstream=None):
-    """
-    Возвращает ранг источника (меньше = выше приоритет).
-    Источник: odds_priority.yaml (§19.2). §23.1
-    """
     _load_odds_priority()
-    # Приоритет: source rank, затем upstream rank
     s_rank = _source_ranks.get(source, 99)
     if upstream:
         u_rank = _upstream_ranks.get(upstream, 99)
@@ -287,22 +357,13 @@ def _get_source_rank(source, upstream=None):
 def should_overwrite(new_source, new_upstream,
                      existing_source, existing_upstream,
                      section="odds"):
-    """
-    Решает, должен ли новый источник перезаписать существующее значение.
-    Основано на приоритете букмекера, а не на времени записи. §23.1
-    """
     new_rank = _get_source_rank(new_source, new_upstream)
     existing_rank = _get_source_rank(existing_source, existing_upstream)
 
-    # Равный ранг — last writer wins
     if new_rank == existing_rank:
         return True
-
-    # Более высокий приоритет (меньший номер) — всегда перебивает
     if new_rank < existing_rank:
         return True
-
-    # Более низкий приоритет — не перебивает, но сохраняется в sources[]
     return False
 
 
@@ -311,10 +372,6 @@ def should_overwrite(new_source, new_upstream,
 # ═══════════════════════════════════════════════════════════
 
 def log_event(source, level, message, **kwargs):
-    """
-    Структурный лог. §20.6
-    Выводит в stdout для GitHub Actions. Не выводит payload целиком.
-    """
     ts = now_msk_short()
     parts = [f"[{ts}]", f"[{source}]", f"[{level}]", message]
     if kwargs:
@@ -328,12 +385,10 @@ def log_event(source, level, message, **kwargs):
 # ═══════════════════════════════════════════════════════════
 
 def serialize_match(match_obj):
-    """Единый сериализатор. §20.1"""
     return json.dumps(match_obj, ensure_ascii=False, separators=(",", ":"))
 
 
 def deserialize_match(raw):
-    """Единый десериализатор. §20.1"""
     if not raw:
         return None
     if isinstance(raw, dict):
@@ -350,14 +405,23 @@ def deserialize_match(raw):
 # Canonical ID generation
 # ═══════════════════════════════════════════════════════════
 
+# FIX-2: Делегирует в team_registry если доступен
 def _clean_team_name(name):
     """Нормализация имени команды для canonical_id."""
     if not name:
         return ""
+
+    # Пытаемся использовать team_registry (лучшая нормализация)
+    try:
+        from team_registry import normalize_team_name
+        return normalize_team_name(name)
+    except (ImportError, Exception):
+        pass
+
+    # Fallback — старая логика
     import re
     name = name.lower().strip()
     name = re.sub(r"[^a-z0-9]", "", name)
-    # Сокращения
     replacements = {
         "manchesterunited": "man", "manchestercity": "mci",
         "manutd": "man", "mancity": "mci",
@@ -366,12 +430,10 @@ def _clean_team_name(name):
 
 
 def build_canonical_id(home_team, away_team, date_utc):
-    """Строит canonical_id: home__away__YYYYMMDD"""
     home_clean = _clean_team_name(home_team)
     away_clean = _clean_team_name(away_team)
     date_part = ""
     if date_utc:
-        # Извлекаем YYYYMMDD из ISO-даты
         date_part = date_utc[:10].replace("-", "")
     return f"{home_clean}__{away_clean}__{date_part}"
 
@@ -381,25 +443,21 @@ def build_canonical_id(home_team, away_team, date_utc):
 # ═══════════════════════════════════════════════════════════
 
 def normalize_date(date_str):
-    """Нормализует дату в ISO формат YYYY-MM-DDTHH:MM:SSZ."""
     if not date_str:
         return ""
     date_str = date_str.strip()
     if not date_str:
         return ""
-    # Уже ISO
     if "T" in date_str:
         return date_str
-    # YYYY-MM-DD → добавляем время
     if len(date_str) == 10:
         return date_str + "T00:00:00Z"
     return date_str
 
 
 def is_future_match(date_utc):
-    """Проверяет, что матч в будущем (или без даты). §1.5"""
     if not date_utc:
-        return True  # Матчи без даты считаются будущими
+        return True
     try:
         match_date = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
@@ -409,11 +467,10 @@ def is_future_match(date_utc):
 
 
 # ═══════════════════════════════════════════════════════════
-# Redis integration (delagate to redis_hub.py)
+# Redis integration
 # ═══════════════════════════════════════════════════════════
 
 def _get_redis():
-    """Ленивый импорт redis_hub."""
     try:
         import redis_hub
         return redis_hub
@@ -422,14 +479,10 @@ def _get_redis():
 
 
 # ═══════════════════════════════════════════════════════════
-# §23.2: Idempotency Keys для patch_match
+# §23.2: Idempotency Keys
 # ═══════════════════════════════════════════════════════════
 
 def _check_idempotency(canonical_id, idempotency_key):
-    """
-    Проверяет, была ли операция уже выполнена. §23.2
-    Возвращает существующий результат или None.
-    """
     if not idempotency_key:
         return None
     rh = _get_redis()
@@ -440,21 +493,19 @@ def _check_idempotency(canonical_id, idempotency_key):
     if existing:
         log_event("hub", "DEBUG", "Idempotent skip",
                   key=idempotency_key, cid=canonical_id)
-        return existing  # Уже обработано
+        return existing
     return None
 
 
 def _stamp_idempotency(canonical_id, idempotency_key, result):
-    """Регистрирует факт выполнения операции. §23.2"""
     if not idempotency_key:
         return
     rh = _get_redis()
     if not rh:
         return
     seen_key = f"match:{canonical_id}:idem:{idempotency_key}"
-    rh.set_key(seen_key, serialize_match({"result": result, "ts": now_msk()}))
-    # TTL 1 час — достаточно для ретраев CI
-    # Upstash поддерживает EXPIRE
+    # FIX-3: json.dumps вместо serialize_match (set_key не использует конверты)
+    rh.set_key(seen_key, json.dumps({"result": result, "ts": now_msk()}))
     try:
         rh._execute_upstash_cmd(["EXPIRE", seen_key, "3600"])
     except Exception:
@@ -471,14 +522,14 @@ def upsert_match(home_team="", away_team="", date_utc="",
                  source="unknown", mode="live", **extra_fields):
     """
     Создаёт или обновляет матч. Возвращает canonical_id или "".
-    §1.4 — единый шлюз, никто не пишет в Redis напрямую.
-    §1.5 — прошедшие матчи отсекаются (для mode=live).
-    §19.3 — mode="history" для исторических матчей.
-    §22.8 — **extra_fields для forward compatibility.
     """
     METRICS.inc("upsert_match")
 
-    # Нормализация
+    # FIX-8: Graceful shutdown check
+    if is_shutdown_requested():
+        log_event(source, "WARN", "upsert_match: shutdown requested, skipping")
+        return ""
+
     date_utc = normalize_date(date_utc)
     canonical_id = build_canonical_id(home_team, away_team, date_utc)
 
@@ -486,14 +537,12 @@ def upsert_match(home_team="", away_team="", date_utc="",
         log_event(source, "ERROR", "upsert_match: empty canonical_id")
         return ""
 
-    # Temporal leakage check (только для live)
     if mode == "live" and not is_future_match(date_utc):
         log_event(source, "DEBUG", "upsert_match: past match skipped",
                   cid=canonical_id)
         METRICS.inc("upsert_match_skipped_past")
         return ""
 
-    # Построение match-объекта
     match_obj = {
         "canonical_id": canonical_id,
         "home_team": home_team,
@@ -512,35 +561,29 @@ def upsert_match(home_team="", away_team="", date_utc="",
         **extra_fields,
     }
 
-    # Нормализация odds в 1x2 (§1.21)
     if "odds" in extra_fields:
         match_obj["odds"] = _normalize_incoming_odds(extra_fields["odds"])
 
-    # Запись в Redis
     rh = _get_redis()
     if rh:
-        key = f"match:{canonical_id}" if mode == "live" else f"history:match:{canonical_id}"
-        key = ns_key(key, load_config())
+        _base = "match" if mode == "live" else "history:match"
+        key = ns_key(_base, canonical_id)
         existing = rh.get_from_cache(key)
 
         if existing and isinstance(existing, dict):
-            # Merge: обновляем поля, не перезаписываем целиком
             for k, v in match_obj.items():
                 if k not in ("canonical_id", "schema_version", "version"):
                     if v is not None and v != "":
                         if k == "sources":
-                            # Добавляем source в список
                             existing_sources = existing.get("sources", [])
                             if source not in existing_sources:
                                 existing_sources.append(source)
                             existing["sources"] = existing_sources
                         elif k == "source_ids":
-                            # Merge source_ids
                             existing_ids = existing.get("source_ids", {})
                             existing_ids.update(v)
                             existing["source_ids"] = existing_ids
                         elif k == "odds":
-                            # Merge odds через _merge_odds
                             existing["odds"] = _merge_odds(
                                 existing.get("odds", {}), v, source
                             )
@@ -548,49 +591,49 @@ def upsert_match(home_team="", away_team="", date_utc="",
                             existing[k] = v
             existing["version"] = existing.get("version", 1) + 1
             existing["updated_at"] = now_msk()
-            rh.save_to_cache(key, serialize_match(existing))
+            # FIX-3: Python-объект, не serialize_match()
+            rh.save_to_cache(key, existing)
         else:
-            rh.save_to_cache(key, serialize_match(match_obj))
+            # FIX-3: Python-объект, не serialize_match()
+            rh.save_to_cache(key, match_obj)
 
     log_event(source, "INFO", "upsert_match",
               cid=canonical_id, mode=mode)
     return canonical_id
 
 
+# FIX-4: str() убран — сохраняет исходный тип (float, int, str)
 def _normalize_incoming_odds(odds_data):
-    """
-    Нормализует odds в формат 1x2. §1.21
-    Принимает плоский {"home": "1.85", ...} или {"1x2": {...}}.
-    """
+    """Нормализует odds в формат 1x2. §1.21"""
     if not odds_data:
         return {}
 
-    # Уже в формате 1x2
     if "1x2" in odds_data:
         return odds_data
 
-    # Плоский формат → 1x2
     if "home" in odds_data or "draw" in odds_data or "away" in odds_data:
         return {
             "1x2": {
                 "current": {
-                    "home": str(odds_data.get("home", "")),
-                    "draw": str(odds_data.get("draw", "")),
-                    "away": str(odds_data.get("away", "")),
+                    "home": odds_data.get("home"),
+                    "draw": odds_data.get("draw"),
+                    "away": odds_data.get("away"),
                 }
             }
         }
 
-    # Current-вложенный формат
     if "current" in odds_data:
         return {"1x2": odds_data}
 
     return odds_data
 
 
-def _merge_odds(existing_odds, new_odds, source):
+# FIX-5: Добавлена поддержка closing секции + upstream параметр
+def _merge_odds(existing_odds, new_odds, source, upstream=None):
     """
     Мержит odds с учётом приоритетов. §23.1
+    FIX-5: Добавлена поддержка closing секции (для Propline/Pinnacle)
+    FIX-5: upstream передаётся из patch_match (а не только из UPSTREAM_MAP)
     """
     if not existing_odds:
         return new_odds
@@ -599,7 +642,10 @@ def _merge_odds(existing_odds, new_odds, source):
 
     result = dict(existing_odds)
 
-    # Мержим по разделам 1x2
+    # Resolve upstream
+    if not upstream:
+        upstream = UPSTREAM_MAP.get(source, "")
+
     for market in new_odds:
         if market == "1x2":
             new_1x2 = new_odds["1x2"]
@@ -607,47 +653,70 @@ def _merge_odds(existing_odds, new_odds, source):
 
             # Current — с проверкой приоритета (§23.1)
             if "current" in new_1x2:
-                new_current = new_1x2["current"]
+                new_current = dict(new_1x2["current"])
                 existing_current = existing_1x2.get("current", {})
 
-                if existing_current and is_feature_enabled(
-                    "conflict_resolution", load_config()
-                ):
-                    # Проверяем приоритет
+                if existing_current and is_feature_enabled("conflict_resolution"):
                     existing_source = existing_current.get("_source", "unknown")
                     existing_upstream = existing_current.get("_upstream", "")
-                    new_upstream = new_1x2.get("_upstream", UPSTREAM_MAP.get(source, ""))
 
-                    if should_overwrite(source, new_upstream,
+                    if should_overwrite(source, upstream,
                                         existing_source, existing_upstream):
                         new_current["_source"] = source
-                        new_current["_upstream"] = new_upstream
+                        new_current["_upstream"] = upstream
                         existing_1x2["current"] = new_current
                     else:
-                        log_event(source, "DEBUG", "Lower priority odds kept in sources[]",
-                                  cid="odds_merge",
-                                  new_rank=_get_source_rank(source, new_upstream),
+                        log_event(source, "DEBUG",
+                                  "Lower priority odds kept in sources[]",
+                                  new_rank=_get_source_rank(source, upstream),
                                   existing_rank=_get_source_rank(existing_source, existing_upstream))
                 else:
                     new_current["_source"] = source
+                    new_current["_upstream"] = upstream
                     existing_1x2["current"] = new_current
 
             # Opening — first writer wins
             if "opening" in new_1x2 and "opening" not in existing_1x2:
                 existing_1x2["opening"] = new_1x2["opening"]
 
+            # FIX-5: Closing — с проверкой приоритета (для Propline/Pinnacle)
+            if "closing" in new_1x2:
+                new_closing = dict(new_1x2["closing"])
+                existing_closing = existing_1x2.get("closing", {})
+
+                if existing_closing and is_feature_enabled("conflict_resolution"):
+                    existing_source = existing_closing.get("_source", "unknown")
+                    existing_upstream = existing_closing.get("_upstream", "")
+
+                    if should_overwrite(source, upstream,
+                                        existing_source, existing_upstream):
+                        new_closing["_source"] = source
+                        new_closing["_upstream"] = upstream
+                        existing_1x2["closing"] = new_closing
+                    else:
+                        log_event(source, "DEBUG",
+                                  "Lower priority closing kept",
+                                  new_rank=_get_source_rank(source, upstream),
+                                  existing_rank=_get_source_rank(existing_source, existing_upstream))
+                else:
+                    new_closing["_source"] = source
+                    new_closing["_upstream"] = upstream
+                    existing_1x2["closing"] = new_closing
+
+            # Best — first writer wins (или last writer wins, если ранг выше)
+            if "best" in new_1x2:
+                existing_1x2["best"] = new_1x2["best"]
+
             # Sources — всегда добавляем
             if "sources" not in existing_1x2:
                 existing_1x2["sources"] = []
             for src in new_1x2.get("sources", []):
                 existing_1x2["sources"].append(src)
-            # Ограничиваем длину sources[]
             if len(existing_1x2["sources"]) > 50:
                 existing_1x2["sources"] = existing_1x2["sources"][-50:]
 
             result["1x2"] = existing_1x2
         else:
-            # Другие рынки — простая перезапись
             result[market] = new_odds[market]
 
     return result
@@ -662,13 +731,15 @@ def patch_match(canonical_id, section, data, source="unknown",
                 upstream=None, idempotency_key=None, **kwargs):
     """
     Точечное обновление секции матча (CAS merge-patch).
-    §1.4, §1.20 — единый шлюз.
-    §23.2 — idempotency_key для защиты от дублей при ретраях CI.
-    §22.8 — **kwargs для forward compatibility.
-
     Возвращает: bool (True если обновлено)
     """
     METRICS.inc("patch_match")
+
+    # FIX-8: Graceful shutdown check
+    if is_shutdown_requested():
+        log_event(source, "WARN", "patch_match: shutdown requested, skipping",
+                  cid=canonical_id)
+        return False
 
     # §23.2: Idempotency check
     if idempotency_key:
@@ -682,12 +753,11 @@ def patch_match(canonical_id, section, data, source="unknown",
         log_event(source, "ERROR", "patch_match: redis_hub not available")
         return False
 
-    key = ns_key(f"match:{canonical_id}", load_config())
+    key = ns_key("match", canonical_id)
     match_obj = rh.get_from_cache(key)
 
     if not match_obj or not isinstance(match_obj, dict):
-        # Попробуем history
-        key = ns_key(f"history:match:{canonical_id}", load_config())
+        key = ns_key("history:match", canonical_id)
         match_obj = rh.get_from_cache(key)
 
     if not match_obj or not isinstance(match_obj, dict):
@@ -703,13 +773,13 @@ def patch_match(canonical_id, section, data, source="unknown",
     # Обновление секции
     if section == "odds":
         normalized = _normalize_incoming_odds(data)
+        # FIX-5: Передаём upstream в _merge_odds
         match_obj["odds"] = _merge_odds(
-            match_obj.get("odds", {}), normalized, source
+            match_obj.get("odds", {}), normalized, source, upstream
         )
     elif section == "status":
-        # §24.1: Статус меняется только через set_match_status()
         log_event(source, "WARN",
-                  "patch_match: use set_match_status() for status changes. §24.1")
+                  "patch_match: use set_match_status() for status changes")
         return False
     else:
         match_obj[section] = data
@@ -717,10 +787,9 @@ def patch_match(canonical_id, section, data, source="unknown",
     match_obj["version"] = match_obj.get("version", 1) + 1
     match_obj["updated_at"] = now_msk()
 
-    # Запись обратно
-    rh.save_to_cache(key, serialize_match(match_obj))
+    # FIX-3: Python-объект, не serialize_match()
+    rh.save_to_cache(key, match_obj)
 
-    # §23.2: Stamp idempotency
     if idempotency_key:
         _stamp_idempotency(canonical_id, idempotency_key, True)
 
@@ -736,10 +805,7 @@ def patch_match(canonical_id, section, data, source="unknown",
 
 @timed
 def get_match_any(canonical_id, namespace="any"):
-    """
-    Читает матч из live или history. §19.3
-    Возвращает dict или None.
-    """
+    """Читает матч из live или history. §19.3"""
     METRICS.inc("get_match_any")
     rh = _get_redis()
     if not rh:
@@ -747,14 +813,12 @@ def get_match_any(canonical_id, namespace="any"):
 
     config = load_config()
 
-    # Сначала live
-    key = ns_key(f"match:{canonical_id}", config)
+    key = ns_key("match", canonical_id)
     match_obj = rh.get_from_cache(key)
     if match_obj and isinstance(match_obj, dict):
         return match_obj
 
-    # Затем history
-    key = ns_key(f"history:match:{canonical_id}", config)
+    key = ns_key("history:match", canonical_id)
     match_obj = rh.get_from_cache(key)
     if match_obj and isinstance(match_obj, dict):
         return match_obj
@@ -767,37 +831,34 @@ def get_match_any(canonical_id, namespace="any"):
 # ═══════════════════════════════════════════════════════════
 
 def save_meta(collector, **kwargs):
-    """
-    Сохраняет метаданные коллектора. §1.27
-    Автоматически включает метрики (§24.5).
-    """
+    """Сохраняет метаданные коллектора. §1.27"""
     rh = _get_redis()
     if not rh:
         return
 
     config = load_config()
-    key = ns_key(f"{collector}:meta", config)
+    key = ns_key(collector, "meta")
 
     meta = {
         "last_run": now_msk(),
         **kwargs,
-        "metrics": METRICS.report(),  # §24.5
+        "metrics": METRICS.report(),
     }
 
-    rh.save_to_cache(key, serialize_match(meta))
+    # FIX-3: Python-объект, не serialize_match()
+    rh.save_to_cache(key, meta)
     log_event(collector, "INFO", "save_meta",
               error_count=kwargs.get("error_count", 0))
 
 
 # ═══════════════════════════════════════════════════════════
-# Core API: cleanup_expired (с §24.7 cleanup_owner)
+# Core API: cleanup_expired (FIX-6 — реализация вместо заглушки)
 # ═══════════════════════════════════════════════════════════
 
 def cleanup_expired(dry_run=False, auto_migrate=True):
     """
-    Удаляет завершённые матчи. §1.7
-    Вызывается только cleanup_owner (§24.7) или любым коллектором,
-    если оркестрация не настроена (§1.7a).
+    Удаляет завершённые матчи из live, мигрирует в history.
+    FIX-6: Реализация (была заглушка deleted=0, migrated=0).
     """
     METRICS.inc("cleanup_expired")
     rh = _get_redis()
@@ -807,17 +868,239 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
     log_event("hub", "INFO", "cleanup_expired starting",
               dry_run=dry_run, auto_migrate=auto_migrate)
 
-    # Реализация зависит от redis_hub API
-    # Заглушка — полная реализация в redis_hub.py
     deleted = 0
     migrated = 0
 
-    # ... (делегируется к существующей реализации в redis_hub.py)
+    # Получаем все live-матчи
+    all_fields = rh.get_all_fields()
+    if not all_fields or not isinstance(all_fields, dict):
+        log_event("hub", "WARN", "cleanup_expired: get_all_fields returned empty")
+        return {"count": 0, "migrated": 0, "dry_run": dry_run, "reason": "no_data"}
+
+    config = load_config()
+
+    for field_id, match_obj in all_fields.items():
+        # FIX-8: Graceful shutdown
+        if is_shutdown_requested():
+            log_event("hub", "WARN", "cleanup_expired: shutdown requested, stopping")
+            break
+
+        # Только live-матчи (не meta, не system)
+        if not field_id.startswith("match:") or ":meta" in field_id:
+            continue
+        if "idem" in field_id or "canary" in field_id:
+            continue
+
+        match = deserialize_match(match_obj) if isinstance(match_obj, str) else match_obj
+        if not match or not isinstance(match, dict):
+            continue
+
+        status = match.get("status", "")
+        if status != "completed":
+            continue
+
+        # Миграция в history
+        canonical_id = match.get("canonical_id", "")
+        if not canonical_id:
+            continue
+
+        history_key = ns_key("history:match", canonical_id)
+
+        if dry_run:
+            log_event("hub", "INFO", "cleanup dry-run: would migrate",
+                      cid=canonical_id)
+            migrated += 1
+            continue
+
+        if auto_migrate:
+            # FIX-3: Python-объект
+            rh.save_to_cache(history_key, match)
+
+        # Удаляем из live
+        rh.delete_from_cache(field_id)
+        deleted += 1
+        migrated += 1
 
     log_event("hub", "INFO", "cleanup_expired done",
               deleted=deleted, migrated=migrated)
     METRICS.inc("cleanup_deleted", deleted)
     return {"count": deleted, "migrated": migrated, "dry_run": dry_run}
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════
+# Odds Helpers — wrappers for value_engine.py compatibility
+# ═══════════════════════════════════════════════════════════
+
+def get_all_odds(match: dict) -> dict:
+    """
+    Возвращает odds-секцию матча в формате {current: {...}, closing: {...}, sources: [...]}.
+    Wrapper для value_engine.py — извлекает 1x2 из match.odds.
+    """
+    if not isinstance(match, dict):
+        return {}
+    odds = match.get("odds", {})
+    if not isinstance(odds, dict):
+        return {}
+    
+    # Если odds уже в формате 1x2
+    if "1x2" in odds:
+        sec = odds["1x2"]
+        return {
+            "current": sec.get("current", {}),
+            "closing": sec.get("closing", {}),
+            "sources": match.get("sources", []),
+            "verification": match.get("odds_verification", "UNVERIFIED"),
+            "independent_sources": len(set(match.get("sources", []))),
+            "betradar_consensus": False,
+        }
+    
+    # Если odds в плоском формате
+    if "current" in odds or "closing" in odds:
+        return {
+            "current": odds.get("current", {}),
+            "closing": odds.get("closing", {}),
+            "sources": match.get("sources", []),
+            "verification": "UNVERIFIED",
+            "independent_sources": len(set(match.get("sources", []))),
+            "betradar_consensus": False,
+        }
+    
+    return {}
+
+
+def get_current_odds(match: dict) -> dict:
+    """
+    Возвращает только current odds из матча.
+    Wrapper для value_engine.py.
+    """
+    all_o = get_all_odds(match)
+    return all_o.get("current", {})
+
+
+def get_match(canonical_id: str) -> dict:
+    """
+    Alias для get_match_any — совместимость с value_engine.py.
+    """
+    return get_match_any(canonical_id)
+
+
+def get_history(canonical_id: str) -> dict:
+    """
+    Читает матч из history (не live).
+    """
+    rh = _get_redis()
+    if not rh:
+        return None
+    key = ns_key("history:match", canonical_id)
+    match_obj = rh.get_from_cache(key)
+    if match_obj and isinstance(match_obj, dict):
+        return match_obj
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+# Phase 2: process_matches — пакетная обработка матчей
+# ═══════════════════════════════════════════════════════════
+
+@timed
+def process_matches(matches: list, default_source: str = "unknown") -> dict:
+    """
+    Принимает список матчей от коллекторов, сливает дубли по canonical_id
+    и записывает в Redis через upsert_match / patch_match.
+
+    Каждый элемент списка — dict с ключами:
+        home_team, away_team, date_utc, competition, country,
+        odds (опционально), source (опционально), **extra
+
+    Возвращает: {created, patched, skipped, errors, total}
+    """
+    METRICS.inc("process_matches")
+
+    if not matches:
+        return {"created": 0, "patched": 0, "skipped": 0,
+                "errors": 0, "total": 0}
+
+    stats = {"created": 0, "patched": 0, "skipped": 0, "errors": 0,
+             "total": len(matches)}
+
+    # Группируем по canonical_id
+    by_cid: dict[str, list[dict]] = {}
+    for m in matches:
+        home = m.get("home_team", m.get("home", ""))
+        away = m.get("away_team", m.get("away", ""))
+        date = m.get("date_utc", "")
+        cid = build_canonical_id(home, away, date)
+        if not cid:
+            stats["skipped"] += 1
+            log_event(default_source, "WARN",
+                      "process_matches: empty canonical_id",
+                      home=home, away=away)
+            continue
+        by_cid.setdefault(cid, []).append(m)
+
+    # Обрабатываем каждый canonical_id
+    for cid, group in by_cid.items():
+        if is_shutdown_requested():
+            log_event(default_source, "WARN",
+                      "process_matches: shutdown requested, stopping")
+            break
+
+        # Сортируем по рангу источника (меньше = выше приоритет)
+        group.sort(key=lambda m: _get_source_rank(
+            m.get("source", default_source),
+            UPSTREAM_MAP.get(m.get("source", ""), "")
+        ))
+
+        # Первый (высший приоритет) — upsert
+        primary = group[0]
+        source = primary.get("source", default_source)
+
+        extra = {}
+        for k in ("odds", "score", "source_ids", "predictions", "h2h", "stats"):
+            if k in primary:
+                extra[k] = primary[k]
+
+        created_cid = upsert_match(
+            home_team=primary.get("home_team", primary.get("home", "")),
+            away_team=primary.get("away_team", primary.get("away", "")),
+            date_utc=primary.get("date_utc", ""),
+            competition=primary.get("competition", ""),
+            country=primary.get("country", ""),
+            source=source,
+            **extra,
+        )
+
+        if created_cid:
+            stats["created"] += 1
+        else:
+            stats["skipped"] += 1
+
+        # Остальные (более низкий приоритет) — patch odds
+        for secondary in group[1:]:
+            if is_shutdown_requested():
+                break
+            sec_source = secondary.get("source", default_source)
+
+            if "odds" in secondary:
+                idempotency_key = (
+                    f"{sec_source}:{cid}:odds:"
+                    f"{secondary.get('date_utc', '')[:10]}"
+                )
+                ok = patch_match(
+                    cid, "odds", secondary["odds"],
+                    source=sec_source,
+                    idempotency_key=idempotency_key,
+                )
+                if ok:
+                    stats["patched"] += 1
+                else:
+                    stats["errors"] += 1
+
+    log_event(default_source, "INFO", "process_matches done", **stats)
+    return stats
 
 
 # ═══════════════════════════════════════════════════════════
@@ -830,14 +1113,7 @@ _run_id = None
 def run_initialization(collector="unknown"):
     """
     Единая инициализация для всех коллекторов. §1.11
-    Выполняет:
-    1. Загрузку и валидацию конфигурации (§24.3)
-    2. Установку shutdown handler (§23.3)
-    3. Генерацию Run ID (§21.2)
-    4. Cleanup (с проверкой cleanup_owner, §24.7)
-    5. Сброс метрик (§24.5)
-
-    Возвращает dict с метриками инициализации.
+    FIX-7: is_feature_enabled / should_run_cleanup — 1 аргумент.
     """
     global _run_id
 
@@ -851,7 +1127,8 @@ def run_initialization(collector="unknown"):
             log_event("hub", "ERROR", f"Config: {e}")
 
     # 2. Graceful shutdown (§23.3)
-    if is_feature_enabled("graceful_shutdown", config):
+    # FIX-7: is_feature_enabled принимает 1 аргумент
+    if is_feature_enabled("graceful_shutdown"):
         install_shutdown_handler()
 
     # 3. Run ID (§21.2)
@@ -861,8 +1138,9 @@ def run_initialization(collector="unknown"):
               env=get_env(), hub_version=__version__)
 
     # 4. Cleanup (§24.7)
-    if should_run_cleanup(collector, config):
-        cleanup_expired(auto_migrate=is_feature_enabled("auto_migrate", config))
+    # FIX-7: should_run_cleanup принимает 1 аргумент
+    if should_run_cleanup(collector):
+        cleanup_expired(auto_migrate=is_feature_enabled("auto_migrate"))
     else:
         log_event(collector, "DEBUG",
                   "Cleanup skipped — not cleanup owner (§24.7)")
@@ -885,7 +1163,6 @@ def run_initialization(collector="unknown"):
 
 
 def get_run_id():
-    """Возвращает текущий Run ID. §21.2"""
     return _run_id
 
 
@@ -894,7 +1171,6 @@ def get_run_id():
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Self-test
     init = run_initialization("self_test")
     print(f"\nHub version: {__version__}")
     print(f"Schema version: {SCHEMA_VERSION}")
