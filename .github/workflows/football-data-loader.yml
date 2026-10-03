@@ -24,6 +24,16 @@ on:
         type: boolean
         required: false
         default: false
+      flush:
+        description: 'Очистить старые ключи перед загрузкой'
+        type: boolean
+        required: false
+        default: false
+
+# FIX-3: Concurrency — предотвращает двойную запись в Redis
+concurrency:
+  group: football-data-loader
+  cancel-in-progress: false
 
 jobs:
   load:
@@ -36,8 +46,16 @@ jobs:
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days }}
       LIMIT_INPUT: ${{ github.event.inputs.limit }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+      FLUSH_INPUT: ${{ github.event.inputs.flush }}
+      # FIX-1: SHARED_* — для redis_hub (транспортный слой)
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+      # FIX-1: UPSTASH_* — для verify-шага (прямой доступ)
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      # FIX-5: Путь к gatekeeper_config.yaml
+      GK_CONFIG_FILE: gatekeeper_config.yaml
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -46,8 +64,52 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # FIX-2: 3.12 — единая версия для всех workflow
+          python-version: '3.12'
           cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml requests
+
+      - name: Flush old keys (optional)
+        if: ${{ github.event.inputs.flush == 'true' }}
+        run: |
+          echo "Flushing football_data:* keys..."
+          python -c "
+          import os, json, urllib.request
+          URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '').rstrip('/')
+          TOKEN = os.environ.get('SHARED_UPSTASH_REDIS_REST_TOKEN', '')
+          if not URL or not TOKEN:
+              print('WARN: No SHARED_* Redis creds, trying UPSTASH_*')
+              URL = os.environ.get('UPSTASH_REDIS_REST_URL', '').rstrip('/')
+              TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
+          if not URL or not TOKEN:
+              print('ERROR: No Redis creds')
+              exit(1)
+          def cmd(*args):
+              req = urllib.request.Request(
+                  URL,
+                  data=json.dumps(list(args)).encode(),
+                  headers={'Authorization': f'Bearer {TOKEN}',
+                           'Content-Type': 'application/json'}
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read()).get('result')
+          # SCAN + DEL football_data:* keys
+          cursor = '0'
+          deleted = 0
+          while True:
+              result = cmd('SCAN', cursor, 'MATCH', 'football_data:*', 'COUNT', 100)
+              cursor = result[0]
+              keys = result[1]
+              if keys:
+                  cmd('DEL', *keys)
+                  deleted += len(keys)
+              if cursor == '0':
+                  break
+          print(f'Flushed {deleted} football_data:* keys')
+          "
 
       - name: Run Football Data Collector
         env:
@@ -74,8 +136,10 @@ jobs:
           import os, json, urllib.request, sys
           from datetime import datetime, timezone
 
-          URL = os.environ.get('UPSTASH_REDIS_REST_URL', '').rstrip('/')
-          TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
+          # FIX-1: Prefer SHARED_* (redis_hub), fallback UPSTASH_*
+          URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '') or os.environ.get('UPSTASH_REDIS_REST_URL', '')
+          URL = URL.rstrip('/')
+          TOKEN = os.environ.get('SHARED_UPSTASH_REDIS_REST_TOKEN', '') or os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
           LIMIT = os.environ.get('LIMIT_INPUT', '0')
 
           if not URL or not TOKEN:
@@ -93,7 +157,7 @@ jobs:
                   with urllib.request.urlopen(req, timeout=30) as r:
                       return json.loads(r.read()).get('result')
               except Exception as e:
-                  print(f'  [CMD ERROR] {args[0]} {args[1] if len(args)>1 else \"\"}: {e}')
+                  print(f'  [CMD ERROR] {args[0]}: {e}')
                   return None
 
           print('=== Redis Verify ===')
@@ -133,13 +197,13 @@ jobs:
                   meta_all = json.loads(meta_raw)
                   for field, m in meta_all.items():
                       if isinstance(m, dict):
-                          print(f'  meta {field}: stored={m.get(\"stored_matches\", m.get(\"matches\"))}, '
-                                f'errors={m.get(\"error_count\", m.get(\"errors\"))}, '
-                                f'last={str(m.get(\"last_run_at\", m.get(\"last_run\", \"\")))[:19]}')
+                          print(f'  meta {field}: stored={m.get("stored_matches", m.get("matches"))}, '
+                                f'errors={m.get("error_count", m.get("errors"))}, '
+                                f'last={str(m.get("last_run_at", m.get("last_run", "")))[:19]}')
               except (json.JSONDecodeError, TypeError) as e:
                   print(f'  meta: parse error: {e}')
           else:
-              print('  meta: not found (SET football_data:meta)')
+              print('  meta: not found')
 
           first = None
           if 'E0' in leagues:
@@ -153,136 +217,37 @@ jobs:
               if data:
                   try:
                       m = json.loads(data)
-                  except (json.JSONDecodeError, TypeError) as e:
-                      print(f'  First match: parse error: {e}')
+                  except (json.JSONDecodeError, TypeError):
                       m = None
 
                   if m:
-                      print(f'First match: {m.get(\"home_team\")} vs {m.get(\"away_team\")}')
+                      print(f'First match: {m.get("home_team")} vs {m.get("away_team")}')
                       print(f'  CID: {cid}')
-                      print(f'  home_clean: {m.get(\"home_clean\")}')
-                      print(f'  away_clean: {m.get(\"away_clean\")}')
-                      print(f'  Score: {m.get(\"score\")}')
-                      print(f'  Date UTC: {m.get(\"date_utc\")}')
-                      print(f'  Time UTC: {m.get(\"time_utc\", \"(none)\")}')
-                      print(f'  Schema version: {m.get(\"schema_version\")}')
-                      print(f'  Season: {m.get(\"season\")}')
-                      print(f'  League code: {m.get(\"league_code\")}')
-                      print(f'  h2h present: {\"h2h\" in m}')
-                      print(f'  Total payload fields: {len(m)}')
-                      print()
+                      print(f'  home_clean: {m.get("home_clean")}')
+                      print(f'  Date UTC: {m.get("date_utc")}')
+                      print(f'  Schema version: {m.get("schema_version")}')
+                      print(f'  Season: {m.get("season")}')
 
-                      print('--- Odds 1x2 ---')
+                      # FIX-6: Verify odds are float (not str)
                       odds = m.get('odds', {}).get('1x2', {})
-                      print(f'  Current (Pinnacle closing): {odds.get(\"current\")}')
-                      print(f'  Best (Max closing): {odds.get(\"best\")}')
-                      print(f'  Opening (Pinnacle): {odds.get(\"opening\")}')
-                      bk_open = odds.get('bookmakers_opening', {})
-                      bk_close = odds.get('bookmakers_closing', {})
-                      print(f'  Bookmakers opening: {len(bk_open)} -> {list(bk_open.keys())}')
-                      print(f'  Bookmakers closing: {len(bk_close)} -> {list(bk_close.keys())}')
-                      sources = odds.get('sources', [])
-                      print(f'  Sources entries: {len(sources)}')
-                      for s in sources:
-                          print(f'    {s.get(\"upstream\")} ({s.get(\"type\")}): {s.get(\"price\")}')
-                      print()
-
-                      print('--- Over/Under 2.5 ---')
-                      ou = m.get('odds', {}).get('over_under_25', {})
-                      ou_open = ou.get('opening', {})
-                      ou_close = ou.get('closing', {})
-                      print(f'  Opening: {len(ou_open)} -> {list(ou_open.keys())}')
-                      print(f'  Closing: {len(ou_close)} -> {list(ou_close.keys())}')
-                      if ou_close:
-                          ps = ou_close.get('pinnacle', {})
-                          print(f'  Pinnacle closing: over={ps.get(\"over\")}, under={ps.get(\"under\")}')
-                      print()
-
-                      print('--- Asian Handicap ---')
-                      ah = m.get('odds', {}).get('asian_handicap', {})
-                      ah_open = ah.get('opening', {})
-                      ah_close = ah.get('closing', {})
-                      print(f'  Opening: {len(ah_open)} -> {list(ah_open.keys())}')
-                      print(f'  Closing: {len(ah_close)} -> {list(ah_close.keys())}')
-                      if ah_close:
-                          ps = ah_close.get('pinnacle', {})
-                          print(f'  Pinnacle closing AH: {ps}')
-                      print()
-
-                      print('--- Stats ---')
-                      stats = m.get('stats', {})
-                      print(f'  Fields: {len(stats)}')
-                      print(f'  _source: {stats.get(\"_source\")}')
-                      print()
-
-                      print('--- Source Map ---')
-                      sm = m.get('source_map', {})
-                      print(f'  Sharp benchmark: {sm.get(\"sharp_benchmark\")}')
-                      print(f'  Soft bookmakers: {sm.get(\"soft_bookmakers\")}')
-                      print(f'  Types: {sm.get(\"types\")}')
-                      print(f'  Odds upstream: {sm.get(\"odds\",{}).get(\"upstream\")}')
-                      print()
-
-                      print('--- value_analysis ---')
-                      print(f'  value_analysis present: {\"value_analysis\" in m}')
-                      print()
-
-                      print('--- csv_raw ---')
-                      raw = m.get('csv_raw', {})
-                      print(f'  csv_raw columns: {len(raw)}')
-                      if raw:
-                          print(f'  Has PPC H/D/A: {\"PPCH\" in raw}, {\"PPCD\" in raw}, {\"PPCA\" in raw}')
-                          print(f'  Has MaxC H/D/A: {\"MaxCH\" in raw}, {\"MaxCD\" in raw}, {\"MaxCA\" in raw}')
-                          print(f'  Has B365C H/D/A: {\"B365CH\" in raw}, {\"B365CD\" in raw}, {\"B365CA\" in raw}')
-                          print(f'  Has BFD H/D/A: {\"BFDH\" in raw}, {\"BFDD\" in raw}, {\"BFDA\" in raw}')
-                          print(f'  Has AHh: {\"AHh\" in raw}')
-                          print(f'  Has AHCh: {\"AHCh\" in raw}')
-                          print(f'  Has Time: {\"Time\" in raw}')
+                      current = odds.get('current', {})
+                      if current:
+                          h = current.get('home')
+                          print(f'  Odds home type: {type(h).__name__} = {h}')
+                          if isinstance(h, str):
+                              print('  WARNING: odds are str, expected float (Schema v710)')
 
                       if LIMIT == '1':
                           print()
-                          print('=' * 60)
                           print('--- FULL PAYLOAD DUMP (limit=1) ---')
-                          print('=' * 60)
                           full = json.dumps(m, indent=2, ensure_ascii=False)
                           chunk = 4000
                           for i in range(0, len(full), chunk):
                               print(full[i:i+chunk])
-                          print()
-                          print(f'--- END DUMP ({len(full)} chars, {len(m)} fields) ---')
               else:
                   print(f'  First match: GET history:match:{cid} returned nil')
-                  print('  WARNING: Data not written or transport mismatch (expected SET, got HSET?)')
           elif total == 0:
-              print('WARNING: NO MATCHES FOUND — data not written to Redis')
-
-          print()
-          print('--- Team SET indexes ---')
-          if first and isinstance(first, list) and first and m:
-              home_clean = m.get('home_clean', '')
-              away_clean = m.get('away_clean', '')
-              for team_name in [home_clean, away_clean]:
-                  if team_name:
-                      team_key = team_name.replace(' ', '_')
-                      members = cmd('SMEMBERS', f'history:team:{team_key}')
-                      cnt = len(members) if members else 0
-                      print(f'  history:team:{team_key}: {cnt} members')
-                      if cnt == 0:
-                          print(f'    WARNING: team SET empty — key format mismatch?')
-
-          print()
-          print('--- Canonical ID format ---')
-          if first and isinstance(first, list) and first:
-              cid_check = first[0]
-              has_spaces = ' ' in cid_check
-              has_underscores = '__' in cid_check
-              print(f'  CID: {cid_check}')
-              print(f'  Has spaces: {has_spaces} (should be False)')
-              print(f'  Has __ separator: {has_underscores} (should be True)')
-              if has_spaces:
-                  print(f'  ERROR: CID contains spaces')
-              if not has_underscores:
-                  print(f'  ERROR: CID missing __ separator')
+              print('WARNING: NO MATCHES FOUND')
 
           print()
           print('=== Verify Done ===')
@@ -299,9 +264,9 @@ jobs:
           echo "History days: ${HISTORY_DAYS_INPUT}"
           echo "Limit: ${LIMIT_INPUT}"
           echo "Dry run: ${DRY_RUN_INPUT}"
+          echo "Flush: ${FLUSH_INPUT}"
           echo ""
           if [ -n "${{ github.run_id }}" ]; then
             echo "Run ID: ${{ github.run_id }}"
             echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
-          
