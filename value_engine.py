@@ -1,5 +1,5 @@
 # value_engine.py
-# Version: 3.0 — Фаза 3: real value calculation, closing odds, margin
+# Version: 3.1 — Phase 5: support both "open" (schema) and "current" (hub) odds keys
 
 import logging
 import os
@@ -18,7 +18,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "3.0"
+__version__ = "3.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,24 +125,30 @@ def calculate_margin(odds: Dict[str, Any]) -> Optional[float]:
 
 def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, float, float]], Optional[Tuple[float, float, float]]]:
     """
-    Извлекает current и closing odds как два независимых тензора.
-    Возвращает (current_tuple, closing_tuple). Любой может быть None.
+    Извлекает open и closing odds как два независимых тензора.
+    Возвращает (open_tuple, closing_tuple). Любой может быть None.
+
+    FIX v3.1: Ищет "open" (схема/фикстуры) как primary,
+              "current" (хаб internal) как fallback.
 
     Closing — «истинная» цена рынка (PropLine/Pinnacle).
-    Current — коэффициент, на который можно поставить сейчас.
+    Open — коэффициент, на который можно поставить сейчас.
     """
-    current_tuple = None
+    open_tuple = None
     closing_tuple = None
 
-    current_block = all_odds.get("current")
-    if isinstance(current_block, dict):
-        current_tuple = _extract_odds_tuple(current_block)
+    # FIX v3.1: "open" — primary (схема v710), "current" — fallback (хаб internal)
+    open_block = all_odds.get("open")
+    if not isinstance(open_block, dict):
+        open_block = all_odds.get("current")
+    if isinstance(open_block, dict):
+        open_tuple = _extract_odds_tuple(open_block)
 
     closing_block = all_odds.get("closing")
     if isinstance(closing_block, dict):
         closing_tuple = _extract_odds_tuple(closing_block)
 
-    return current_tuple, closing_tuple
+    return open_tuple, closing_tuple
 
 
 def _extract_source(sources: List[Dict[str, Any]]) -> Optional[str]:
@@ -166,19 +172,19 @@ def evaluate_match_full(
     Полная оценка value. Возвращает dict с деталями или None.
 
     Логика value:
-    1. Если есть current И closing — value = разница нормализованных
-       implied probs (closing = «истина», current = где ставим).
-    2. Если есть только current — value = отклонение max prob от 1/3
+    1. Если есть open И closing — value = разница нормализованных
+       implied probs (closing = «истина», open = где ставим).
+    2. Если есть только open — value = отклонение max prob от 1/3
        (дисбаланс рынка), fallback без closing.
     3. Если есть только closing — value не считается (нечего сравнивать).
 
     Возвращает:
         {
-            "value": float,           # значение value
-            "direction": "home"|"draw"|"away",  # где максимальное value
-            "margin": float,           # bookmaker margin на current odds
-            "closing_margin": float|None,  # margin на closing odds
-            "current_odds": (h, d, a),
+            "value": float,
+            "direction": "home"|"draw"|"away",
+            "margin": float,
+            "closing_margin": float|None,
+            "current_odds": (h, d, a),       # open odds tuple (имя сохранено для совместимости)
             "closing_odds": (h, d, a)|None,
             "best_source": str|None,
         }
@@ -190,27 +196,27 @@ def evaluate_match_full(
     if not isinstance(all_odds, dict):
         return None
 
-    current_tuple, closing_tuple = extract_odds_pair(all_odds)
+    open_tuple, closing_tuple = extract_odds_pair(all_odds)
 
-    # Нет ни current, ни closing — нечего оценивать
-    if not current_tuple and not closing_tuple:
+    # Нет ни open, ни closing — нечего оценивать
+    if not open_tuple and not closing_tuple:
         return None
 
     # Только closing — нечего сравнивать
-    if not current_tuple and closing_tuple:
+    if not open_tuple and closing_tuple:
         logger.debug("Только closing odds — value не вычисляется")
         return None
 
-    # Fallback: если current есть, но нет closing — используем current
-    if current_tuple and not closing_tuple:
-        return _evaluate_single(current_tuple, value_threshold, match_data, has_closing=False)
+    # Fallback: если open есть, но нет closing — используем open
+    if open_tuple and not closing_tuple:
+        return _evaluate_single(open_tuple, value_threshold, match_data, has_closing=False)
 
-    # Оба есть — считаем реальный value: current vs closing
-    return _evaluate_dual(current_tuple, closing_tuple, value_threshold, match_data)
+    # Оба есть — считаем реальный value: open vs closing
+    return _evaluate_dual(open_tuple, closing_tuple, value_threshold, match_data)
 
 
 def _evaluate_single(
-    current: Tuple[float, float, float],
+    open_odds: Tuple[float, float, float],
     threshold: float,
     match_data: Dict[str, Any],
     has_closing: bool = False,
@@ -219,7 +225,7 @@ def _evaluate_single(
     Fallback-оценка без closing odds.
     Value = отклонение максимальной normalised prob от 1/3 (равномерного распределения).
     """
-    hp, dp, ap, margin = _implied_probs(current)
+    hp, dp, ap, margin = _implied_probs(open_odds)
     h_norm, d_norm, a_norm = _normalize_probs((hp, dp, ap))
 
     fair = 1.0 / 3.0
@@ -247,39 +253,38 @@ def _evaluate_single(
         "direction": direction,
         "margin": round(margin, 5),
         "closing_margin": None,
-        "current_odds": current,
+        "current_odds": open_odds,
         "closing_odds": None,
         "best_source": best_source,
     }
 
 
 def _evaluate_dual(
-    current: Tuple[float, float, float],
+    open_odds: Tuple[float, float, float],
     closing: Tuple[float, float, float],
     threshold: float,
     match_data: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """
-    Реальный value: сравнение current (где ставим) vs closing (истина рынка).
+    Реальный value: сравнение open (где ставим) vs closing (истина рынка).
 
     implied_prob = 1 / odds.
     fair_prob = normalised implied prob (без margin).
-    value_home = fair_prob_home(closing) - fair_prob_home(current)
-    ...
+    value_home = fair_prob_home(closing) - fair_prob_home(open)
     value = max(abs(value_home), abs(value_draw), abs(value_away))
     """
-    ch, cd, ca = current
+    ch, cd, ca = open_odds
     kh, kd, ka = closing
 
     # Implied probs
-    c_hp, c_dp, c_ap, c_margin = _implied_probs(current)
+    c_hp, c_dp, c_ap, c_margin = _implied_probs(open_odds)
     k_hp, k_dp, k_ap, k_margin = _implied_probs(closing)
 
     # Normalised probs (убираем margin)
     c_hn, c_dn, c_an = _normalize_probs((c_hp, c_dp, c_ap))
     k_hn, k_dn, k_an = _normalize_probs((k_hp, k_dp, k_ap))
 
-    # Value = разница normalised probs (closing = истина, current = где ставим)
+    # Value = разница normalised probs (closing = истина, open = где ставим)
     v_home = k_hn - c_hn
     v_draw = k_dn - c_dn
     v_away = k_an - c_an
@@ -304,7 +309,7 @@ def _evaluate_dual(
         "direction": direction,
         "margin": round(c_margin, 5),
         "closing_margin": round(k_margin, 5),
-        "current_odds": current,
+        "current_odds": open_odds,
         "closing_odds": closing,
         "best_source": best_source,
     }

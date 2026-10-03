@@ -58,7 +58,7 @@ except ImportError:
 # §22.8: Hub version
 # ═══════════════════════════════════════════════════════════
 
-__version__ = "8.9-patched"
+__version__ = "8.10-patched"
 HUB_API_VERSION = "8.9"
 SCHEMA_VERSION = "v710"
 
@@ -614,7 +614,12 @@ def _normalize_incoming_odds(odds_data):
     if "home" in odds_data or "draw" in odds_data or "away" in odds_data:
         return {
             "1x2": {
-                "current": {
+                "open": {
+                    "home": odds_data.get("home"),
+                    "draw": odds_data.get("draw"),
+                    "away": odds_data.get("away"),
+                },
+                "current": {  # backward compat
                     "home": odds_data.get("home"),
                     "draw": odds_data.get("draw"),
                     "away": odds_data.get("away"),
@@ -622,8 +627,13 @@ def _normalize_incoming_odds(odds_data):
             }
         }
 
-    if "current" in odds_data:
-        return {"1x2": odds_data}
+    if "open" in odds_data or "current" in odds_data:
+        # FIX v8.10: нормализуем open → 1x2.open, сохраняем current для compat
+        result = {"1x2": {}}
+        for key in ("open", "current", "closing"):
+            if key in odds_data:
+                result["1x2"][key] = odds_data[key]
+        return result
 
     return odds_data
 
@@ -948,19 +958,24 @@ def get_all_odds(match: dict) -> dict:
     # Если odds уже в формате 1x2
     if "1x2" in odds:
         sec = odds["1x2"]
+        # FIX v8.10: "open" — primary (схема v710), "current" — для обратной совместимости
+        open_odds = sec.get("open", sec.get("current", {}))
         return {
-            "current": sec.get("current", {}),
+            "open": open_odds,
+            "current": open_odds,  # backward compat для value_engine < v3.1
             "closing": sec.get("closing", {}),
             "sources": match.get("sources", []),
             "verification": match.get("odds_verification", "UNVERIFIED"),
             "independent_sources": len(set(match.get("sources", []))),
             "betradar_consensus": False,
         }
-    
+
     # Если odds в плоском формате
-    if "current" in odds or "closing" in odds:
+    if "open" in odds or "current" in odds or "closing" in odds:
+        open_odds = odds.get("open", odds.get("current", {}))
         return {
-            "current": odds.get("current", {}),
+            "open": open_odds,
+            "current": open_odds,  # backward compat
             "closing": odds.get("closing", {}),
             "sources": match.get("sources", []),
             "verification": "UNVERIFIED",
