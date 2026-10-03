@@ -8,13 +8,62 @@ services:
       - "5000:5000"
     environment:
       PYTHONUNBUFFERED: 1
+      # Добавляем переменные для мониторинга
+      PROMETHEUS_JOURNAL_DIR: /prometheus/journal
+      PROMETHEUS_DATA: /prometheus/data
     volumes:
       - .:/app
+      - prometheus_data:/prometheus/data
+      - prometheus_journal:/prometheus/journal
     depends_on:
       - redis
+      - prometheus
+      - alertmanager
 
   redis:
     image: redis:latest
     ports:
       - "6379:6379"
-      
+    volumes:
+      - redis_data:/data
+
+  prometheus:
+    image: prom/prometheus:v2.43.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/rules:/etc/prometheus/rules
+      - ./monitoring/config:/etc/prometheus/config
+      - prometheus_data:/prometheus/data
+    command:
+      - '--config.file=/etc/prometheus/config/prometheus.yml'
+
+  alertmanager:
+    image: prom/alertmanager:v0.25.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/config/alertmanager.yml:/etc/alertmanager/config.yml
+    environment:
+      # Переменные окружения для уведомлений
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+      ALERTMANAGER_CONFIG: /etc/alertmanager/config.yml
+
+  grafana:
+    image: grafana/grafana:9.4.4
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards
+      - ./monitoring/provisioning:/etc/grafana/provisioning
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+
+volumes:
+  prometheus_data:
+  prometheus_journal:
+  redis_data:
+  grafana_data:
+  
