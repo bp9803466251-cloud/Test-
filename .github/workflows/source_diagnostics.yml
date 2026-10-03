@@ -15,20 +15,36 @@ on:
           - errors
         default: full
 
-env:
-  PYTHON_VERSION: "3.12"
-
 permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
-  cancel-in-progress: false
+  group: source-diagnostics
+  cancel-in-progress: false  # TODO: изменить на true после внедрения idempotency_key
 
 jobs:
   run-diagnostics:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    env:
+      PYTHON_VERSION: "3.12"
+      PYTHONUNBUFFERED: "1"
+      GK_CONFIG_FILE: gatekeeper_config.yaml
+      # SHARED_* — для redis_hub (транспортный слой)
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+      # UPSTASH_* — для прямого доступа (verify/diagnostics)
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      # API-ключи коллекторов
+      BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
+      SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
+      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -37,30 +53,34 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          cache: pip
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
       - name: Run Diagnostics
-        env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
-          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           MODE="${{ inputs.mode }}"
           if [ "$MODE" = "full" ] || [ -z "$MODE" ]; then
             python source_diagnostics.py
           else
             python source_diagnostics.py --${MODE}
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Source Diagnostics Summary ==="
+          echo "Mode: ${{ github.event.inputs.mode }}"
+          echo ""
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "Status: SUCCESS"
+          else
+            echo "Status: ${{ job.status }}"
           fi
           
