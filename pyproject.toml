@@ -1,0 +1,32 @@
+[tool.poetry]
+name = "your-project"
+version = "0.1.0"
+description = "Your project description"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+python-dotenv = "*"
+redis = "*"
+curl-cffi = ">=0.7.0"
+PyYAML = ">=6.0"
+pytest = "*"
+pytest-mock = "*"
+pytest-asyncio = "*"
+jsonschema = "*"
+prometheus_client = "*"
+python-json-logger = "*"
+statsd = "*"
+requests = "*"
+aiohttp = "*"
+black = "*"
+isort = "*"
+flake8 = "*"
+mypy = "*"
+
+[tool.poetry.dev-dependencies]
+# Здесь можно указать дополнительные dev-зависимости
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
