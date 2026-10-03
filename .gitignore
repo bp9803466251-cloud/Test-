@@ -1,7 +1,26 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# GatekeeperAI
+gatekeeper_config.local.yaml
+export_*.json
+canary_*.json
+
+# Environment
 .env
-venv/
-.venv/
-*.log
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
