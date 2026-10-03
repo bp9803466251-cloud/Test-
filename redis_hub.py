@@ -4,6 +4,10 @@
 Единый инкапсулированный шлюз к Upstash Redis REST API.
 Только urllib.request. Никаких сторонних клиентов.
 
+v2.1: + zadd_key dual-API (dict / separate), + zrange_key_withscores,
+      + type_key, + execute_pipeline retry, + cooldown_remaining in status,
+      - мёртвые импорты/константы (Tuple, EXTERNAL_API_TIMEOUT, MSK_TIMEZONE),
+      - scan_keys sleep 0.05 → 0.01
 v2.0: + Pipeline, + SCAN, + отдельные ключи, + ZSET, + SET,
       унифицированный breaker (threshold=10, cooldown=60s, timeout=30s)
 """
@@ -13,17 +17,15 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any, List, Dict, Tuple
+from typing import Optional, Any, List, Dict
 
 # ---------------------------------------------------------------------------
 # Конфигурация из переменных окружения
 # ---------------------------------------------------------------------------
 REDIS_TIMEOUT = int(os.getenv("GATEKEEPER_REDIS_TIMEOUT", "30"))
-EXTERNAL_API_TIMEOUT = int(os.getenv("GATEKEEPER_EXTERNAL_API_TIMEOUT", "15"))
 HMGET_CHUNK_SIZE = int(os.getenv("GATEKEEPER_HMGET_CHUNK_SIZE", "50"))
 
 IMMUTABLE_ROOT_ADDRESS = "GatekeeperAI"
-MSK_TIMEZONE = timezone(timedelta(hours=3))
 ENVELOPE_VERSION = "v710"
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,7 @@ def get_circuit_breaker_status() -> dict:
         "open": _circuit_breaker_open,
         "error_count": _error_count,
         "threshold": _breaker_threshold,
+        "cooldown_remaining": get_remaining_cooldown(),
     }
 
 
@@ -136,11 +139,11 @@ def _reset_breaker_success() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline (для football_data_to_redis.py v6.2)
+# Pipeline (для football_data_to_redis.py v6.2) — с retry
 # ---------------------------------------------------------------------------
 
 def execute_pipeline(commands: List[List[Any]]) -> Optional[Any]:
-    """Выполнить pipeline-команды через /pipeline endpoint."""
+    """Выполнить pipeline-команды через /pipeline endpoint. 2 retry с backoff."""
     if not commands:
         return None
     if not _check_circuit_breaker():
@@ -162,21 +165,35 @@ def execute_pipeline(commands: List[List[Any]]) -> Optional[Any]:
         "Content-Type": "application/json",
     }
 
-    try:
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        req.method = "POST"
-        with urllib.request.urlopen(req, timeout=REDIS_TIMEOUT) as response:
-            res_json = json.loads(response.read().decode("utf-8"))
-            _reset_breaker_success()
-            return res_json
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as e:
-        print(f"[REDIS PIPELINE ERROR] {e}")
-        _trip_breaker()
-        return None
-    except Exception as e:
-        print(f"[REDIS PIPELINE ERROR] Необработанная: {e}")
-        _trip_breaker()
-        return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers)
+            req.method = "POST"
+            with urllib.request.urlopen(req, timeout=REDIS_TIMEOUT) as response:
+                res_json = json.loads(response.read().decode("utf-8"))
+                _reset_breaker_success()
+                return res_json
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as e:
+            if attempt < max_retries - 1:
+                wait_sec = 2 * (attempt + 1)
+                print(f"[REDIS PIPELINE] retry {attempt + 1}/{max_retries} через {wait_sec}s: {e}")
+                time.sleep(wait_sec)
+                continue
+            print(f"[REDIS PIPELINE ERROR] {e}")
+            _trip_breaker()
+            return None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_sec = 2 * (attempt + 1)
+                print(f"[REDIS PIPELINE] retry {attempt + 1}/{max_retries} через {wait_sec}s: {e}")
+                time.sleep(wait_sec)
+                continue
+            print(f"[REDIS PIPELINE ERROR] Необработанная: {e}")
+            _trip_breaker()
+            return None
+
+    return None
 
 
 class PipelineBatch:
@@ -424,6 +441,16 @@ def key_exists(key: str) -> bool:
     return bool(res)
 
 
+def type_key(key: str) -> str:
+    """Возвращает тип ключа: string, hash, zset, set, list, none."""
+    res = _execute_upstash_cmd(["TYPE", key])
+    if res is None:
+        return "none"
+    if isinstance(res, str):
+        return res
+    return str(res) if res else "none"
+
+
 def scan_keys(pattern: str, count: int = 500) -> List[str]:
     """SCAN по паттерну, возвращает список ключей."""
     result = []
@@ -446,7 +473,7 @@ def scan_keys(pattern: str, count: int = 500) -> List[str]:
         if str(next_cursor) == "0":
             break
         cursor = next_cursor
-        time.sleep(0.05)
+        time.sleep(0.01)
 
     return result
 
@@ -497,9 +524,28 @@ def hlen_key(key: str) -> int:
 # ZSET (для history:league:*)
 # ---------------------------------------------------------------------------
 
-def zadd_key(key: str, score: float, member: str) -> bool:
-    res = _execute_upstash_cmd(["ZADD", key, str(score), member])
-    return res is not None
+def zadd_key(key: str, score=None, member=None, mapping=None) -> bool:
+    """
+    Добавить элемент в ZSET. Dual-API:
+      zadd_key("history:league:E0", score=1.5, member="cid_123")
+      zadd_key("history:league:E0", mapping={"cid_1": 1.5, "cid_2": 2.0})
+    """
+    if mapping is not None:
+        # dict mode: {member: score}
+        if not isinstance(mapping, dict) or not mapping:
+            return False
+        # Upstash ZADD format: ["ZADD", key, score1, member1, score2, member2, ...]
+        cmd = ["ZADD", key]
+        for m, s in mapping.items():
+            cmd.extend([str(s), m])
+        res = _execute_upstash_cmd(cmd)
+        return res is not None
+    else:
+        # separate score/member mode
+        if score is None or member is None:
+            return False
+        res = _execute_upstash_cmd(["ZADD", key, str(score), member])
+        return res is not None
 
 
 def zcard_key(key: str) -> int:
@@ -513,6 +559,23 @@ def zcard_key(key: str) -> int:
 def zrange_key(key: str, start: int = 0, end: int = -1) -> List[str]:
     res = _execute_upstash_cmd(["ZRANGE", key, str(start), str(end)])
     return res if isinstance(res, list) else []
+
+
+def zrange_key_withscores(key: str, start: int = 0, end: int = -1) -> List[tuple]:
+    """ZRANGE ... WITHSCORES. Возвращает [(member, score), ...]."""
+    res = _execute_upstash_cmd(["ZRANGE", key, str(start), str(end), "WITHSCORES"])
+    if not isinstance(res, list) or not res:
+        return []
+    pairs = []
+    for i in range(0, len(res), 2):
+        if i + 1 < len(res):
+            member = res[i]
+            try:
+                score = float(res[i + 1])
+            except (TypeError, ValueError):
+                score = 0.0
+            pairs.append((member, score))
+    return pairs
 
 
 def zrem_key(key: str, *members: str) -> int:
@@ -562,9 +625,9 @@ def is_redis_available() -> bool:
     return res is not None
 
 
-def dbsize() -> Optional[int]:
+def dbsize() -> int:
     res = _execute_upstash_cmd(["DBSIZE"])
     try:
         return int(res) if res else 0
     except (TypeError, ValueError):
-        return None
+        return 0

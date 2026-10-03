@@ -28,12 +28,13 @@ from redis_hub import (
     get_circuit_breaker_status,
     reset_circuit_breaker,
     get_all_fields,
-    get_key,
     scan_keys,
     delete_keys,
+    delete_key,
     dbsize,
     zcard_key,
     zrange_key,
+    get_key,
     hlen_key,
     _execute_upstash_cmd,
 )
@@ -75,12 +76,18 @@ def _print(*args, **kwargs):
         print(*args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# History scanning
+# ---------------------------------------------------------------------------
+
 def scan_history():
+    """Сканирование history:match:* ключей."""
     keys = scan_keys("history:match:*", count=500)
     return keys
 
 
 def scan_history_leagues():
+    """Сканирование history:league:* ZSET-индексов."""
     keys = scan_keys("history:league:*", count=100)
     result = {}
     for key in keys:
@@ -91,30 +98,38 @@ def scan_history_leagues():
 
 
 def scan_history_teams():
+    """Сканирование history:team:* SET-индексов."""
     keys = scan_keys("history:team:*", count=100)
     return len(keys)
 
 
 def scan_analysis():
+    """Сканирование analysis:* ключей."""
     keys = scan_keys("analysis:*", count=500)
     return len(keys)
 
 
 def get_football_data_meta():
-    """Чтение football_data:meta — SET (string key), не HGETALL."""
+    """Чтение football_data:meta (SET, string key — не hash)."""
     raw = get_key("football_data:meta")
     if not raw:
         return {}
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, TypeError):
-        pass
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
     return {}
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
 def run_diagnostics():
+    """Полная диагностика обеих моделей."""
     diag = {
         "version": "v710",
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -126,6 +141,7 @@ def run_diagnostics():
         return diag
 
     diag["redis"] = {"available": True}
+
     total_keys = dbsize()
     diag["redis"]["dbsize"] = total_keys
 
@@ -229,7 +245,7 @@ def run_diagnostics():
         if meta_val and isinstance(meta_val, dict):
             last_run = meta_val.get("last_run", meta_val.get("last_run_at"))
             if last_run:
-                stored = meta_val.get("stored_matches", 0)
+                stored = meta_val.get("stored_matches", meta_val.get("matches", 0))
                 err = meta_val.get("error_count", meta_val.get("errors", 0))
                 meta_status[name] = f"OK {str(last_run)[:19]} (stored={stored}, errors={err})"
             else:
@@ -258,7 +274,12 @@ def run_diagnostics():
     return diag
 
 
+# ---------------------------------------------------------------------------
+# Flush operations
+# ---------------------------------------------------------------------------
+
 def do_flush_soft(diag, auto_yes=False, dry_run=False):
+    """Мягкая очистка: удалить завершённые past-матчи + search + index из хеша."""
     keys_info = diag.get("_flush_keys", {})
     match_keys = keys_info.get("match_keys_to_delete", [])
     search_keys = keys_info.get("search_keys", [])
@@ -269,13 +290,13 @@ def do_flush_soft(diag, auto_yes=False, dry_run=False):
         _print("[FLUSH] Nothing to delete (soft)")
         return 0
 
-    _print("[FLUSH] SOFT MODE: selective HDEL")
+    _print(f"[FLUSH] SOFT MODE: selective HDEL")
     _print(f"  Matches (completed+past): {len(match_keys)}")
     _print(f"  Search results: {len(search_keys)}")
     _print(f"  Index shards: {len(index_keys)}")
 
     if dry_run:
-        _print("[FLUSH] DRY RUN — nothing deleted")
+        _print(f"[FLUSH] DRY RUN — {len(keys_to_delete)} keys would be deleted")
         return len(keys_to_delete)
 
     if not auto_yes:
@@ -304,13 +325,14 @@ def do_flush_soft(diag, auto_yes=False, dry_run=False):
 
 
 def do_flush_hard(auto_yes=False, dry_run=False):
+    """Жёсткая очистка: DEL GatekeeperAI (только live, history не трогает)."""
     hlen = hlen_key("GatekeeperAI")
-    _print("[FLUSH] HARD MODE: DEL GatekeeperAI (live only)")
+    _print(f"[FLUSH] HARD MODE: DEL GatekeeperAI (live only)")
     _print(f"  Fields before: {hlen}")
     _print(f"  NOTE: history:match:* keys will NOT be affected")
 
     if dry_run:
-        _print("[FLUSH] DRY RUN — nothing deleted")
+        _print(f"[FLUSH] DRY RUN — GatekeeperAI ({hlen} fields) would be deleted")
         return hlen
 
     if not auto_yes:
@@ -332,6 +354,7 @@ def do_flush_hard(auto_yes=False, dry_run=False):
 
 
 def do_history_only(auto_yes=False, dry_run=False):
+    """Удалить только history:match:* + history:league:* + history:team:* + football_data:meta."""
     _print("[HISTORY-ONLY] Scanning history keys...")
 
     history_keys = scan_keys("history:match:*", count=500)
@@ -378,6 +401,7 @@ def do_history_only(auto_yes=False, dry_run=False):
 
 
 def do_purge(auto_yes=False, dry_run=False):
+    """FLUSHDB — wipe ВСЕХ ключей."""
     _print("[PURGE] GATEKEEPER-AI v710")
     _print(f"  Time: {datetime.now(MSK_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')}")
 
@@ -392,7 +416,7 @@ def do_purge(auto_yes=False, dry_run=False):
     _print(f"  WARNING: This will DELETE ALL KEYS")
 
     if dry_run:
-        _print("[PURGE] DRY RUN — nothing deleted")
+        _print(f"[PURGE] DRY RUN — {total} keys would be deleted")
         return True
 
     if not auto_yes:
@@ -419,7 +443,12 @@ def do_purge(auto_yes=False, dry_run=False):
         return False
 
 
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
 def print_diagnostics(diag):
+    """Человекочитаемый вывод диагностики."""
     _print("=" * 60)
     _print(f"[DIAG] GATEKEEPER-AI {diag.get('version', 'v710')}")
     _print(f"  Time: {datetime.now(MSK_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')}")
@@ -507,6 +536,10 @@ def print_diagnostics(diag):
     _print("=" * 60)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     import argparse
 
@@ -514,7 +547,7 @@ def main():
     parser.add_argument("--flush", action="store_true", help="Soft flush (selective HDEL)")
     parser.add_argument("--hard", action="store_true", help="Hard flush (DEL GatekeeperAI)")
     parser.add_argument("--history-only", action="store_true",
-                        help="Delete only history keys (live preserved)")
+                        help="Delete only history:match:* + history:league:* (live preserved)")
     parser.add_argument("--purge", action="store_true", help="FLUSHDB (wipe ALL keys)")
     parser.add_argument("--yes", action="store_true", help="Auto-confirm (for CI)")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without executing")

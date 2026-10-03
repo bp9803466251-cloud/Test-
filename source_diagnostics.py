@@ -1,6 +1,6 @@
 # source_diagnostics.py
 """
-Единый модуль диагностики Gatekeeper-AI v700-prod.
+Единый модуль диагностики Gatekeeper-AI v710.
 Заменяет debug_inspect.py и debug_odds.py.
 Объединяет диагностику всех источников, Redis и матчей в одном файле.
 
@@ -22,12 +22,12 @@ from gatekeeper_hub import (
     get_matches_by_date_range,
     get_all_matches,
 )
-from redis_hub import get_from_cache, get_all_fields, is_redis_available
+from redis_hub import get_from_cache, get_all_fields, is_redis_available, get_key
 
 MSK_TIMEZONE = timezone(timedelta(hours=3))
 
 # ---------------------------------------------------------------------------
-# Хелперы для определения формата данных (v700 поддерживает 3 формата odds)
+# Хелперы для определения формата данных (v710 поддерживает 3 формата odds)
 # ---------------------------------------------------------------------------
 
 def _get_current_odds(match: dict) -> Optional[dict]:
@@ -134,7 +134,7 @@ def diagnose_sources() -> dict:
     sources = {}
 
     # SharpAPI
-    sharpapi_meta = get_from_cache("sharpapi:meta")
+    sharpapi_meta = get_key("sharpapi:meta")
     sharpapi_key = "✅" if os.getenv("SHARP_API_KEY") else "❌"
     if sharpapi_meta and isinstance(sharpapi_meta, dict):
         last_run = sharpapi_meta.get("last_run", sharpapi_meta.get("last_run_at", "неизвестно"))
@@ -165,7 +165,7 @@ def diagnose_sources() -> dict:
         print(f"   📊 SharpAPI: ключ {sharpapi_key}, мета отсутствует")
 
     # Bzzoiro
-    bzzoiro_meta = get_from_cache("bzzoiro:meta")
+    bzzoiro_meta = get_key("bzzoiro:meta")
     bzzoiro_key = "✅" if os.getenv("BZZOIRO_API_KEY") else "❌"
     if bzzoiro_meta and isinstance(bzzoiro_meta, dict):
         events = bzzoiro_meta.get("total_events", bzzoiro_meta.get("events_count", 0))
@@ -211,7 +211,7 @@ def diagnose_sources() -> dict:
         print(f"   🐝 Bzzoiro:  ключ {bzzoiro_key}, мета отсутствует")
 
     # OddsAPI
-    oddsapi_meta = get_from_cache("odds_api:meta")
+    oddsapi_meta = get_key("odds_api:meta")
     oddsapi_key = "✅" if os.getenv("ODDS_API_KEY") else "❌"
     if oddsapi_meta and isinstance(oddsapi_meta, dict):
         events = oddsapi_meta.get("total_events", oddsapi_meta.get("events_count", 0))
@@ -245,7 +245,7 @@ def diagnose_sources() -> dict:
         print(f"   🎲 OddsAPI: ключ {oddsapi_key}, мета отсутствует")
 
     # Propline (Pinnacle)
-    propline_meta = get_from_cache("propline:meta")
+    propline_meta = get_key("propline:meta")
     propline_key = "✅" if os.getenv("PROPLINE_API_KEY") else "❌"
     if propline_meta and isinstance(propline_meta, dict):
         events = propline_meta.get("total_events", 0)
@@ -277,11 +277,6 @@ def diagnose_sources() -> dict:
     else:
         sources["propline"] = {"key": propline_key, "last_run": "нет данных"}
         print(f"   🏆 Propline: ключ {propline_key}, мета отсутствует")
-
-    # API-Football
-    football_key = "✅" if os.getenv("API_FOOTBALL_KEY") else "❌"
-    sources["api_football"] = {"key": football_key}
-    print(f"   ⚽ API-Football: ключ {football_key}")
 
     # Football-Data
     fd_key = "✅" if os.getenv("FOOTBALL_DATA_API_KEY") else "❌"
@@ -317,7 +312,7 @@ def diagnose_redis() -> dict:
 
     est_memory_kb = round(len(match_keys) * 2 + len(search_keys) * 3 + 5, 1)
 
-    health = all_fields.get("system:health", {})
+    health = get_key("system:health") or {}
     if not isinstance(health, dict):
         health = {}
 
@@ -510,7 +505,7 @@ def diagnose_errors() -> dict:
 
     errors = []
 
-    bzzoiro_meta = get_from_cache("bzzoiro:meta")
+    bzzoiro_meta = get_key("bzzoiro:meta")
     if bzzoiro_meta and isinstance(bzzoiro_meta, dict):
         err_count = bzzoiro_meta.get("error_count", 0)
         enrichment = bzzoiro_meta.get("enrichment", {})
@@ -521,14 +516,14 @@ def diagnose_errors() -> dict:
             errors.append({"source": "bzzoiro", "count": err_count})
             print(f"   🐝 Bzzoiro: {err_count} ошибок")
 
-    sharpapi_meta = get_from_cache("sharpapi:meta")
+    sharpapi_meta = get_key("sharpapi:meta")
     if sharpapi_meta and isinstance(sharpapi_meta, dict):
         err_count = sharpapi_meta.get("error_count", sharpapi_meta.get("errors", 0))
         if err_count > 0:
             errors.append({"source": "sharpapi", "count": err_count})
             print(f"   📊 SharpAPI: {err_count} ошибок")
 
-    oddsapi_meta = get_from_cache("odds_api:meta")
+    oddsapi_meta = get_key("odds_api:meta")
     if oddsapi_meta and isinstance(oddsapi_meta, dict):
         err_count = oddsapi_meta.get("error_count", oddsapi_meta.get("errors", 0))
         if err_count > 0:
@@ -536,14 +531,14 @@ def diagnose_errors() -> dict:
             print(f"   🎲 OddsAPI: {err_count} ошибок")
 
     # Propline
-    propline_meta = get_from_cache("propline:meta")
+    propline_meta = get_key("propline:meta")
     if propline_meta and isinstance(propline_meta, dict):
         err_count = propline_meta.get("error_count", 0)
         if err_count > 0:
             errors.append({"source": "propline", "count": err_count})
             print(f"   🏆 Propline: {err_count} ошибок")
 
-    health = get_from_cache("system:health")
+    health = get_key("system:health")
     if health and isinstance(health, dict):
         cas = health.get("cas_conflicts_total", 0)
         if cas > 0:
@@ -588,7 +583,7 @@ def print_summary(sources, redis_data, matches_data, errors_data) -> None:
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 60)
-    print("🔧 ДИАГНОСТИКА GATEKEEPER-AI v700-prod")
+    print("🔧 ДИАГНОСТИКА GATEKEEPER-AI v710")
     print(f"   Время: {datetime.now(MSK_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')}")
     print("=" * 60)
 

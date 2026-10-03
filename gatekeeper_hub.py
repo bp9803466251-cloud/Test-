@@ -3,26 +3,35 @@
 Единый хаб Gatekeeper-AI v710.
 Все операции с данными матчей проходят только через этот модуль.
 
-v2.0:
-  - History/Analysis → отдельные ключи (set_key/get_key), не хеш
-  - TEAM_ALIASES синхронизированы с football_data_to_redis.py
-  - _merge_odds сохраняет O/U 2.5 и Asian Handicap
-  - UPSTREAM_MAP["football_data"] = "multi_bookmaker"
-  - save_analysis/save_search_results — без двойной обёртки
-  - update_history_indexes → zadd_key/sadd_key (ZSET/SET)
-  - get_all_matches — union flat + sharded index
-  - _now_utc() вместо _now_msk() (UTC по умолчанию)
-  - schema_version = "v710" в _init_match_object
-  - value_analysis: {} в _init_match_object + patch_match
-  - MAX_ODDS_SNAPSHOTS enforcement
-  - clean_team_name — fallback при ImportError search_module
+v2.1:
+  - patch_match: restored positional (section, data) API + keyword API
+  - copy.deepcopy in _merge_odds, _merge_1x2, patch_match (CAS safe)
+  - _init_match_object: +home_clean, +away_clean, +competition, +country,
+    +league_code, +season, +time_utc, +h2h, +csv_raw, +flags
+  - upsert_match: +competition/country/league_code/season params, past filter
+  - patch_match: +h2h param
+  - cleanup_expired: date-based check (not only status==completed)
+  - batch_upsert_matches: returns dict with stats
+  - get_matches_count: dedup via set
+  - upsert_history_match: enrichment + indexes + merge existing
+  - migrate_to_history: strips live-only fields, always updates indexes
+  - _merge_odds O/U+AH: "price" field (not "data"), deepcopy
+  - _merge_1x2: proper type ("opening"/"live"), deepcopy
+  - _normalize_incoming_full_odds: `is not None` (not `or`)
+  - save_meta/save_health: set_key (not hash)
+  - Added: get_match_by_teams, patch_match_by_teams, find_match_fuzzy,
+    get_history_by_team, get_analysis_by_date, _resolve_upstream,
+    _remove_from_index, _extract_opening_closing
+  - Removed dead code: _validate_section, _prices_agree, _mad_outlier,
+    MERGE_SECTIONS, MAX_HISTORY_ENTRIES
+  - Removed unused imports: os, json, batch_get_from_cache, delete_keys,
+    zrem_key, srem_key, Set
+  - _make_canonical_id: "nodate" (not "unknown") for missing dates
 """
-import os
-import json
+import copy
 import time
-import statistics
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional
 
 from redis_hub import (
     # Hash model (live)
@@ -30,7 +39,6 @@ from redis_hub import (
     get_from_cache,
     delete_from_cache,
     get_all_fields,
-    batch_get_from_cache,
     is_redis_available,
     reset_circuit_breaker,
     get_circuit_breaker_status,
@@ -38,17 +46,14 @@ from redis_hub import (
     get_key,
     set_key,
     delete_key,
-    delete_keys,
     scan_keys,
     # ZSET
     zadd_key,
     zcard_key,
     zrange_key,
-    zrem_key,
     # SET
     sadd_key,
     smembers_key,
-    srem_key,
     # System
     dbsize,
 )
@@ -66,14 +71,11 @@ HISTORY_PREFIX = "history:match:"
 ANALYSIS_PREFIX = "analysis:"
 INDEX_FIELD = "match:index"
 MAX_CAS_RETRIES = 3
-MAX_HISTORY_ENTRIES = 20
 MAX_ODDS_SNAPSHOTS = 10
 
 MATCH_FINISH_BUFFER_HOURS = 2
 INDEX_LOOKBACK_DAYS = 2
 INDEX_LOOKAHEAD_DAYS = 7
-
-MERGE_SECTIONS = ("odds", "stats", "extra", "predictions", "h2h", "source_ids", "value_analysis")
 
 _pending_metrics: Dict[str, Any] = {}
 
@@ -86,103 +88,103 @@ TEAM_ALIASES = {
     "manchester united": "manchester united",
     "man united": "manchester united",
     "man utd": "manchester united",
-    "manchester_city": "manchester city",
+    "manchester city": "manchester city",
     "man city": "manchester city",
-    "tottenham_hotspur": "tottenham hotspur",
+    "tottenham hotspur": "tottenham hotspur",
     "tottenham": "tottenham hotspur",
     "spurs": "tottenham hotspur",
     "wolverhampton": "wolverhampton wanderers",
-    "wolverhampton_wanderers": "wolverhampton wanderers",
+    "wolverhampton wanderers": "wolverhampton wanderers",
     "wolves": "wolverhampton wanderers",
-    "newcastle_united": "newcastle united",
+    "newcastle united": "newcastle united",
     "newcastle": "newcastle united",
-    "west_ham_united": "west ham united",
-    "west_ham": "west ham united",
-    "nottm_forest": "nottingham forest",
-    "nottingham_forest": "nottingham forest",
+    "west ham united": "west ham united",
+    "west ham": "west ham united",
+    "nottm forest": "nottingham forest",
+    "nottingham forest": "nottingham forest",
     "nott'm forest": "nottingham forest",
     "nottingham": "nottingham forest",
-    "brighton_hove_albion": "brighton hove albion",
+    "brighton hove albion": "brighton hove albion",
     "brighton & hove albion": "brighton hove albion",
     "brighton": "brighton hove albion",
-    "leicester_city": "leicester city",
+    "leicester city": "leicester city",
     "leicester": "leicester city",
-    "norwich_city": "norwich city",
+    "norwich city": "norwich city",
     "norwich": "norwich city",
     # La Liga
-    "atletico_madrid": "atletico madrid",
+    "atletico madrid": "atletico madrid",
     "atletico": "atletico madrid",
-    "athletico_madrid": "atletico madrid",
-    "real_betis": "real betis",
+    "athletico madrid": "atletico madrid",
+    "real betis": "real betis",
     "betis": "real betis",
-    "rayo_vallecano": "rayo vallecano",
+    "rayo vallecano": "rayo vallecano",
     # Serie A
     "internazionale": "internazionale",
-    "inter_milan": "internazionale",
+    "inter milan": "internazionale",
     "inter": "internazionale",
-    "ac_milan": "ac milan",
+    "ac milan": "ac milan",
     "milan": "ac milan",
-    "hellas_verona": "hellas verona",
+    "hellas verona": "hellas verona",
     "verona": "hellas verona",
     # Bundesliga
-    "bayern_munich": "bayern munich",
+    "bayern munich": "bayern munich",
     "bayern": "bayern munich",
-    "borussia_dortmund": "borussia dortmund",
+    "borussia dortmund": "borussia dortmund",
     "dortmund": "borussia dortmund",
-    "bayer_leverkusen": "bayer leverkusen",
+    "bayer leverkusen": "bayer leverkusen",
     "leverkusen": "bayer leverkusen",
-    "borussia_monchengladbach": "borussia monchengladbach",
+    "borussia monchengladbach": "borussia monchengladbach",
     "monchengladbach": "borussia monchengladbach",
     # Ligue 1
-    "paris_saint_germain": "paris saint-germain",
+    "paris saint germain": "paris saint-germain",
     "paris saint-germain": "paris saint-germain",
     "psg": "paris saint-germain",
-    "saint_etienne": "saint-etienne",
-    "st_etienne": "saint-etienne",
+    "saint etienne": "saint-etienne",
+    "st etienne": "saint-etienne",
     # Scottish
-    "st_mirren_fc": "st mirren",
+    "st mirren fc": "st mirren",
     "st. mirren": "st mirren",
-    "st_mirren": "st mirren",
-    "celtic_fc": "celtic",
+    "st mirren": "st mirren",
+    "celtic fc": "celtic",
     "celtic": "celtic",
-    "rangers_fc": "rangers",
+    "rangers fc": "rangers",
     "rangers": "rangers",
     # Other
-    "sporting_cp": "sporting cp",
-    "sporting_lisbon": "sporting cp",
+    "sporting cp": "sporting cp",
+    "sporting lisbon": "sporting cp",
     "sporting": "sporting cp",
-    "club_brugge": "club brugge",
+    "club brugge": "club brugge",
     "brugge": "club brugge",
-    "fc_bayern": "bayern munich",
-    "real_sociedad_de_futbol": "real sociedad",
-    "athletic_club": "athletic bilbao",
-    "athletic_bilbao": "athletic bilbao",
-    "vfl_wolfsburg": "vfl wolfsburg",
+    "fc bayern": "bayern munich",
+    "real sociedad de futbol": "real sociedad",
+    "athletic club": "athletic bilbao",
+    "athletic bilbao": "athletic bilbao",
+    "vfl wolfsburg": "vfl wolfsburg",
     "wolfsburg": "vfl wolfsburg",
-    "sc_freiburg": "sc freiburg",
+    "sc freiburg": "sc freiburg",
     "freiburg": "sc freiburg",
-    "vfb_stuttgart": "vfb stuttgart",
+    "vfb stuttgart": "vfb stuttgart",
     "stuttgart": "vfb stuttgart",
-    "1_fc_union_berlin": "1 fc union berlin",
+    "1 fc union berlin": "1 fc union berlin",
     "1. fc union berlin": "1 fc union berlin",
-    "union_berlin": "1 fc union berlin",
-    "1_fc_koln": "1 fc koln",
+    "union berlin": "1 fc union berlin",
+    "1 fc koln": "1 fc koln",
     "1. fc koln": "1 fc koln",
     "koln": "1 fc koln",
-    "fc_augsburg": "fc augsburg",
+    "fc augsburg": "fc augsburg",
     "augsburg": "fc augsburg",
-    "vfl_bochum": "vfl bochum",
+    "vfl bochum": "vfl bochum",
     "bochum": "vfl bochum",
-    "sv_werder_bremen": "sv werder bremen",
-    "werder_bremen": "sv werder bremen",
+    "sv werder bremen": "sv werder bremen",
+    "werder bremen": "sv werder bremen",
     "bremen": "sv werder bremen",
-    "tsg_hoffenheim": "tsg hoffenheim",
+    "tsg hoffenheim": "tsg hoffenheim",
     "hoffenheim": "tsg hoffenheim",
-    "fc_schalke_04": "fc schalke 04",
+    "fc schalke 04": "fc schalke 04",
     "schalke": "fc schalke 04",
-    "hertha_bsc": "hertha bsc",
+    "hertha bsc": "hertha bsc",
     "hertha": "hertha bsc",
-    "hamburger_sv": "hamburger sv",
+    "hamburger sv": "hamburger sv",
     "hamburg": "hamburger sv",
 }
 
@@ -228,6 +230,11 @@ def detect_upstream(source: str) -> str:
     return UPSTREAM_MAP.get(source, "unknown")
 
 
+def _resolve_upstream(source: str) -> str:
+    """Backward compat alias for detect_upstream."""
+    return detect_upstream(source)
+
+
 # ---------------------------------------------------------------------------
 # Временные утилиты
 # ---------------------------------------------------------------------------
@@ -252,11 +259,14 @@ def now_utc() -> str:
 def _make_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
     home_c = clean_team_name(home_team).replace(" ", "_")
     away_c = clean_team_name(away_team).replace(" ", "_")
-    try:
-        dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
-        date_str = dt.strftime("%Y%m%d")
-    except Exception:
-        date_str = "unknown"
+    if not date_utc:
+        date_str = "nodate"
+    else:
+        try:
+            dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+            date_str = dt.strftime("%Y%m%d")
+        except (ValueError, TypeError):
+            date_str = "nodate"
     return f"{home_c}__{away_c}__{date_str}"
 
 
@@ -319,11 +329,11 @@ def _flush_health_metrics() -> None:
     global _pending_metrics
     if not _pending_metrics:
         return
-    health = get_from_cache("system:health") or {}
+    health = get_key("system:health") or {}
     if not isinstance(health, dict):
         health = {}
     health.update(_pending_metrics)
-    save_to_cache("system:health", health)
+    set_key("system:health", health)
     _pending_metrics = {}
 
 
@@ -349,35 +359,6 @@ def _max_per_selection(prices: List[dict]) -> dict:
                 continue
         result[key] = str(max(values)) if values else ""
     return result
-
-
-def _prices_agree(prices: List[dict], threshold: float = 0.05) -> bool:
-    if len(prices) < 2:
-        return False
-    for key in ("home", "draw", "away"):
-        vals = []
-        for p in prices:
-            val = p.get(key)
-            if val is None or val == "-" or val == "":
-                continue
-            try:
-                vals.append(float(val))
-            except (ValueError, TypeError):
-                continue
-        if vals and (max(vals) - min(vals)) > threshold:
-            return False
-    return True
-
-
-def _mad_outlier(values: List[float], new_value: float, threshold: float = 3.0) -> bool:
-    if len(values) < 3:
-        return False
-    median = statistics.median(values)
-    mad = statistics.median([abs(v - median) for v in values])
-    if mad == 0:
-        return abs(new_value - median) > threshold
-    modified_z = 0.6745 * (new_value - median) / mad
-    return abs(modified_z) > threshold
 
 
 def _is_numeric(val) -> bool:
@@ -407,6 +388,35 @@ def _normalize_incoming_odds(raw_odds: Any) -> Optional[dict]:
     return None
 
 
+def _extract_opening_closing(raw_odds: Any) -> dict:
+    """Извлекает opening/closing из входящего odds-блока для football_data."""
+    result = {}
+    if raw_odds is None or not isinstance(raw_odds, dict):
+        return result
+    if "1x2" in raw_odds:
+        inner = raw_odds["1x2"]
+        if isinstance(inner, dict):
+            if "opening" in inner:
+                result["opening_1x2"] = inner["opening"]
+            if "closing" in inner:
+                result["closing_1x2"] = inner["closing"]
+    if "over_under_25" in raw_odds:
+        inner = raw_odds["over_under_25"]
+        if isinstance(inner, dict):
+            if "opening" in inner:
+                result["opening_ou25"] = inner["opening"]
+            if "closing" in inner:
+                result["closing_ou25"] = inner["closing"]
+    if "asian_handicap" in raw_odds:
+        inner = raw_odds["asian_handicap"]
+        if isinstance(inner, dict):
+            if "opening" in inner:
+                result["opening_ah"] = inner["opening"]
+            if "closing" in inner:
+                result["closing_ah"] = inner["closing"]
+    return result
+
+
 def _normalize_incoming_full_odds(raw_odds: Any) -> Optional[dict]:
     """Нормализация полного odds-блока: 1x2 + O/U 2.5 + AH."""
     if raw_odds is None or not isinstance(raw_odds, dict):
@@ -420,13 +430,17 @@ def _normalize_incoming_full_odds(raw_odds: Any) -> Optional[dict]:
         result["1x2"] = flat_1x2
 
     # O/U 2.5
-    ou25 = raw_odds.get("over_under_25") or raw_odds.get("ou25")
-    if ou25 and isinstance(ou25, dict):
+    ou25 = raw_odds.get("over_under_25")
+    if ou25 is None:
+        ou25 = raw_odds.get("ou25")
+    if ou25 is not None and isinstance(ou25, dict):
         result["over_under_25"] = ou25
 
     # Asian Handicap
-    ah = raw_odds.get("asian_handicap") or raw_odds.get("ah")
-    if ah and isinstance(ah, dict):
+    ah = raw_odds.get("asian_handicap")
+    if ah is None:
+        ah = raw_odds.get("ah")
+    if ah is not None and isinstance(ah, dict):
         result["asian_handicap"] = ah
 
     return result if result else None
@@ -469,38 +483,37 @@ def _build_1x2(price: dict, source: str, upstream: str, ts: str) -> dict:
 
 def _merge_odds(existing: dict, new_odds: dict, source: str, upstream: str, ts: str) -> dict:
     """Слияние odds: сохраняет 1x2, O/U 2.5, AH."""
-    # Normalize full odds
     new_full = _normalize_incoming_full_odds(new_odds)
     if new_full is None:
-        # Fallback: try flat 1x2
         flat = _normalize_incoming_odds(new_odds)
         if flat is None:
-            return existing
+            return copy.deepcopy(existing) if existing else {}
         new_full = {"1x2": flat}
 
-    result = dict(existing) if existing else {}
+    result = copy.deepcopy(existing) if existing else {}
 
     # --- 1x2 ---
     new_1x2 = new_full.get("1x2")
     if new_1x2:
         existing_1x2 = result.get("1x2", {})
         if not existing_1x2:
-            result["1x2"] = _build_1x2(new_1x2, source, upstream, ts)
+            result["1x2"] = _build_1x2(copy.deepcopy(new_1x2), source, upstream, ts)
         else:
-            result["1x2"] = _merge_1x2(existing_1x2, new_1x2, source, upstream, ts)
+            result["1x2"] = _merge_1x2(existing_1x2, copy.deepcopy(new_1x2), source, upstream, ts)
 
     # --- O/U 2.5 ---
     new_ou25 = new_full.get("over_under_25")
     if new_ou25:
+        new_ou25 = copy.deepcopy(new_ou25)
         existing_ou = result.get("over_under_25", {})
         if not existing_ou:
             result["over_under_25"] = {
                 "current": new_ou25,
-                "sources": [{"source": source, "upstream": upstream, "data": new_ou25, "timestamp": ts}],
+                "sources": [{"source": source, "upstream": upstream, "price": new_ou25, "timestamp": ts}],
             }
         else:
-            sources = existing_ou.get("sources", [])
-            sources.append({"source": source, "upstream": upstream, "data": new_ou25, "timestamp": ts})
+            sources = list(existing_ou.get("sources", []))
+            sources.append({"source": source, "upstream": upstream, "price": new_ou25, "timestamp": ts})
             existing_ou["sources"] = sources[-MAX_ODDS_SNAPSHOTS:]
             existing_ou["current"] = new_ou25
             result["over_under_25"] = existing_ou
@@ -508,15 +521,16 @@ def _merge_odds(existing: dict, new_odds: dict, source: str, upstream: str, ts: 
     # --- Asian Handicap ---
     new_ah = new_full.get("asian_handicap")
     if new_ah:
+        new_ah = copy.deepcopy(new_ah)
         existing_ah = result.get("asian_handicap", {})
         if not existing_ah:
             result["asian_handicap"] = {
                 "current": new_ah,
-                "sources": [{"source": source, "upstream": upstream, "data": new_ah, "timestamp": ts}],
+                "sources": [{"source": source, "upstream": upstream, "price": new_ah, "timestamp": ts}],
             }
         else:
-            sources = existing_ah.get("sources", [])
-            sources.append({"source": source, "upstream": upstream, "data": new_ah, "timestamp": ts})
+            sources = list(existing_ah.get("sources", []))
+            sources.append({"source": source, "upstream": upstream, "price": new_ah, "timestamp": ts})
             existing_ah["sources"] = sources[-MAX_ODDS_SNAPSHOTS:]
             existing_ah["current"] = new_ah
             result["asian_handicap"] = existing_ah
@@ -526,63 +540,68 @@ def _merge_odds(existing: dict, new_odds: dict, source: str, upstream: str, ts: 
 
 def _merge_1x2(existing_1x2: dict, new_price: dict, source: str, upstream: str, ts: str) -> dict:
     """Слияние 1x2: накопление в sources[], обновление current/best."""
-    result = dict(existing_1x2)
+    result = copy.deepcopy(existing_1x2)
+
+    # Determine type: first source = opening, subsequent = live
+    sources = result.get("sources", [])
+    otype = "opening" if not sources else "live"
 
     # Update current
-    result["current"] = new_price
+    result["current"] = copy.deepcopy(new_price)
 
     # Update best (max per selection)
     old_best = result.get("best", {})
-    result["best"] = _max_per_selection([old_best, new_price]) if old_best else new_price
+    result["best"] = _max_per_selection([old_best, new_price]) if old_best else copy.deepcopy(new_price)
 
     # Append to sources
-    sources = result.get("sources", [])
+    sources = list(sources)
     sources.append({
         "source": source,
         "upstream": upstream,
-        "price": new_price,
+        "price": copy.deepcopy(new_price),
         "timestamp": ts,
-        "type": "update",
+        "type": otype,
     })
     result["sources"] = sources[-MAX_ODDS_SNAPSHOTS:]
 
     # Append to snapshots
-    snapshots = result.get("snapshots", [])
-    snapshots.append({"price": new_price, "timestamp": ts, "source": source})
+    snapshots = list(result.get("snapshots", []))
+    snapshots.append({"price": copy.deepcopy(new_price), "timestamp": ts, "source": source})
     result["snapshots"] = snapshots[-MAX_ODDS_SNAPSHOTS:]
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-def _validate_section(section: str, data: dict) -> bool:
-    """Проверка структуры секции."""
-    if not isinstance(data, dict):
-        return False
-    if section == "odds":
-        # Проверяем хотя бы один формат
-        has_1x2 = "1x2" in data or ("home" in data and "draw" in data and "away" in data)
-        has_ou = "over_under_25" in data or "ou25" in data
-        has_ah = "asian_handicap" in data or "ah" in data
-        return has_1x2 or has_ou or has_ah
-    if section == "stats":
-        return any(k in data for k in ("shots_home", "shots_away", "corners_home", "fouls_home"))
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Init match
 # ---------------------------------------------------------------------------
-def _init_match_object(home_team: str, away_team: str, date_utc: str, source: str, upstream: str) -> dict:
+def _init_match_object(
+    home_team: str, away_team: str, date_utc: str, source: str, upstream: str,
+    competition: str = "", country: str = "", league_code: str = "", season: str = "",
+) -> dict:
     ts = _now_utc()
     cid = _make_canonical_id(home_team, away_team, date_utc)
+    home_c = clean_team_name(home_team)
+    away_c = clean_team_name(away_team)
+    time_utc = ""
+    if date_utc:
+        try:
+            dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+            time_utc = dt.strftime("%H:%M:%SZ")
+        except (ValueError, TypeError):
+            pass
     return {
         "canonical_id": cid,
         "home_team": home_team,
         "away_team": away_team,
+        "home_clean": home_c,
+        "away_clean": away_c,
+        "competition": competition,
+        "country": country,
+        "league_code": league_code,
+        "season": season,
         "date_utc": date_utc,
+        "time_utc": time_utc,
         "status": "scheduled",
         "score": {},
         "odds": {},
@@ -590,7 +609,10 @@ def _init_match_object(home_team: str, away_team: str, date_utc: str, source: st
         "sources": [],
         "source_ids": {},
         "predictions": {},
+        "h2h": {},
         "value_analysis": {},
+        "csv_raw": {},
+        "flags": {},
         "schema_version": SCHEMA_VERSION,
         "version": 1,
         "created_at": ts,
@@ -622,8 +644,16 @@ def upsert_match(
     source_id: Optional[str] = None,
     predictions: Optional[dict] = None,
     h2h: Optional[dict] = None,
+    competition: str = "",
+    country: str = "",
+    league_code: str = "",
+    season: str = "",
 ) -> str:
-    """Создать или обновить матч (live, в хеше)."""
+    """Создать или обновить матч (live, в хеше). Только предстоящие матчи."""
+    # FIX #7: Filter past matches
+    if not _is_future_match(date_utc):
+        return ""
+
     upstream = detect_upstream(source)
     cid = _make_canonical_id(home_team, away_team, date_utc)
     field_id = _make_field_name(cid)
@@ -632,9 +662,22 @@ def upsert_match(
     existing = get_from_cache(field_id)
 
     if existing is None:
-        match = _init_match_object(home_team, away_team, date_utc, source, upstream)
+        match = _init_match_object(
+            home_team, away_team, date_utc, source, upstream,
+            competition=competition, country=country,
+            league_code=league_code, season=season,
+        )
     else:
         match = existing
+        # Update fields if provided
+        if competition and not match.get("competition"):
+            match["competition"] = competition
+        if country and not match.get("country"):
+            match["country"] = country
+        if league_code and not match.get("league_code"):
+            match["league_code"] = league_code
+        if season and not match.get("season"):
+            match["season"] = season
 
     # Score
     if score:
@@ -688,18 +731,40 @@ def upsert_match(
 # ---------------------------------------------------------------------------
 def patch_match(
     canonical_id: str,
+    section: Optional[str] = None,
+    data: Optional[dict] = None,
     *,
     score: Optional[dict] = None,
     odds: Optional[dict] = None,
     stats: Optional[dict] = None,
     extra: Optional[dict] = None,
     predictions: Optional[dict] = None,
+    h2h: Optional[dict] = None,
     value_analysis: Optional[dict] = None,
     upstream: Optional[str] = None,
     source_map: Optional[dict] = None,
     source: str = "unknown",
 ) -> bool:
-    """CAS-обновление матча."""
+    """CAS-обновление матча. Поддерживает positional (section, data) и keyword API."""
+    # Support positional API: patch_match(cid, "odds", {...}, source=, upstream=)
+    if section is not None and data is not None:
+        if section == "odds":
+            odds = data
+        elif section == "stats":
+            stats = data
+        elif section == "score":
+            score = data
+        elif section == "predictions":
+            predictions = data
+        elif section == "h2h":
+            h2h = data
+        elif section == "extra":
+            extra = data
+        elif section == "value_analysis":
+            value_analysis = data
+        elif section == "source_map":
+            source_map = data
+
     field_id = _make_field_name(canonical_id)
     ts = _now_utc()
 
@@ -708,7 +773,7 @@ def patch_match(
         if existing is None:
             return False
 
-        match = dict(existing)
+        match = copy.deepcopy(existing)
 
         if score:
             match["score"] = score
@@ -730,6 +795,9 @@ def patch_match(
         if predictions:
             match["predictions"] = predictions
 
+        if h2h:
+            match["h2h"] = h2h
+
         if value_analysis:
             match["value_analysis"] = value_analysis
 
@@ -738,15 +806,17 @@ def patch_match(
                 match["source_map"] = {}
             match["source_map"].update(source_map)
 
+        # Ensure required fields
+        if "schema_version" not in match:
+            match["schema_version"] = SCHEMA_VERSION
+        if "value_analysis" not in match:
+            match["value_analysis"] = {}
+        if "h2h" not in match:
+            match["h2h"] = {}
+
         old_version = match.get("version", 1)
         match["version"] = old_version + 1
         match["updated_at"] = ts
-
-        if "schema_version" not in match:
-            match["schema_version"] = SCHEMA_VERSION
-
-        if "value_analysis" not in match:
-            match["value_analysis"] = {}
 
         if save_to_cache(field_id, match):
             return True
@@ -848,13 +918,13 @@ def get_matches_by_date_range(
 
 
 def get_matches_count() -> int:
-    """Количество матчей — union flat + sharded."""
+    """Количество матчей — union flat + sharded (с дедупликацией)."""
     all_fields = get_all_fields()
-    count = 0
+    seen = set()
 
     flat_index = all_fields.get(INDEX_FIELD, {})
     if isinstance(flat_index, dict):
-        count += len(flat_index)
+        seen.update(flat_index.keys())
 
     now = datetime.now(timezone.utc)
     for delta_days in range(-INDEX_LOOKBACK_DAYS, INDEX_LOOKAHEAD_DAYS + 1):
@@ -863,9 +933,9 @@ def get_matches_count() -> int:
         shard_key = f"match:index:{date_fmt}"
         shard = all_fields.get(shard_key)
         if isinstance(shard, dict):
-            count += len(shard)
+            seen.update(shard.keys())
 
-    return count
+    return len(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -898,12 +968,42 @@ def _update_index(canonical_id: str, date_utc: str) -> None:
 # History (отдельные ключи)
 # ---------------------------------------------------------------------------
 def upsert_history_match(payload: dict) -> bool:
-    """Записать history-матч в отдельный ключ (не в хеш)."""
+    """Записать history-матч в отдельный ключ (не в хеш). С enrichment + indexes."""
     cid = payload.get("canonical_id")
     if not cid:
         return False
+
+    # Enrichment: ensure required fields
+    home_team = payload.get("home_team", "")
+    away_team = payload.get("away_team", "")
+    if "home_clean" not in payload or not payload["home_clean"]:
+        payload["home_clean"] = clean_team_name(home_team)
+    if "away_clean" not in payload or not payload["away_clean"]:
+        payload["away_clean"] = clean_team_name(away_team)
+    payload.setdefault("schema_version", SCHEMA_VERSION)
+    payload.setdefault("version", 1)
+    payload.setdefault("value_analysis", {})
+    payload.setdefault("predictions", {})
+
     key = f"{HISTORY_PREFIX}{cid}"
-    return set_key(key, payload)
+
+    # Merge with existing (preserve enrichments from value_engine etc.)
+    existing = get_key(key)
+    if existing and isinstance(existing, dict):
+        for enrich_field in ("value_analysis", "predictions", "analysis"):
+            if existing.get(enrich_field) and not payload.get(enrich_field):
+                payload[enrich_field] = existing[enrich_field]
+
+    if not set_key(key, payload):
+        return False
+
+    # Update indexes
+    league_code = payload.get("league_code", "")
+    date_utc = payload.get("date_utc", "")
+    if league_code or date_utc:
+        update_history_indexes(cid, league_code, date_utc, home_team, away_team)
+
+    return True
 
 
 def get_history_match(canonical_id: str) -> Optional[dict]:
@@ -930,19 +1030,22 @@ def get_history_league_count(league_code: str) -> int:
 def update_history_indexes(canonical_id: str, league_code: str, date_utc: str,
                            home_team: str, away_team: str) -> None:
     """Обновление индексов history:league:* (ZSET) и history:team:* (SET)."""
-    # ZSET league index
-    try:
-        dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
-        score = dt.timestamp()
-    except (ValueError, TypeError):
-        score = 0
-    zadd_key(f"history:league:{league_code}", score, canonical_id)
+    # ZSET league index (only if league_code is non-empty)
+    if league_code:
+        try:
+            dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+            score = dt.timestamp()
+        except (ValueError, TypeError):
+            score = 0
+        zadd_key(f"history:league:{league_code}", score, canonical_id)
 
     # SET team indexes
-    home_clean = clean_team_name(home_team).replace(" ", "_")
-    away_clean = clean_team_name(away_team).replace(" ", "_")
-    sadd_key(f"history:team:{home_clean}", canonical_id)
-    sadd_key(f"history:team:{away_clean}", canonical_id)
+    if home_team:
+        home_clean = clean_team_name(home_team).replace(" ", "_")
+        sadd_key(f"history:team:{home_clean}", canonical_id)
+    if away_team:
+        away_clean = clean_team_name(away_team).replace(" ", "_")
+        sadd_key(f"history:team:{away_clean}", canonical_id)
 
 
 def migrate_to_history(canonical_id: str) -> bool:
@@ -952,21 +1055,31 @@ def migrate_to_history(canonical_id: str) -> bool:
     if match is None:
         return False
 
+    # Strip live-only fields
+    payload = copy.deepcopy(match)
+    for live_field in ("created_at", "updated_at"):
+        payload.pop(live_field, None)
+
+    # Ensure home_clean/away_clean
+    if not payload.get("home_clean"):
+        payload["home_clean"] = clean_team_name(payload.get("home_team", ""))
+    if not payload.get("away_clean"):
+        payload["away_clean"] = clean_team_name(payload.get("away_team", ""))
+
     # Записать в отдельный ключ
     key = f"{HISTORY_PREFIX}{canonical_id}"
-    if not set_key(key, match):
+    if not set_key(key, payload):
         return False
 
     # Удалить из хеша
     delete_from_cache(field_id)
 
     # Обновить индексы
-    league_code = match.get("league_code", "")
-    date_utc = match.get("date_utc", "")
-    home_team = match.get("home_team", "")
-    away_team = match.get("away_team", "")
-    if league_code and date_utc:
-        update_history_indexes(canonical_id, league_code, date_utc, home_team, away_team)
+    league_code = payload.get("league_code", "")
+    date_utc = payload.get("date_utc", "")
+    home_team = payload.get("home_team", "")
+    away_team = payload.get("away_team", "")
+    update_history_indexes(canonical_id, league_code, date_utc, home_team, away_team)
 
     return True
 
@@ -977,6 +1090,11 @@ def migrate_to_history(canonical_id: str) -> bool:
 def save_analysis(canonical_id: str, payload: dict) -> bool:
     """Сохранить анализ в отдельный ключ (raw JSON, без конверта)."""
     key = f"{ANALYSIS_PREFIX}{canonical_id}"
+    existing = get_key(key)
+    analysis_version = 1
+    if existing and isinstance(existing, dict):
+        analysis_version = existing.get("analysis_version", 0) + 1
+    payload["analysis_version"] = analysis_version
     payload["saved_at"] = _now_utc()
     return set_key(key, payload)
 
@@ -1010,13 +1128,13 @@ def get_search_results() -> Optional[dict]:
 def save_meta(collector: str, **kwargs) -> None:
     if not collector:
         return
-    field_id = f"{collector}:meta"
-    meta = get_from_cache(field_id) or {}
+    key = f"{collector}:meta"
+    meta = get_key(key) or {}
     if not isinstance(meta, dict):
         meta = {}
     meta["last_run"] = _now_utc()
     meta.update(kwargs)
-    save_to_cache(field_id, meta)
+    set_key(key, meta)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,18 +1154,36 @@ def cleanup_expired() -> int:
 
         status = value.get("status", "")
         date_utc = value.get("date_utc", "")
+        should_delete = False
 
-        if status == "completed":
+        # Check 1: completed + buffer passed
+        if status == "completed" and date_utc:
             try:
                 dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 if (now - dt).total_seconds() > MATCH_FINISH_BUFFER_HOURS * 3600:
-                    cid = value.get("canonical_id", field_id[len(MATCH_PREFIX):])
-                    if migrate_to_history(cid):
-                        deleted += 1
+                    should_delete = True
             except (ValueError, TypeError):
                 pass
+
+        # Check 2: date in the past + buffer passed (regardless of status)
+        if not should_delete and date_utc:
+            try:
+                dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if (now - dt).total_seconds() > MATCH_FINISH_BUFFER_HOURS * 3600:
+                    should_delete = True
+            except (ValueError, TypeError):
+                pass
+
+        if should_delete:
+            cid = value.get("canonical_id", field_id[len(MATCH_PREFIX):])
+            if migrate_to_history(cid):
+                deleted += 1
+                # Clean up index entries
+                _remove_from_index(cid, date_utc)
 
     if deleted > 0:
         _update_health_metric("last_cleanup_count", deleted)
@@ -1055,6 +1191,26 @@ def cleanup_expired() -> int:
         _flush_health_metrics()
 
     return deleted
+
+
+def _remove_from_index(canonical_id: str, date_utc: str) -> None:
+    """Удаление canonical_id из flat и sharded индексов."""
+    flat = get_from_cache(INDEX_FIELD) or {}
+    if isinstance(flat, dict):
+        flat.pop(canonical_id, None)
+        save_to_cache(INDEX_FIELD, flat)
+
+    if date_utc:
+        try:
+            dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+            date_fmt = dt.strftime("%Y%m%d")
+            shard_key = f"match:index:{date_fmt}"
+            shard = get_from_cache(shard_key) or {}
+            if isinstance(shard, dict):
+                shard.pop(canonical_id, None)
+                save_to_cache(shard_key, shard)
+        except (ValueError, TypeError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1088,15 +1244,21 @@ def find_match_by_source_id(source: str, source_id: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # Batch upsert
 # ---------------------------------------------------------------------------
-def batch_upsert_matches(matches: List[dict], source: str = "unknown") -> int:
-    """Массовое создание/обновление матчей."""
-    count = 0
+def batch_upsert_matches(matches: List[dict], source: str = "unknown") -> dict:
+    """Массовое создание/обновление матчей. Возвращает статистику."""
+    result = {"total": len(matches), "created": 0, "updated": 0, "skipped_past": 0, "errors": 0}
     for m in matches:
         try:
+            date_utc = m.get("date_utc", "")
+            # Check past match
+            if date_utc and not _is_future_match(date_utc):
+                result["skipped_past"] += 1
+                continue
+
             cid = upsert_match(
                 home_team=m.get("home_team", ""),
                 away_team=m.get("away_team", ""),
-                date_utc=m.get("date_utc", ""),
+                date_utc=date_utc,
                 source=source,
                 score=m.get("score"),
                 odds=m.get("odds"),
@@ -1105,12 +1267,25 @@ def batch_upsert_matches(matches: List[dict], source: str = "unknown") -> int:
                 source_id=m.get("source_id"),
                 predictions=m.get("predictions"),
                 h2h=m.get("h2h"),
+                competition=m.get("competition", ""),
+                country=m.get("country", ""),
+                league_code=m.get("league_code", ""),
+                season=m.get("season", ""),
             )
             if cid:
-                count += 1
+                # Check if it was created or updated
+                field_id = _make_field_name(cid)
+                existing = get_from_cache(field_id)
+                if existing and existing.get("version", 1) > 1:
+                    result["updated"] += 1
+                else:
+                    result["created"] += 1
+            else:
+                result["skipped_past"] += 1
         except Exception as e:
             print(f"[HUB] batch_upsert error: {e}")
-    return count
+            result["errors"] += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1151,11 +1326,76 @@ def get_odds_metadata(canonical_id: str) -> dict:
         result["snapshots"] = len(odds_1x2.get("snapshots", []))
         result["has_opening"] = any(s.get("type") == "opening" for s in sources)
         result["has_closing"] = any(s.get("type") == "closing" for s in sources)
+        result["has_live"] = any(s.get("type") == "live" for s in sources)
 
     result["has_ou25"] = "over_under_25" in odds
     result["has_ah"] = "asian_handicap" in odds
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Find by teams / fuzzy
+# ---------------------------------------------------------------------------
+def get_match_by_teams(home_team: str, away_team: str, date_utc: str) -> Optional[dict]:
+    """Найти матч по командам и дате."""
+    cid = _make_canonical_id(home_team, away_team, date_utc)
+    return get_match(cid)
+
+
+def patch_match_by_teams(
+    home_team: str, away_team: str, date_utc: str,
+    section: Optional[str] = None, data: Optional[dict] = None,
+    **kwargs,
+) -> bool:
+    """Патч матча по командам и дате (обёртка над patch_match)."""
+    cid = _make_canonical_id(home_team, away_team, date_utc)
+    return patch_match(cid, section, data, **kwargs)
+
+
+def find_match_fuzzy(home_team: str, away_team: str) -> Optional[dict]:
+    """Нечёткий поиск матча по командам (без даты)."""
+    home_c = clean_team_name(home_team)
+    away_c = clean_team_name(away_team)
+    all_matches = get_all_matches()
+    for cid, match in all_matches.items():
+        if not isinstance(match, dict):
+            continue
+        m_home = match.get("home_clean", "")
+        m_away = match.get("away_clean", "")
+        if not m_home:
+            m_home = clean_team_name(match.get("home_team", ""))
+        if not m_away:
+            m_away = clean_team_name(match.get("away_team", ""))
+        if m_home == home_c and m_away == away_c:
+            return match
+    return None
+
+
+def get_history_by_team(team_clean: str) -> List[str]:
+    """History-матчи команды (из SET)."""
+    team_key = clean_team_name(team_clean).replace(" ", "_")
+    return list(smembers_key(f"history:team:{team_key}"))
+
+
+def get_analysis_by_date(date_utc: str) -> List[dict]:
+    """Все analysis за указанную дату."""
+    try:
+        target_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+        target_date = target_dt.strftime("%Y%m%d")
+    except (ValueError, TypeError):
+        return []
+
+    results = []
+    analysis_keys = scan_keys(f"{ANALYSIS_PREFIX}*", count=500)
+    for key in analysis_keys:
+        data = get_key(key)
+        if not data or not isinstance(data, dict):
+            continue
+        saved_at = data.get("saved_at", "")
+        if saved_at and target_date in saved_at:
+            results.append(data)
+    return results
 
 
 # ---------------------------------------------------------------------------
