@@ -1,4 +1,4 @@
-name: Collector — PropLine (Pinnacle)
+name: Collector PropLine (Pinnacle)
 
 on:
   workflow_dispatch:
@@ -9,6 +9,17 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
+concurrency:
+  group: collector-propline
+  cancel-in-progress: false  # TODO: изменить на true после внедрения idempotency_key (Фаза 2)
+
+env:
+  PYTHON_VERSION: '3.12'
+  GK_CONFIG_FILE: gatekeeper_config.yaml
+
 jobs:
   collect:
     runs-on: ubuntu-latest
@@ -18,7 +29,13 @@ jobs:
       PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
       GITHUB_REPOSITORY: ${{ github.repository }}
+      PROPLINE_RATE_DELAY: '1.0'
+      PROPLINE_MAX_RETRIES: '3'
+      PROPLINE_DAYS_AHEAD: '7'
       PYTHONUNBUFFERED: '1'
 
     steps:
@@ -28,14 +45,21 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Install dependencies
         run: |
-          pip install --no-cache-dir requests
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run collector
-        run: python collector_propline.py
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.debug }}" = "true" ]; then
+            ARGS="--debug"
+          fi
+          python collector_propline.py $ARGS
 
       - name: Upload logs on failure
         if: failure()
@@ -45,4 +69,19 @@ jobs:
           path: |
             *.log
           retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Collector PropLine Summary ==="
+          echo "Debug: ${{ github.event.inputs.debug }}"
+          echo ""
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "Status: SUCCESS"
+          else
+            echo "Status: ${{ job.status }}"
+          fi
           
