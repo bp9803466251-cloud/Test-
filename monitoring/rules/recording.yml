@@ -1,0 +1,9 @@
+groups:
+  - name: gatekeeper_metrics
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job)
+      
+      - record: job:http_duration:p99
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job))
+        
