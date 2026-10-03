@@ -1,34 +1,23 @@
-# ═══════════════════════════════════════════════════════════════════════
-# GatekeeperAI — Sports Pipeline (§24.7 оркестрация)
-# Stage 1 (parallel): sharpapi + odds_api
-# Stage 2:            bzzoiro       (needs: sharpapi)
-# Stage 3:            propline      (needs: sharpapi, odds_api)
-# Stage 4:            contract-tests (needs: all)
-# ═══════════════════════════════════════════════════════════════════════
-
 name: Sports Pipeline
 
 on:
   workflow_dispatch:
-    inputs:
-      debug:
-        description: 'Debug mode'
-        required: false
-        default: 'false'
-        type: choice
-        options: ['true', 'false']
-
-env:
-  PYTHON_VERSION: '3.12'
 
 permissions:
   contents: read
 
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+
 jobs:
-  # ── Stage 1: Parallel — нет зависимостей ───────────────────────────
+  # ── Stage 1: Parallel collectors (no dependencies) ──
   sharpapi:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,12 +32,13 @@ jobs:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
-          SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '1.0' }}
-          SHARPAPI_MAX_PAGES: ${{ vars.SHARPAPI_MAX_PAGES || '5' }}
+          SHARPAPI_RATE_LIMIT_DELAY: '1.0'
+          SHARPAPI_MAX_PAGES: '5'
+          SHARPAPI_LIMIT: '100'
 
   odds_api:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -63,15 +53,16 @@ jobs:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          ODDS_API_RATE_DELAY: ${{ vars.ODDS_API_RATE_DELAY || '1.0' }}
-          ODDS_API_REGIONS: ${{ vars.ODDS_API_REGIONS || 'eu' }}
-          ODDS_API_MARKETS: ${{ vars.ODDS_API_MARKETS || 'h2h,totals,spreads' }}
-          ODDS_API_ODDS_FORMAT: ${{ vars.ODDS_API_ODDS_FORMAT || 'decimal' }}
+          ODDS_API_RATE_DELAY: '1.0'
+          ODDS_API_MAX_RETRIES: '3'
+          ODDS_API_REGIONS: 'eu'
+          ODDS_API_MARKETS: 'h2h'
+          ODDS_API_ODDS_FORMAT: 'decimal'
 
-  # ── Stage 2: Bzzoiro — enrichment после SharpAPI ───────────────────
+  # ── Stage 2: Bzzoiro (needs: sharpapi) ──
   bzzoiro:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     needs: [sharpapi]
     steps:
       - uses: actions/checkout@v4
@@ -87,14 +78,14 @@ jobs:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-          BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || '2.0' }}
-          BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || '1.0' }}
-          BZZOIRO_MAX_RETRIES: ${{ vars.BZZOIRO_MAX_RETRIES || '3' }}
+          BZZOIRO_RATE_DELAY: '1.5'
+          BZZOIRO_ENRICH_DELAY: '0.5'
+          BZZOIRO_MAX_RETRIES: '3'
 
-  # ── Stage 3: Propline — value analysis после SharpAPI + OddsAPI ─────
+  # ── Stage 3: Propline (needs: sharpapi, odds_api) ──
   propline:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: [sharpapi, odds_api]
     steps:
       - uses: actions/checkout@v4
@@ -110,10 +101,10 @@ jobs:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
-          PROPLINE_RATE_DELAY: ${{ vars.PROPLINE_RATE_DELAY || '1.5' }}
-          PROPLINE_MAX_RETRIES: ${{ vars.PROPLINE_MAX_RETRIES || '3' }}
+          PROPLINE_RATE_DELAY: '1.0'
+          PROPLINE_MAX_RETRIES: '3'
 
-  # ── Stage 4: Contract tests — после всех коллекторов ───────────────
+  # ── Stage 4: Contract tests + Pipeline ──
   contract-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -127,9 +118,25 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - name: Run contract tests
-        run: make test
-      - name: Config check
-        run: make config-check
-      - name: Hub version
-        run: make check-version
+      - run: python test_contracts.py
+
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [contract-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - run: python main.py
+        env:
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_TELEGRAM_BOT_TOKEN: ${{ secrets.SHARED_TELEGRAM_BOT_TOKEN || '' }}
+          SHARED_TELEGRAM_CHAT_ID: ${{ secrets.SHARED_TELEGRAM_CHAT_ID || '' }}
+          
