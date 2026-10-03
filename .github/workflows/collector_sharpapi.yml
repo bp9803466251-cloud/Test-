@@ -5,6 +5,7 @@ on:
 
 env:
   PYTHON_VERSION: "3.12"
+  GK_CONFIG_FILE: "./gatekeeper_config.yaml"
 
 permissions:
   contents: read
@@ -35,16 +36,16 @@ jobs:
       - name: Run collector
         run: python collector_sharpapi.py
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
           SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
           SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '6' }}
           SHARPAPI_MAX_PAGES: ${{ vars.SHARPAPI_MAX_PAGES || '60' }}
           SHARPAPI_LIMIT: ${{ vars.SHARPAPI_LIMIT || '200' }}
           SHARPAPI_MAX_RETRIES: ${{ vars.SHARPAPI_MAX_RETRIES || '3' }}
+          SHARPAPI_DAYS_AHEAD: '3'
           GATEKEEPER_EXTERNAL_API_TIMEOUT: ${{ vars.GATEKEEPER_EXTERNAL_API_TIMEOUT || '15' }}
+          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PYTHONUNBUFFERED: '1'
 
