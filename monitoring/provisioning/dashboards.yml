@@ -1,0 +1,9 @@
+apiVersion: 1
+dashboards:
+  - provider: 'default'
+    folder: 'Gatekeeper'
+    folderUid: null
+    orgId: 1
+    paths:
+      - ../dashboards/
+      
