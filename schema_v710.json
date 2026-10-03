@@ -4,7 +4,7 @@
     "type": "object",
     "required": [
         "id",
-        "sources",  // Добавлено обязательное поле sources
+        "sources",
         "source",
         "home",
         "away",
@@ -17,7 +17,7 @@
             "description": "Canonical ID: home__away__YYYYMMDD",
             "pattern": "^[a-z0-9_]+__[a-z0-9_]+__[0-9]{8}$"
         },
-        "sources": {  // Добавленный массив sources
+        "sources": {
             "type": "array",
             "items": {
                 "type": "string"
@@ -73,11 +73,11 @@
         },
         "competition": {
             "type": "string",
-            "minLength": 1  // Добавлено требование минимальной длины
+            "minLength": 1
         },
         "country": {
             "type": "string",
-            "minLength": 1  // Добавлено требование минимальной длины
+            "minLength": 1
         },
         "odds": {
             "type": "object",
