@@ -1,146 +1,206 @@
 {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "version": "7.10",
-    "type": "object",
-    "required": [
-        "id",
-        "sources",
-        "source",
-        "home",
-        "away",
-        "date_utc",
-        "odds"
-    ],
-    "properties": {
-        "id": {
-            "type": "string",
-            "description": "Canonical ID: home__away__YYYYMMDD",
-            "pattern": "^[a-z0-9_]+__[a-z0-9_]+__[0-9]{8}$"
-        },
-        "sources": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            }
-        },
-        "source": {
-            "type": "string",
-            "enum": [
-                "sharpapi",
-                "odds_api",
-                "propline",
-                "bzzoiro",
-                "football_data"
-            ]
-        },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatekeeperAI Match Schema",
+  "version": "v710",
+  "description": "Канонический формат матча GatekeeperAI (schema v710)",
+  "type": "object",
+  "required": [
+    "canonical_id",
+    "home_team",
+    "away_team",
+    "home_clean",
+    "away_clean",
+    "date_utc",
+    "competition",
+    "country",
+    "status",
+    "version",
+    "schema_version"
+  ],
+  "properties": {
+    "canonical_id": {
+      "type": "string",
+      "description": "home__away__YYYYMMDD",
+      "pattern": "^[a-z0-9_]+__[a-z0-9_]+__\\d{8}$"
+    },
+    "home_team": {
+      "type": "string",
+      "description": "Оригинальное название домашней команды"
+    },
+    "away_team": {
+      "type": "string",
+      "description": "Оригинальное название гостевой команды"
+    },
+    "home_clean": {
+      "type": "string",
+      "description": "Нормализованное название (clean_team_name)"
+    },
+    "away_clean": {
+      "type": "string",
+      "description": "Нормализованное название (clean_team_name)"
+    },
+    "date_utc": {
+      "type": "string",
+      "description": "ISO 8601 UTC, единственный источник даты"
+    },
+    "competition": {
+      "type": "string",
+      "description": "Название лиги/турнира (строка, не dict)"
+    },
+    "country": {
+      "type": "string",
+      "description": "Страна"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "scheduled",
+        "live",
+        "completed",
+        "cancelled",
+        "postponed",
+        "interrupted",
+        "archived"
+      ],
+      "description": "Статус матча (state machine §24.1)"
+    },
+    "score": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
         "home": {
-            "type": "string",
-            "minLength": 1
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "away": {
-            "type": "string",
-            "minLength": 1
-        },
-        "date_utc": {
-            "type": "string",
-            "format": "date-time"
-        },
-        "status": {
-            "type": "string",
-            "enum": [
-                "scheduled",
-                "live",
-                "completed",
-                "cancelled",
-                "postponed",
-                "interrupted",
-                "archived"
-            ],
-            "default": "scheduled"
-        },
-        "score": {
-            "type": "object",
-            "properties": {
-                "home": {
-                    "type": "integer",
-                    "minimum": 0
-                },
-                "away": {
-                    "type": "integer",
-                    "minimum": 0
-                }
-            }
-        },
-        "competition": {
-            "type": "string",
-            "minLength": 1
-        },
-        "country": {
-            "type": "string",
-            "minLength": 1
-        },
-        "odds": {
-            "type": "object",
-            "required": [
-                "open"
-            ],
-            "properties": {
-                "open": {
-                    "type": "object",
-                    "required": [
-                        "home",
-                        "draw",
-                        "away"
-                    ],
-                    "properties": {
-                        "home": {
-                            "type": "number",
-                            "minimum": 1.0
-                        },
-                        "draw": {
-                            "type": "number",
-                            "minimum": 1.0
-                        },
-                        "away": {
-                            "type": "number",
-                            "minimum": 1.0
-                        }
-                    }
-                },
-                "closing": {
-                    "type": "object",
-                    "properties": {
-                        "home": {
-                            "type": "number",
-                            "minimum": 1.0
-                        },
-                        "draw": {
-                            "type": "number",
-                            "minimum": 1.0
-                        },
-                        "away": {
-                            "type": "number",
-                            "minimum": 1.0
-                        }
-                    }
-                }
-            }
-        },
-        "metadata": {
-            "type": "object",
-            "properties": {
-                "fetched_at": {
-                    "type": "string",
-                    "format": "date-time"
-                },
-                "canonical_verified": {
-                    "type": "boolean"
-                },
-                "upstream": {
-                    "type": "string"
-                }
-            }
+          "type": [
+            "integer",
+            "null"
+          ]
         }
+      },
+      "description": "Плоский счёт {home: int, away: int}"
     },
-    "additionalProperties": true
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Версия для CAS"
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Версия схемы (v710)"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Уникальные источники данных"
+    },
+    "source_ids": {
+      "type": "object",
+      "description": "ID матча в источнике {source: id}"
+    },
+    "odds": {
+      "type": "object",
+      "description": "Коэффициенты в формате 1x2 (§1.21)",
+      "properties": {
+        "1x2": {
+          "type": "object",
+          "properties": {
+            "current": {
+              "type": "object"
+            },
+            "opening": {
+              "type": "object"
+            },
+            "best": {
+              "type": "object"
+            },
+            "closing": {
+              "type": "object"
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string"
+                  },
+                  "upstream": {
+                    "type": "string"
+                  },
+                  "price": {
+                    "type": "object"
+                  },
+                  "timestamp": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "predictions": {
+      "type": "object",
+      "description": "Прогнозы (от Bzzoiro)"
+    },
+    "stats": {
+      "type": "object",
+      "description": "Статистика матча (от Bzzoiro)"
+    },
+    "h2h": {
+      "type": "object",
+      "description": "Head-to-head (от Bzzoiro)"
+    },
+    "created_at": {
+      "type": "string",
+      "description": "ISO 8601 MSK"
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "ISO 8601 MSK"
+    },
+    "section_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "section": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "FIFO, max 20"
+    },
+    "season": {
+      "type": "string",
+      "description": "Сезон (для history)"
+    },
+    "league_code": {
+      "type": "string",
+      "description": "Код лиги (для history)"
+    },
+    "csv_raw": {
+      "type": "object",
+      "description": "Сырые колонки CSV (для history)"
+    }
+  },
+  "additionalProperties": true
 }
