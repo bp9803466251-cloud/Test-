@@ -1,24 +1,28 @@
 # value_engine.py
-# Version: 3.1 — Phase 5: support both "open" (schema) and "current" (hub) odds keys
+# Version: 3.2 — Phase 6: fix 1x2 nesting + opening key + error isolation
 
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-from gatekeeper_config import MSK_TZ
-from gatekeeper_hub import is_shutdown_requested
+try:
+    from gatekeeper_hub import is_shutdown_requested
+except ImportError:
+    def is_shutdown_requested():
+        return False
 
 __all__ = [
     "evaluate_match_value",
     "evaluate_match_full",
     "batch_evaluate",
+    "batch_evaluate_full",
     "calculate_margin",
     "extract_odds_pair",
     "ValueEngineError",
     "__version__",
 ]
 
-__version__ = "3.1"
+__version__ = "3.2-patched"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,15 +37,16 @@ class ValueEngineError(Exception):
 
 
 # ---- Приоритеты источников (ранг 1 = лучший) ----
+# FIX: синхронизировано с odds_priority.yaml (§20.3)
 _PRIORITY_MAP = {
     "sharpapi": 1,
-    "propline": 2,
-    "odds_api": 3,
+    "propline": 1,
+    "odds_api": 2,
     "football_data": 4,
-    "bzzoiro": 8,
+    "bzzoiro": 3,
 }
 
-# ---- Единый порог value (из gatekeeper_config → ENV → default) ----
+# ---- Единый порог value (из gatekeeper_config -> ENV -> default) ----
 try:
     from gatekeeper_config import VALUE_THRESHOLD as _CFG_THRESHOLD
 except ImportError:
@@ -128,8 +133,9 @@ def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, f
     Извлекает open и closing odds как два независимых тензора.
     Возвращает (open_tuple, closing_tuple). Любой может быть None.
 
-    FIX v3.1: Ищет "open" (схема/фикстуры) как primary,
-              "current" (хаб internal) как fallback.
+    FIX v3.2: Корректно обрабатывает nesting 1x2 (§1.21).
+              Schema key = "opening" (не "open").
+              "current" — fallback если нет "opening".
 
     Closing — «истинная» цена рынка (PropLine/Pinnacle).
     Open — коэффициент, на который можно поставить сейчас.
@@ -137,14 +143,23 @@ def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, f
     open_tuple = None
     closing_tuple = None
 
-    # FIX v3.1: "open" — primary (схема v710), "current" — fallback (хаб internal)
-    open_block = all_odds.get("open")
+    # FIX v3.2: odds хранятся в 1x2 (§1.21), но поддерживаем плоский формат
+    if not isinstance(all_odds, dict):
+        return None, None
+
+    odds_1x2 = all_odds.get("1x2")
+    if not isinstance(odds_1x2, dict):
+        # Fallback: плоский формат (без 1x2 обёртки)
+        odds_1x2 = all_odds
+
+    # "opening" — primary (schema v710 §1.21), "current" — fallback (hub internal)
+    open_block = odds_1x2.get("opening")
     if not isinstance(open_block, dict):
-        open_block = all_odds.get("current")
+        open_block = odds_1x2.get("current")
     if isinstance(open_block, dict):
         open_tuple = _extract_odds_tuple(open_block)
 
-    closing_block = all_odds.get("closing")
+    closing_block = odds_1x2.get("closing")
     if isinstance(closing_block, dict):
         closing_tuple = _extract_odds_tuple(closing_block)
 
@@ -184,35 +199,42 @@ def evaluate_match_full(
             "direction": "home"|"draw"|"away",
             "margin": float,
             "closing_margin": float|None,
-            "current_odds": (h, d, a),       # open odds tuple (имя сохранено для совместимости)
+            "current_odds": (h, d, a),       # open odds tuple
             "closing_odds": (h, d, a)|None,
             "best_source": str|None,
         }
     """
-    if value_threshold is None:
-        value_threshold = _DEFAULT_THRESHOLD
+    try:
+        if value_threshold is None:
+            value_threshold = _DEFAULT_THRESHOLD
 
-    all_odds = match_data.get("odds", {})
-    if not isinstance(all_odds, dict):
+        if not isinstance(match_data, dict):
+            return None
+
+        all_odds = match_data.get("odds", {})
+        if not isinstance(all_odds, dict):
+            return None
+
+        open_tuple, closing_tuple = extract_odds_pair(all_odds)
+
+        # Нет ни open, ни closing — нечего оценивать
+        if not open_tuple and not closing_tuple:
+            return None
+
+        # Только closing — нечего сравнивать
+        if not open_tuple and closing_tuple:
+            logger.debug("Только closing odds — value не вычисляется")
+            return None
+
+        # Fallback: если open есть, но нет closing — используем open
+        if open_tuple and not closing_tuple:
+            return _evaluate_single(open_tuple, value_threshold, match_data, has_closing=False)
+
+        # Оба есть — считаем реальный value: open vs closing
+        return _evaluate_dual(open_tuple, closing_tuple, value_threshold, match_data)
+    except Exception as e:
+        logger.warning("evaluate_match_full error: %s", e)
         return None
-
-    open_tuple, closing_tuple = extract_odds_pair(all_odds)
-
-    # Нет ни open, ни closing — нечего оценивать
-    if not open_tuple and not closing_tuple:
-        return None
-
-    # Только closing — нечего сравнивать
-    if not open_tuple and closing_tuple:
-        logger.debug("Только closing odds — value не вычисляется")
-        return None
-
-    # Fallback: если open есть, но нет closing — используем open
-    if open_tuple and not closing_tuple:
-        return _evaluate_single(open_tuple, value_threshold, match_data, has_closing=False)
-
-    # Оба есть — считаем реальный value: open vs closing
-    return _evaluate_dual(open_tuple, closing_tuple, value_threshold, match_data)
 
 
 def _evaluate_single(
@@ -273,10 +295,6 @@ def _evaluate_dual(
     value_home = fair_prob_home(closing) - fair_prob_home(open)
     value = max(abs(value_home), abs(value_draw), abs(value_away))
     """
-    ch, cd, ca = open_odds
-    kh, kd, ka = closing
-
-    # Implied probs
     c_hp, c_dp, c_ap, c_margin = _implied_probs(open_odds)
     k_hp, k_dp, k_ap, k_margin = _implied_probs(closing)
 
@@ -333,7 +351,8 @@ def batch_evaluate(
 ) -> Dict[str, Optional[float]]:
     """
     Пакетная оценка. Возвращает {canonical_id: value | None}.
-    Graceful shutdown: проверка is_shutdown_requested() в цикле.
+    Graceful shutdown: проверка is_shutdown_requested() в цикле (§23.3).
+    Error isolation: try-except вокруг каждого матча (§1.25).
     """
     results: Dict[str, Optional[float]] = {}
 
@@ -341,7 +360,11 @@ def batch_evaluate(
         if is_shutdown_requested():
             logger.info("Graceful shutdown — batch_evaluate прерван")
             break
-        results[cid] = evaluate_match_value(match, value_threshold)
+        try:
+            results[cid] = evaluate_match_value(match, value_threshold)
+        except Exception as e:
+            logger.warning("batch_evaluate error for %s: %s", cid, e)
+            results[cid] = None
 
     return results
 
@@ -353,6 +376,8 @@ def batch_evaluate_full(
     """
     Пакетная оценка с детальным результатом.
     Возвращает {canonical_id: {value, direction, margin, ...} | None}.
+    Graceful shutdown: проверка is_shutdown_requested() в цикле (§23.3).
+    Error isolation: try-except вокруг каждого матча (§1.25).
     """
     results: Dict[str, Optional[Dict[str, Any]]] = {}
 
@@ -360,6 +385,10 @@ def batch_evaluate_full(
         if is_shutdown_requested():
             logger.info("Graceful shutdown — batch_evaluate_full прерван")
             break
-        results[cid] = evaluate_match_full(match, value_threshold)
+        try:
+            results[cid] = evaluate_match_full(match, value_threshold)
+        except Exception as e:
+            logger.warning("batch_evaluate_full error for %s: %s", cid, e)
+            results[cid] = None
 
     return results
