@@ -4,6 +4,10 @@ TEAM_ALIASES и clean_team_name в одном модуле (§19.2).
 Устраняет циклическую зависимость между hub и search_module.
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # ── TEAM_ALIASES — 257+ записей ─────────────────────────────
 TEAM_ALIASES = {
     # England
@@ -425,7 +429,7 @@ TEAM_ALIASES = {
     "banfield": "banfield",
     "gimnasia": "gimnasia",
     "gimnasia lp": "gimnasia",
-    "v elez sarsfield": "velez_sarsfield",
+    "velez sarsfield": "velez_sarsfield",
     "velez": "velez_sarsfield",
 
     # Mexico
@@ -667,7 +671,6 @@ TEAM_ALIASES = {
     "bk hacken": "hacken",
     "djugardens": "djugardens",
     "djurgardens": "djugardens",
-    "if": "djugardens",
     "hammarby": "hammarby",
     "if elfsborg": "elfsborg",
     "elfsborg": "elfsborg",
@@ -858,21 +861,43 @@ def clean_team_name(name: str) -> str:
         if clean_key in TEAM_ALIASES:
             return TEAM_ALIASES[clean_key]
         
-        # Шаг 3: Удаление суффиксов + lookup
-        suffixes = [" fc", " cf", " afc", " sc", " united", " city", " town",
-                    "fc ", "cf ", "afc ", "sc ", " club"]
+        # Шаг 3: Удаление суффиксов (только с конца) + lookup
+        suffixes = [" fc", " cf", " afc", " sc", " united", " city", " town", " club"]
         stripped = clean_key
         for suffix in suffixes:
-            stripped = stripped.replace(suffix, " ")
-        stripped = stripped.replace("  ", " ").strip()
+            if stripped.endswith(suffix):
+                stripped = stripped[:-len(suffix)].strip()
+                break  # only strip one suffix
         if stripped in TEAM_ALIASES:
             return TEAM_ALIASES[stripped]
         
         # Шаг 4: Fallback — заменяем пробелы на подчёркивания
         return stripped.replace(" ", "_")
-    except Exception:
+    except Exception as e:
+        logger.warning("clean_team_name error for %r: %s", name, e)
         return ""
+
+
+def build_canonical_id(home: str, away: str, date_str: str) -> str:
+    """
+    Строит canonical_id (§1.18): home__away__YYYYMMDD.
+    Использует clean_team_name для нормализации команд.
+    date_str — ISO 8601 или YYYY-MM-DD.
+    """
+    try:
+        h = clean_team_name(home) or home.strip().lower().replace(" ", "_")
+        a = clean_team_name(away) or away.strip().lower().replace(" ", "_")
+        # Извлекаем YYYYMMDD из date_str
+        d = date_str.strip() if date_str else ""
+        if "T" in d:
+            d = d.split("T")[0]
+        d = d.replace("-", "")
+        return f"{h}__{a}__{d}"
+    except Exception as e:
+        logger.warning("build_canonical_id error: %s", e)
+        return ""
+
 
 __version__ = "8.10-patched"
 
-__all__ = ["TEAM_ALIASES", "clean_team_name"]
+__all__ = ["TEAM_ALIASES", "clean_team_name", "build_canonical_id", "__version__"]
