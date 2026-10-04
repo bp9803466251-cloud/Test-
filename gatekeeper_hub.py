@@ -65,6 +65,36 @@ __version__ = "8.10-patched"
 HUB_API_VERSION = "8.9"
 SCHEMA_VERSION = "v710"
 
+# ═══════════════════════════════════════════════════════════
+# FIX-AUDIT: validate_schema — валидация матча против schema v710
+# ═══════════════════════════════════════════════════════════
+
+def validate_schema(match_obj, schema_version=SCHEMA_VERSION):
+    """
+    Валидирует матч против schema v710. §20.8
+    Возвращает (bool, str): (True, "ok") или (False, "error message").
+    """
+    if not isinstance(match_obj, dict):
+        return False, "match_obj is not dict"
+    required = ("canonical_id", "home_clean", "away_clean", "date_utc",
+                "status", "schema_version")
+    for field in required:
+        if field not in match_obj:
+            return False, f"missing required field: {field}"
+    if match_obj.get("schema_version") != schema_version:
+        return False, f"schema_version mismatch: {match_obj.get('schema_version')} != {schema_version}"
+    cid = match_obj.get("canonical_id", "")
+    if "__" not in cid or len(cid.split("__")) != 3:
+        return False, f"canonical_id format invalid: {cid}"
+    odds = match_obj.get("odds", {})
+    if odds and isinstance(odds, dict) and "1x2" not in odds:
+        log_event("hub", "WARN", "validate_schema: odds without 1x2",
+                  cid=cid)
+    return True, "ok"
+
+
+
+
 __all__ = [
     # Version
     "__version__", "HUB_API_VERSION", "SCHEMA_VERSION",
@@ -106,6 +136,9 @@ __all__ = [
     "save_search_results",
     "save_analysis",
     "get_from_cache",
+    # FIX-AUDIT: schema + indexes
+    "validate_schema",
+    "update_history_indexes",
 ]
 
 
@@ -543,6 +576,22 @@ def upsert_match(home_team="", away_team="", date_utc="",
     """
     METRICS.inc("upsert_match")
 
+    # FIX-AUDIT: Поддержка payload dict (football_data collector)
+    if isinstance(home_team, dict):
+        payload = home_team
+        home_team = payload.get("home_team", "")
+        away_team = payload.get("away_team", "")
+        date_utc = payload.get("date_utc", "")
+        competition = payload.get("competition", "")
+        country = payload.get("country", "")
+        status = payload.get("status", "scheduled")
+        source = payload.get("source", source)
+        mode = payload.get("mode", mode)
+        extra_fields = {k: v for k, v in payload.items()
+                        if k not in ("home_team", "away_team", "date_utc",
+                                     "competition", "country", "status",
+                                     "source", "mode", "canonical_id")}
+
     # FIX-8: Graceful shutdown check
     if is_shutdown_requested():
         log_event(source, "WARN", "upsert_match: shutdown requested, skipping")
@@ -756,6 +805,19 @@ def _merge_odds(existing_odds, new_odds, source, upstream=None):
         else:
             result[market] = new_odds[market]
 
+    # FIX-AUDIT: section_history tracking (schema v710)
+    sec_1x2 = result.get("1x2", {})
+    if isinstance(sec_1x2, dict):
+        history = sec_1x2.setdefault("section_history", [])
+        history.append({
+            "section": "odds",
+            "source": source,
+            "upstream": upstream or "",
+            "updated_at": now_msk(),
+        })
+        if len(history) > 50:
+            sec_1x2["section_history"] = history[-50:]
+
     return result
 
 
@@ -953,6 +1015,26 @@ def _remove_from_index(canonical_id):
         pass
 
 
+
+
+def update_history_indexes(canonical_id, date_utc):
+    """
+    Добавляет canonical_id в дневной индекс index:shard:{YYYYMMDD}. §1.7c
+    Для football_data_to_redis.py — индексация исторических матчей.
+    """
+    rh = _get_redis()
+    if not rh or not date_utc:
+        return
+    shard_key = f"index:shard:{date_utc[:10].replace('-', '')}"
+    try:
+        rh._execute_upstash_cmd(["SADD", shard_key, canonical_id])
+        log_event("hub", "DEBUG", "update_history_indexes",
+                  cid=canonical_id, shard=shard_key)
+    except Exception as e:
+        log_event("hub", "WARN", "update_history_indexes failed",
+                  cid=canonical_id, error=str(e))
+
+
 # ═══════════════════════════════════════════════════════════
 # Core API: cleanup_expired (FIX-6 — реализация вместо заглушки)
 # ═══════════════════════════════════════════════════════════
@@ -969,6 +1051,8 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
 
     log_event("hub", "INFO", "cleanup_expired starting",
               dry_run=dry_run, auto_migrate=auto_migrate)
+
+    _cleanup_start = time.monotonic()
 
     deleted = 0
     migrated = 0
@@ -1058,7 +1142,7 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
     log_event("hub", "INFO", "cleanup_expired done",
               deleted=deleted, migrated=migrated, expired=expired_deleted)
     METRICS.inc("cleanup_deleted", deleted)
-    METRICS.time("cleanup_duration", time.time() - 0)  # approximate
+    METRICS.time("cleanup_duration", time.monotonic() - _cleanup_start)  # approximate
     return {
         "count": deleted,
         "migrated": migrated,
