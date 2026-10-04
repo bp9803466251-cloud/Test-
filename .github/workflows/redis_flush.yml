@@ -1,6 +1,9 @@
 name: Redis Flush
 
 on:
+  schedule:
+    # Ежедневно в 03:00 UTC (06:00 МСК) — soft mode
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -26,15 +29,14 @@ on:
         description: 'Только превью (без выполнения)'
         type: boolean
         required: false
-        default: false
+        default: true
 
 permissions:
   contents: read
 
-# FIX-3: Concurrency — предотвращает двойную запись в Redis
 concurrency:
   group: redis-flush
-  cancel-in-progress: false  # TODO: изменить на true после внедрения idempotency_key
+  cancel-in-progress: false
 
 jobs:
   flush:
@@ -43,12 +45,12 @@ jobs:
 
     env:
       PYTHON_VERSION: '3.12'
-      # FIX-1: SHARED_* — для redis_hub (транспортный слой)
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-      # FIX-1: UPSTASH_* — fallback для прямого доступа
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -62,11 +64,27 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set mode for scheduled run
+        if: github.event_name == 'schedule'
+        run: |
+          echo "FLUSH_MODE=soft" >> $GITHUB_ENV
+          echo "FLUSH_CONFIRM=yes" >> $GITHUB_ENV
+          echo "FLUSH_DRY_RUN=true" >> $GITHUB_ENV
+
+      - name: Set mode for manual run
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "FLUSH_MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
+          echo "FLUSH_CONFIRM=${{ github.event.inputs.confirm }}" >> $GITHUB_ENV
+          echo "FLUSH_DRY_RUN=${{ github.event.inputs.dry_run_only }}" >> $GITHUB_ENV
 
       - name: Validate confirm
         run: |
-          if [ "${{ github.event.inputs.confirm }}" != "yes" ]; then
+          if [ "${FLUSH_CONFIRM}" != "yes" ]; then
             echo "ERROR: confirm must be 'yes'"
             exit 1
           fi
@@ -76,7 +94,7 @@ jobs:
         if: success()
         timeout-minutes: 15
         run: |
-          MODE="${{ github.event.inputs.mode }}"
+          MODE="${FLUSH_MODE}"
           echo "=== Redis Flush — Dry Run ==="
           echo "Mode: $MODE"
           echo ""
@@ -96,7 +114,6 @@ jobs:
               ;;
             reset-breaker)
               echo "Reset breaker — dry run not applicable"
-              echo "Will execute: --reset-breaker"
               ;;
             *)
               echo "ERROR: Unknown mode '$MODE'"
@@ -105,17 +122,16 @@ jobs:
           esac
 
       - name: Stop if dry-run-only
-        if: success() && github.event.inputs.dry_run_only == 'true'
+        if: success() && env.FLUSH_DRY_RUN == 'true'
         run: |
           echo "=== Dry-run-only mode — skipping execution ==="
-          echo "Review the plan above. Re-run with dry_run_only=false to execute."
           exit 0
 
       - name: Execute flush
-        if: success() && github.event.inputs.dry_run_only != 'true'
+        if: success() && env.FLUSH_DRY_RUN != 'true'
         timeout-minutes: 20
         run: |
-          MODE="${{ github.event.inputs.mode }}"
+          MODE="${FLUSH_MODE}"
           echo "=== Redis Flush — Execute ==="
           echo "Mode: $MODE"
           echo ""
@@ -143,7 +159,7 @@ jobs:
           esac
 
       - name: Verify after flush
-        if: always() && github.event.inputs.mode != 'reset-breaker'
+        if: always() && env.FLUSH_MODE != 'reset-breaker'
         timeout-minutes: 10
         run: |
           echo "=== Post-Flush Verify ==="
@@ -153,16 +169,16 @@ jobs:
         if: always()
         run: |
           echo "=== Redis Flush Summary ==="
-          echo "Mode: ${{ github.event.inputs.mode }}"
-          echo "Confirm: ${{ github.event.inputs.confirm }}"
-          echo "Dry run only: ${{ github.event.inputs.dry_run_only }}"
+          echo "Mode: ${FLUSH_MODE}"
+          echo "Confirm: ${FLUSH_CONFIRM}"
+          echo "Dry run only: ${FLUSH_DRY_RUN}"
           echo ""
           echo "Run ID: ${{ github.run_id }}"
           echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo ""
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "Status: SUCCESS"
-          else
-            echo "Status: ${{ job.status }}"
-          fi
+
+      - name: Telegram alert on failure
+        if: failure()
+        run: |
+          MSG="❌ Redis Flush FAILED%0AMode: ${FLUSH_MODE}%0ARun: ${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_CHAT_ID}"             -d text="${MSG}" || true
           
