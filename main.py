@@ -107,10 +107,8 @@ except ImportError:
         return balanced
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [DASH] %(message)s'
-)
+logger = logging.getLogger("main")
+logger.addHandler(logging.NullHandler())
 
 __version__ = "8.11-patched"
 __all__ = ["main", "__version__"]
@@ -119,7 +117,7 @@ MSK_TZ = timezone(timedelta(hours=3))
 VALUE_THRESHOLD = float(os.environ.get("VALUE_THRESHOLD", "") or os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "") or os.environ.get("TELEGRAM_GROUP_ID", "")
+TG_CHAT = os.environ.get("TELEGRAM_GROUP_ID", "") or os.environ.get("TELEGRAM_CHAT_ID", "")
 # FIX-14: Используем TELEGRAM_CHUNK_LIMIT из telegram_transport
 TG_MAX_CHARS = TELEGRAM_CHUNK_LIMIT
 
@@ -129,16 +127,16 @@ TG_MAX_CHARS = TELEGRAM_CHUNK_LIMIT
 # ---------------------------------------------------------------------------
 def _send_telegram(text: str) -> bool:
     if not TG_TOKEN or not TG_CHAT:
-        logging.info("Нет токена или chat_id — пропуск")
+        logger.info("Нет токена или chat_id — пропуск")
         return False
     text = text.replace('%', '&#37;')
     parts = _split_html_safe(text, TG_MAX_CHARS)
-    logging.info(f"Отправка {len(parts)} сообщений...")
+    logger.info(f"Отправка {len(parts)} сообщений...")
     for i, part in enumerate(parts, 1):
         if not _send_one(part):
-            logging.warning(f"Ошибка отправки части {i}/{len(parts)}")
+            logger.warning(f"Ошибка отправки части {i}/{len(parts)}")
             return False
-        logging.info(f"Часть {i}/{len(parts)} отправлена")
+        logger.info(f"Часть {i}/{len(parts)} отправлена")
     return True
 
 
@@ -157,7 +155,7 @@ def _send_one(text: str) -> bool:
             data = json.loads(resp.read().decode("utf-8"))
             if data.get("ok"):
                 return True
-            logging.warning(f"API error: {data.get('description', '?')}")
+            logger.warning(f"API error: {data.get('description', '?')}")
             return False
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -166,10 +164,10 @@ def _send_one(text: str) -> bool:
                 retry_after = json.loads(body).get("parameters", {}).get("retry_after", 3)
             except Exception:
                 retry_after = 3
-            logging.warning(f"429: ожидание {retry_after}с")
+            logger.warning(f"429: ожидание {retry_after}с")
             time.sleep(retry_after)
             return _send_one(text)
-        logging.warning(f"HTTP {e.code}: {body[:200]}")
+        logger.warning(f"HTTP {e.code}: {body[:200]}")
         return False
     except Exception as e:
         # FIX-AUDIT: Retry на network errors (ConnectionRefused, Timeout)
@@ -178,13 +176,13 @@ def _send_one(text: str) -> bool:
         if _send_one._retry_count < 2:
             _send_one._retry_count += 1
             delay = 2 ** _send_one._retry_count
-            logging.warning(f"Network error, retry {_send_one._retry_count}/2 после {delay}с: {e}")
+            logger.warning(f"Network error, retry {_send_one._retry_count}/2 после {delay}с: {e}")
             time.sleep(delay)
             result = _send_one(text)
             _send_one._retry_count = 0
             return result
         _send_one._retry_count = 0
-        logging.warning(f"Ошибка отправки (нет retry): {e}")
+        logger.warning(f"Ошибка отправки (нет retry): {e}")
         return False
 
 
@@ -407,17 +405,17 @@ def _format_dashboard(result: dict) -> str:
 def main():
     global _redis_available
 
-    logging.info("=" * 60)
-    logging.info("Gatekeeper-AI Pipeline v8.11-patched")
-    logging.info(f"Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
-    logging.info("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Gatekeeper-AI Pipeline v8.11-patched")
+    logger.info(f"Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
+    logger.info("=" * 60)
 
     # === ШАГ 1: Инициализация (§1.7a) ===
-    logging.info("Инициализация Redis...")
+    logger.info("Инициализация Redis...")
     init = run_initialization(collector="main")
     if not init or not init.get("redis_available"):
         _redis_available = False
-        logging.error("Redis недоступен")
+        logger.error("Redis недоступен")
         dashboard = (
             "\U0001f310 Redis- | Пайплайн работает в graceful degradation | "
             "Данные не обновлены\n"
@@ -429,14 +427,14 @@ def main():
 
     _redis_available = True
     latency = init.get("init_latency_ms", 0)
-    logging.info(f"Redis init OK, latency={latency}ms")
+    logger.info(f"Redis init OK, latency={latency}ms")
 
     # === ШАГ 2: Получение матчей ===
     matches = get_matches_by_date_range()
-    logging.info(f"get_matches_by_date_range -> {len(matches)} матчей")
+    logger.info(f"get_matches_by_date_range -> {len(matches)} матчей")
 
     if not matches:
-        logging.info("Нет матчей для анализа")
+        logger.info("Нет матчей для анализа")
         now_str = datetime.now(MSK_TZ).strftime("%H:%M")
         module = _last_module()
         dashboard = (
@@ -450,18 +448,18 @@ def main():
 
     # === Graceful shutdown check (§23.3) ===
     if is_shutdown_requested():
-        logging.info("Graceful shutdown — завершение до value-анализа")
+        logger.info("Graceful shutdown — завершение до value-анализа")
         save_meta("main", last_run=now_msk(), total_events=len(matches),
                   stored_matches=0, error_count=0, shutdown=True)
         return
 
     # === ШАГ 3: Value-анализ ===
-    logging.info(f"Value-анализ через value_engine.run_pipeline (threshold={VALUE_THRESHOLD})...")
+    logger.info(f"Value-анализ через value_engine.run_pipeline (threshold={VALUE_THRESHOLD})...")
     try:
         # FIX-11: run_pipeline вместо batch_evaluate
         result = run_pipeline(matches, value_threshold=VALUE_THRESHOLD)
     except Exception as e:
-        logging.error(f"run_pipeline failed: {e}")
+        logger.error(f"run_pipeline failed: {e}")
         dashboard = (
             "\U0001f310 Redis+ | \U0001f4caValue engine error | "
             f"Пайплайн прерван: {html.escape(str(e))}\n"
@@ -472,9 +470,9 @@ def main():
                   stored_matches=0, error_count=1)
         return
 
-    logging.info(f"HOT: {len(result['hot'])}, WARM: {len(result['warm'])}, "
+    logger.info(f"HOT: {len(result['hot'])}, WARM: {len(result['warm'])}, "
                  f"Value: {result['stats']['value_bets']}")
-    logging.info(f"Odds: {result['stats']['with_odds']}, "
+    logger.info(f"Odds: {result['stats']['with_odds']}, "
                  f"Pred: {result['stats']['with_pred']}, "
                  f"H2H: {result['stats']['with_h2h']}, "
                  f"Stats: {result['stats']['with_stats']}")
@@ -497,12 +495,11 @@ def main():
             })
             saved_analysis += 1
         except Exception as e:
-            logging.warning(f"save_analysis failed for {cid}: {e}")
+            logger.warning(f"save_analysis failed for {cid}: {e}")
 
     # === ШАГ 5: Формирование и отправка дашборда ===
     dashboard = _format_dashboard(result)
-    print()
-    print(dashboard)
+    logger.info("\n" + dashboard)
 
     try:
         save_search_results({
@@ -517,9 +514,9 @@ def main():
             "saved_analysis": saved_analysis,
             "timestamp": datetime.now(MSK_TZ).isoformat(),
         })
-        logging.info("Результаты сохранены в Redis")
+        logger.info("Результаты сохранены в Redis")
     except Exception as e:
-        logging.warning(f"save_search_results failed: {e}")
+        logger.warning(f"save_search_results failed: {e}")
 
     _send_telegram(dashboard)
 
@@ -532,7 +529,7 @@ def main():
               hot_bets=len(result["hot"]),
               warm_bets=len(result["warm"]),
               value_bets=result["stats"]["value_bets"])
-    logging.info("Готово")
+    logger.info("Готово")
 
 
 if __name__ == "__main__":
