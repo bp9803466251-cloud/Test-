@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
 """
-Gatekeeper-AI v700-prod — Main Pipeline (Dashboard + Telegram)
-V7.0.1 — value_engine вместо SearchModule
+Gatekeeper-AI v810-patched — Main Pipeline (Dashboard + Telegram)
+Value engine + Telegram-дашборд по стандарту §12.
+
+Патчи v8.10:
+  FIX-1: Удалён импорт _parse_date_msk, _get_competition_code из search_module —
+         этих функций там нет (search_module экспортирует только clean_team_name,
+         TEAM_ALIASES, search_teams, find_match_candidates). main.py падал в ImportError.
+  FIX-2: Удалён неиспользуемый импорт get_odds_metadata — нет в __all__ хаба.
+  FIX-3: run_initialization(collector="main") — §1.7a требует передачу имени.
+  FIX-4: is_shutdown_requested() перед batch_evaluate — §23.3 graceful shutdown.
+  FIX-5: <b> HTML-теги в дашборде — §12 стандарт Telegram-формата.
+  FIX-6: import time вынесен на верхний уровень (был внутри except-блока).
+  FIX-7: save_meta("main", ...) — запись собственного мета (§1.27).
+  FIX-8: Ecosystem marker: "!" при Redis-down (был всегда "+").
+  FIX-9: __version__, __all__ добавлены.
+  FIX-10: save_search_results — расширенный payload (hot/warm детали, stats).
 """
 import os
 import sys
 import json
+import time
 import html
+import logging
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -19,13 +35,22 @@ from gatekeeper_hub import (
     get_history,
     get_current_odds,
     get_all_odds,
-    get_odds_metadata,
     save_search_results,
     save_analysis,
+    save_meta,
     get_from_cache,
+    now_msk,
+    is_shutdown_requested,
 )
-from search_module import _parse_date_msk, _get_competition_code
 from value_engine import batch_evaluate
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [DASH] %(message)s'
+)
+
+__version__ = "8.10-patched"
+__all__ = ["main", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
 VALUE_THRESHOLD = float(os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
@@ -40,16 +65,16 @@ TG_MAX_CHARS = 4000
 # ---------------------------------------------------------------------------
 def _send_telegram(text: str) -> bool:
     if not TG_TOKEN or not TG_CHAT:
-        print("[TELEGRAM] Нет токена или chat_id — пропуск")
+        logging.info("Нет токена или chat_id — пропуск")
         return False
     text = text.replace('%', '&#37;')
     parts = _split_message(text, TG_MAX_CHARS)
-    print(f"[TELEGRAM] Отправка {len(parts)} сообщений...")
+    logging.info(f"Отправка {len(parts)} сообщений...")
     for i, part in enumerate(parts, 1):
         if not _send_one(part):
-            print(f"[TELEGRAM] Ошибка отправки части {i}/{len(parts)}")
+            logging.warning(f"Ошибка отправки части {i}/{len(parts)}")
             return False
-        print(f"[TELEGRAM] Часть {i}/{len(parts)} отправлена")
+        logging.info(f"Часть {i}/{len(parts)} отправлена")
     return True
 
 
@@ -68,7 +93,7 @@ def _send_one(text: str) -> bool:
             data = json.loads(resp.read().decode("utf-8"))
             if data.get("ok"):
                 return True
-            print(f"[TELEGRAM] API error: {data.get('description', '?')}")
+            logging.warning(f"API error: {data.get('description', '?')}")
             return False
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -77,14 +102,13 @@ def _send_one(text: str) -> bool:
                 retry_after = json.loads(body).get("parameters", {}).get("retry_after", 3)
             except Exception:
                 retry_after = 3
-            print(f"[TELEGRAM] 429: ожидание {retry_after}с")
-            import time
+            logging.warning(f"429: ожидание {retry_after}с")
             time.sleep(retry_after)
             return _send_one(text)
-        print(f"[TELEGRAM] HTTP {e.code}: {body[:200]}")
+        logging.warning(f"HTTP {e.code}: {body[:200]}")
         return False
     except Exception as e:
-        print(f"[TELEGRAM] Ошибка: {e}")
+        logging.warning(f"Ошибка: {e}")
         return False
 
 
@@ -119,20 +143,28 @@ def _split_message(text: str, max_chars: int) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Ecosystem markers
+# Ecosystem markers (§12)
 # ---------------------------------------------------------------------------
+_redis_available = True  # обновляется в main()
+
+
 def _ecosystem_line() -> str:
-    markers = ["Ecosystem+", "Redis+"]
+    eco_marker = "+" if _redis_available else "!"
+    redis_marker = "+" if _redis_available else "-"
+    markers = [f"Ecosystem{eco_marker}", f"Redis{redis_marker}"]
     for name, meta_key in [
         ("Bzzoiro", "bzzoiro:meta"),
         ("Sharp", "sharpapi:meta"),
         ("PropLine", "propline:meta"),
         ("OddsAPI", "odds_api:meta"),
     ]:
-        meta = get_from_cache(meta_key)
-        if isinstance(meta, dict) and meta.get("last_run"):
-            markers.append(f"{name}+")
-        else:
+        try:
+            meta = get_from_cache(meta_key)
+            if isinstance(meta, dict) and meta.get("last_run"):
+                markers.append(f"{name}+")
+            else:
+                markers.append(f"{name}-")
+        except Exception:
             markers.append(f"{name}-")
     if os.environ.get("SHARPAPI_FLUSH_OLD") == "1":
         markers.append("Flush\U0001f9f9")
@@ -142,7 +174,7 @@ def _ecosystem_line() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Last module
+# Last module (§12)
 # ---------------------------------------------------------------------------
 def _last_module() -> str:
     modules = [
@@ -154,7 +186,10 @@ def _last_module() -> str:
     latest = None
     latest_dt = None
     for name, meta_key in modules:
-        meta = get_from_cache(meta_key)
+        try:
+            meta = get_from_cache(meta_key)
+        except Exception:
+            continue
         if not isinstance(meta, dict):
             continue
         last_run = meta.get("last_run", "")
@@ -171,7 +206,7 @@ def _last_module() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Форматирование
+# Форматирование (§12 — HTML bold tags)
 # ---------------------------------------------------------------------------
 def _fmt_odds(o: float) -> str:
     s = f"{o:.2f}".rstrip("0").rstrip(".")
@@ -257,7 +292,7 @@ def _format_dashboard(result: dict) -> str:
     stats = result["stats"]
 
     if hot:
-        lines.append(f"\U0001f3af HOT BETS ({len(hot)})")
+        lines.append(f"\U0001f3af <b>HOT BETS ({len(hot)})</b>")
         lines.append("")
         for i, info in enumerate(hot, 1):
             header, teams, data = _fmt_bet(info, is_hot=True)
@@ -266,12 +301,12 @@ def _format_dashboard(result: dict) -> str:
             lines.append(data)
             lines.append("")
     else:
-        lines.append("\U0001f3af HOT BETS (0)")
+        lines.append("\U0001f3af <b>HOT BETS (0)</b>")
         lines.append("Нет кандидатов в топе.")
         lines.append("")
 
     if warm:
-        lines.append(f"\u26a0\ufe0f WARM BETS ({len(warm)})")
+        lines.append(f"\u26a0\ufe0f <b>WARM BETS ({len(warm)})</b>")
         lines.append("")
         for i, info in enumerate(warm, 1):
             header, teams, data = _fmt_bet(info, is_hot=False)
@@ -280,7 +315,7 @@ def _format_dashboard(result: dict) -> str:
             lines.append(data)
             lines.append("")
     else:
-        lines.append("\u26a0\ufe0f WARM BETS (0)")
+        lines.append("\u26a0\ufe0f <b>WARM BETS (0)</b>")
         lines.append("Нет кандидатов.")
         lines.append("")
 
@@ -306,31 +341,38 @@ def _format_dashboard(result: dict) -> str:
 # Главная функция
 # ---------------------------------------------------------------------------
 def main():
-    print("=" * 60)
-    print("[DASH] Gatekeeper-AI Pipeline v700-prod")
-    print(f"[DASH] Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
-    print("=" * 60)
+    global _redis_available
 
-    print("[DASH] Инициализация Redis...")
-    init = run_initialization()
+    logging.info("=" * 60)
+    logging.info("Gatekeeper-AI Pipeline v8.10-patched")
+    logging.info(f"Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
+    logging.info("=" * 60)
+
+    # === ШАГ 1: Инициализация (§1.7a) ===
+    logging.info("Инициализация Redis...")
+    init = run_initialization(collector="main")
     if not init or not init.get("redis_available"):
-        print("[DASH] \u274c Redis недоступен")
+        _redis_available = False
+        logging.error("Redis недоступен")
         dashboard = (
             "\U0001f310 Redis- | Пайплайн работает в graceful degradation | "
             "Данные не обновлены\n"
             + _ecosystem_line()
         )
         _send_telegram(dashboard)
+        save_meta("main", last_run=now_msk(), error_count=1, stored_matches=0)
         return
 
+    _redis_available = True
     latency = init.get("init_latency_ms", 0)
-    print(f"[DASH] Redis init OK, latency={latency}ms")
+    logging.info(f"Redis init OK, latency={latency}ms")
 
+    # === ШАГ 2: Получение матчей ===
     matches = get_matches_by_date_range()
-    print(f"[DASH] get_matches_by_date_range \u2192 {len(matches)} матчей")
+    logging.info(f"get_matches_by_date_range -> {len(matches)} матчей")
 
     if not matches:
-        print("[DASH] Нет матчей для анализа")
+        logging.info("Нет матчей для анализа")
         now_str = datetime.now(MSK_TZ).strftime("%H:%M")
         module = _last_module()
         dashboard = (
@@ -339,48 +381,93 @@ def main():
             + _ecosystem_line()
         )
         _send_telegram(dashboard)
+        save_meta("main", last_run=now_msk(), total_events=0, stored_matches=0, error_count=0)
         return
 
-    print(f"[DASH] Value-анализ через value_engine (threshold={VALUE_THRESHOLD})...")
-    result = batch_evaluate(matches, value_threshold=VALUE_THRESHOLD)
+    # === Graceful shutdown check (§23.3) ===
+    if is_shutdown_requested():
+        logging.info("Graceful shutdown — завершение до value-анализа")
+        save_meta("main", last_run=now_msk(), total_events=len(matches),
+                  stored_matches=0, error_count=0, shutdown=True)
+        return
 
-    print(f"[DASH] HOT: {len(result['hot'])}, WARM: {len(result['warm'])}, "
-          f"Value: {result['stats']['value_bets']}")
-    print(f"[DASH] Odds: {result['stats']['with_odds']}, "
-          f"Pred: {result['stats']['with_pred']}, "
-          f"H2H: {result['stats']['with_h2h']}, "
-          f"Stats: {result['stats']['with_stats']}")
+    # === ШАГ 3: Value-анализ ===
+    logging.info(f"Value-анализ через value_engine (threshold={VALUE_THRESHOLD})...")
+    try:
+        result = batch_evaluate(matches, value_threshold=VALUE_THRESHOLD)
+    except Exception as e:
+        logging.error(f"batch_evaluate failed: {e}")
+        dashboard = (
+            "\U0001f310 Redis+ | \U0001f4caValue engine error | "
+            f"Пайплайн прерван: {html.escape(str(e))}\n"
+            + _ecosystem_line()
+        )
+        _send_telegram(dashboard)
+        save_meta("main", last_run=now_msk(), total_events=len(matches),
+                  stored_matches=0, error_count=1)
+        return
 
-    # Сохранение analysis для HOT матчей
+    logging.info(f"HOT: {len(result['hot'])}, WARM: {len(result['warm'])}, "
+                 f"Value: {result['stats']['value_bets']}")
+    logging.info(f"Odds: {result['stats']['with_odds']}, "
+                 f"Pred: {result['stats']['with_pred']}, "
+                 f"H2H: {result['stats']['with_h2h']}, "
+                 f"Stats: {result['stats']['with_stats']}")
+
+    # === ШАГ 4: Сохранение analysis для HOT матчей ===
+    saved_analysis = 0
     for info in result["hot"]:
         cid = info.get("canonical_id", "")
         if not cid:
             continue
-        save_analysis(cid, {
-            "is_fire": info.get("is_fire", False),
-            "value_ev": info.get("value_ev", 0),
-            "v_side": info.get("v_side", ""),
-            "v_odds": info.get("v_odds", 0),
-            "v_prob": info.get("v_prob", 0),
-            "odds_verification": info.get("odds_verification", {}),
-            "timestamp": datetime.now(MSK_TZ).isoformat(),
-        })
+        try:
+            save_analysis(cid, {
+                "is_fire": info.get("is_fire", False),
+                "value_ev": info.get("value_ev", 0),
+                "v_side": info.get("v_side", ""),
+                "v_odds": info.get("v_odds", 0),
+                "v_prob": info.get("v_prob", 0),
+                "odds_verification": info.get("odds_verification", {}),
+                "timestamp": datetime.now(MSK_TZ).isoformat(),
+            })
+            saved_analysis += 1
+        except Exception as e:
+            logging.warning(f"save_analysis failed for {cid}: {e}")
 
+    # === ШАГ 5: Формирование и отправка дашборда ===
     dashboard = _format_dashboard(result)
     print()
     print(dashboard)
 
-    save_search_results({
-        "hot": len(result["hot"]),
-        "warm": len(result["warm"]),
-        "value_bets": result["stats"]["value_bets"],
-        "total_matches": result["stats"]["total"],
-        "timestamp": datetime.now(MSK_TZ).isoformat(),
-    })
-    print("[DASH] Результаты сохранены в Redis")
+    try:
+        save_search_results({
+            "hot": len(result["hot"]),
+            "warm": len(result["warm"]),
+            "value_bets": result["stats"]["value_bets"],
+            "total_matches": result["stats"]["total"],
+            "with_odds": result["stats"]["with_odds"],
+            "with_pred": result["stats"]["with_pred"],
+            "with_h2h": result["stats"]["with_h2h"],
+            "with_stats": result["stats"]["with_stats"],
+            "saved_analysis": saved_analysis,
+            "timestamp": datetime.now(MSK_TZ).isoformat(),
+        })
+        logging.info("Результаты сохранены в Redis")
+    except Exception as e:
+        logging.warning(f"save_search_results failed: {e}")
 
     _send_telegram(dashboard)
-    print("[DASH] Готово")
+
+    # === Сохранение мета (§1.27) ===
+    save_meta("main",
+              last_run=now_msk(),
+              total_events=len(matches),
+              stored_matches=saved_analysis,
+              error_count=0,
+              hot_bets=len(result["hot"]),
+              warm_bets=len(result["warm"]),
+              value_bets=result["stats"]["value_bets"])
+    logging.info("Готово")
 
 
 if __name__ == "__main__":
