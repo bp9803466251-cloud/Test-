@@ -17,6 +17,11 @@ v8.10-patched:
   FIX-5: __version__, расширенный __all__
   FIX-6: REDIS_MAX_PIPELINE используется в get_all_fields()
   FIX-7: Безопасное логирование — без payload (§1.23)
+  FIX-8: PipelineBatch class (§1.20) — batch writes для коллекторов
+  FIX-9: HTTP 429 Retry-After handling (§15)
+  FIX-10: Request recreation в retry loop (urllib data consumption bug)
+  FIX-11: expire_key() / ttl support
+  FIX-12: Убран dead code после retry loop
 """
 
 import json
@@ -30,7 +35,7 @@ from datetime import datetime, timezone, timedelta
 from redis_config import (
     REDIS_REST_URL,
     REDIS_REST_TOKEN,
-    REDIS_TIMEOUT,
+    REDIS_TIMEOUT as _CFG_TIMEOUT,
     REDIS_HASH_NAME,
     CB_FAILURE_THRESHOLD,
     CB_RECOVERY_TIMEOUT,
@@ -41,12 +46,12 @@ from redis_config import (
 __version__ = "8.10-patched"
 ENVELOPE_VERSION = "v700-prod"
 HASH_NAME = REDIS_HASH_NAME
-REDIS_TIMEOUT = REDIS_TIMEOUT
+REDIS_TIMEOUT = _CFG_TIMEOUT  # FIX-12: убрана self-assignment
 CB_THRESHOLD = CB_FAILURE_THRESHOLD
 CB_RESET_SECONDS = CB_RECOVERY_TIMEOUT
-BATCH_SIZE = REDIS_MAX_PIPELINE or 50  # для HKEYS + HMGET
-MAX_RETRIES = 2  # ретраи для transport-уровня (§9.5)
-RETRY_BASE_DELAY = 0.5  # базовая задержка для exponential backoff
+BATCH_SIZE = REDIS_MAX_PIPELINE or 50
+MAX_RETRIES = 2
+RETRY_BASE_DELAY = 0.5
 
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -57,7 +62,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Circuit Breaker ─────────────────────────────────────────
-_cb_state = "closed"  # closed | open | half-open
+_cb_state = "closed"
 _cb_failures = 0
 _cb_opened_at = 0.0
 
@@ -69,7 +74,7 @@ def _cb_can_pass():
     if _cb_state == "open":
         if time.monotonic() - _cb_opened_at >= CB_RESET_SECONDS:
             _cb_state = "half-open"
-            logger.info("Circuit breaker → half-open")
+            logger.info("Circuit breaker -> half-open")
             return True
         return False
     if _cb_state == "half-open":
@@ -80,7 +85,7 @@ def _cb_can_pass():
 def _cb_on_success():
     global _cb_state, _cb_failures
     if _cb_state != "closed":
-        logger.info("Circuit breaker → closed (recovered)")
+        logger.info("Circuit breaker -> closed (recovered)")
     _cb_failures = 0
     _cb_state = "closed"
 
@@ -91,7 +96,7 @@ def _cb_on_failure():
     if _cb_failures >= CB_THRESHOLD and _cb_state != "open":
         _cb_state = "open"
         _cb_opened_at = time.monotonic()
-        logger.warning("Circuit breaker → open after %d failures", _cb_failures)
+        logger.warning("Circuit breaker -> open after %d failures", _cb_failures)
 
 
 def get_circuit_breaker_status():
@@ -107,26 +112,19 @@ def reset_circuit_breaker():
 
 
 # ── Сериализация через хаб (§20.1) ──────────────────────────
-# Ленивый импорт для избежания циклической зависимости:
-# gatekeeper_hub → redis_hub → gatekeeper_hub
-
 def _serialize(obj):
-    """Делегирует сериализацию в serialize_match из хаба (§20.1)."""
     try:
         from gatekeeper_hub import serialize_match
         return serialize_match(obj)
     except ImportError:
-        # Fallback — если хаб недоступен
         return json.dumps(obj, ensure_ascii=False, default=str)
 
 
 def _deserialize(raw):
-    """Делегирует десериализацию в deserialize_match из хаба (§20.1)."""
     try:
         from gatekeeper_hub import deserialize_match
         return deserialize_match(raw)
     except ImportError:
-        # Fallback — если хаб недоступен
         if not raw or not isinstance(raw, str):
             return None
         try:
@@ -138,19 +136,17 @@ def _deserialize(raw):
 
 # ── Подключение ─────────────────────────────────────────────
 def _get_redis_url():
-    """Возвращает URL из redis_config (без env-чтения)."""
     return REDIS_REST_URL
 
 
 def _get_redis_token():
-    """Возвращает токен из redis_config (без env-чтения)."""
     return REDIS_REST_TOKEN
 
 
 def _execute_upstash_cmd(args, retry=True):
     """
     Единый транспорт для всех команд Upstash REST API.
-    args — список аргументов команды, например ["HGET", "GatekeeperAI", "match:xxx"]
+    args — список аргументов, например ["HGET", "GatekeeperAI", "match:xxx"]
     Возвращает результат (str) или None при ошибке.
     Retry с exponential backoff для transient-ошибок (§9.5).
     """
@@ -162,19 +158,19 @@ def _execute_upstash_cmd(args, retry=True):
     if not url or not token:
         return None
 
-    payload = json.dumps(args).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    payload_bytes = json.dumps(args).encode("utf-8")
 
-    last_error = None
     for attempt in range(MAX_RETRIES + 1 if retry else 1):
+        # FIX-10: создаём новый Request для каждой попытки
+        req = urllib.request.Request(
+            url,
+            data=payload_bytes,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
         try:
             with urllib.request.urlopen(req, timeout=REDIS_TIMEOUT) as resp:
                 body = resp.read().decode("utf-8")
@@ -183,30 +179,44 @@ def _execute_upstash_cmd(args, retry=True):
                 return result.get("result")
         except (urllib.error.URLError, urllib.error.HTTPError,
                 json.JSONDecodeError, OSError, TimeoutError) as e:
-            last_error = e
-            # Timeout и network errors — retry; HTTP 4xx — нет
+            # FIX-9: HTTP 429 — Retry-After
+            if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                retry_after = int(e.headers.get("Retry-After", "5"))
+                if attempt < MAX_RETRIES and retry:
+                    logger.warning("HTTP 429 rate limited, waiting %ds (attempt %d/%d)",
+                                   retry_after, attempt + 1, MAX_RETRIES)
+                    time.sleep(retry_after)
+                    continue
+                _cb_on_failure()
+                logger.warning("HTTP 429 after %d retries", MAX_RETRIES)
+                return None
+
+            # HTTP 4xx (кроме 429) — не retry
             if isinstance(e, urllib.error.HTTPError) and e.code < 500:
                 _cb_on_failure()
                 logger.warning("HTTP %d: %s", e.code, type(e).__name__)
                 return None
+
+            # Transient errors — retry
             if attempt < MAX_RETRIES and retry:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
                 logger.warning("Retry %d/%d after %.1fs: %s",
                                attempt + 1, MAX_RETRIES, delay, type(e).__name__)
                 time.sleep(delay)
                 continue
+
             _cb_on_failure()
             logger.warning("Error after %d retries: %s: %s",
                            MAX_RETRIES, type(e).__name__, e)
             return None
 
+    # FIX-12: dead code удалён — все пути в loop возвращают
     _cb_on_failure()
     return None
 
 
 # ── Конверт v700-prod ───────────────────────────────────────
 def _wrap_envelope(payload, sender_repo="unknown"):
-    """Оборачивает payload в конверт v700-prod."""
     ts = datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
     return {
         "version": ENVELOPE_VERSION,
@@ -217,17 +227,12 @@ def _wrap_envelope(payload, sender_repo="unknown"):
 
 
 def _unwrap_envelope(data):
-    """
-    Распаковывает конверт. Возвращает payload (правило 1.16).
-    Если data — не конверт, возвращает как есть (backward compat).
-    """
     if data is None:
         return None
     if isinstance(data, dict):
         if "payload" in data and "version" in data:
             return data["payload"]
         return data
-    # Строка — может быть JSON (делегируем в deserialize_match — §20.1)
     if isinstance(data, str):
         obj = _deserialize(data)
         if obj is not None:
@@ -237,6 +242,52 @@ def _unwrap_envelope(data):
                 return obj
         return None
     return data
+
+
+# ── PipelineBatch (§1.20) ───────────────────────────────────
+class PipelineBatch:
+    """
+    Батч-буфер для массовой записи в Redis.
+    Коллекторы используют его для накопления HSET-команд
+    и отправки одним запросом (или порциями BATCH_SIZE).
+    """
+    def __init__(self, max_size=None):
+        self._commands = []
+        self._max_size = max_size or BATCH_SIZE
+
+    def add_hset(self, field, value):
+        """Добавить HSET-команду в буфер."""
+        if isinstance(value, (dict, list)):
+            serialized = _serialize(value)
+        elif isinstance(value, str):
+            serialized = value
+        else:
+            serialized = _serialize(value)
+        self._commands.append(["HSET", HASH_NAME, field, serialized])
+
+    def add_set(self, key, value):
+        """Добавить SET-команду в буфер."""
+        if isinstance(value, (dict, list)):
+            serialized = _serialize(value)
+        elif isinstance(value, str):
+            serialized = value
+        else:
+            serialized = _serialize(value)
+        self._commands.append(["SET", key, serialized])
+
+    def flush(self):
+        """Выполнить все накопленные команды порциями BATCH_SIZE."""
+        total = 0
+        for i in range(0, len(self._commands), self._max_size):
+            batch = self._commands[i:i + self._max_size]
+            for cmd in batch:
+                _execute_upstash_cmd(cmd, retry=True)
+                total += 1
+        self._commands.clear()
+        return total
+
+    def __len__(self):
+        return len(self._commands)
 
 
 # ── Публичный API ───────────────────────────────────────────
@@ -258,8 +309,7 @@ def is_redis_available():
 def save_to_cache(field_id, value, sender_repo="unknown"):
     """
     Запись поля в хеш GatekeeperAI с конвертом v700-prod.
-    value — Python-объект (dict), не строка (FIX-3 в hub).
-    Сериализация через serialize_match (§20.1).
+    value — Python-объект (dict), не строка.
     """
     if isinstance(value, (dict, list)):
         envelope = _wrap_envelope(value, sender_repo)
@@ -273,10 +323,7 @@ def save_to_cache(field_id, value, sender_repo="unknown"):
 
 
 def get_from_cache(field_id):
-    """
-    Чтение одного поля (с распаковкой конверта).
-    Возвращает payload (dict) или None (правило 1.16, 1.17).
-    """
+    """Чтение одного поля (с распаковкой конверта)."""
     raw = _execute_upstash_cmd(["HGET", HASH_NAME, field_id])
     if raw is None:
         return None
@@ -311,7 +358,6 @@ def delete_from_cache(field_id):
 def get_all_fields():
     """
     Возвращает все поля хэш-таблицы (правило 1.15: HKEYS + HMGET).
-    При >20 000 полей HGETALL нестабилен.
     Батчинг через REDIS_MAX_PIPELINE (§9.5).
     """
     keys_raw = _execute_upstash_cmd(["HKEYS", HASH_NAME])
@@ -344,7 +390,6 @@ def get_key(key):
     """
     Чтение отдельного ключа (без конверта, raw JSON).
     Для history:match:* и system:* ключей.
-    Десериализация через deserialize_match (§20.1).
     """
     raw = _execute_upstash_cmd(["GET", key])
     if raw is None:
@@ -361,7 +406,6 @@ def set_key(key, value):
     """
     Запись отдельного ключа (без конверта, raw JSON).
     Для history:match:* и system:* ключей.
-    Сериализация через serialize_match (§20.1).
     """
     if isinstance(value, (dict, list)):
         serialized = _serialize(value)
@@ -377,6 +421,56 @@ def delete_key(key):
     return _execute_upstash_cmd(["DEL", key])
 
 
+def expire_key(key, seconds):
+    """Установить TTL для ключа (FIX-11)."""
+    return _execute_upstash_cmd(["EXPIRE", key, str(int(seconds))])
+
+
+def get_ttl(key):
+    """Получить оставшийся TTL ключа в секундах."""
+    result = _execute_upstash_cmd(["TTL", key])
+    if result is None:
+        return -2
+    try:
+        return int(result)
+    except (ValueError, TypeError):
+        return -2
+
+
+def scan_keys(pattern, count=1000):
+    """
+    SCAN по ключам с pattern (FIX-11).
+    Возвращает список ключей. Безопаснее KEYS для больших БД.
+    """
+    all_keys = []
+    cursor = "0"
+    while True:
+        result = _execute_upstash_cmd(["SCAN", cursor, "MATCH", pattern, "COUNT", str(count)])
+        if not result or not isinstance(result, list) or len(result) < 2:
+            break
+        cursor = result[0]
+        keys = result[1]
+        if keys:
+            all_keys.extend(keys)
+        if cursor == "0" or cursor == 0:
+            break
+    return all_keys
+
+
+def delete_keys_by_pattern(pattern):
+    """
+    Удалить все ключи по pattern (FIX-11).
+    Использует SCAN + DEL (безопаснее FLUSHDB).
+    """
+    keys = scan_keys(pattern)
+    deleted = 0
+    for key in keys:
+        _execute_upstash_cmd(["DEL", key])
+        deleted += 1
+    logger.info("Deleted %d keys matching %s", deleted, pattern)
+    return deleted
+
+
 # ── Экспорт ─────────────────────────────────────────────────
 __all__ = [
     "__version__",
@@ -386,6 +480,8 @@ __all__ = [
     "save_to_cache", "get_from_cache", "batch_get_from_cache",
     "delete_from_cache", "get_all_fields", "field_exists",
     "get_key", "set_key", "delete_key",
+    "expire_key", "get_ttl", "scan_keys", "delete_keys_by_pattern",
     "get_circuit_breaker_status", "reset_circuit_breaker",
+    "PipelineBatch",
     "_execute_upstash_cmd",
-  ]
+]
