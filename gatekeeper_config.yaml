@@ -1,147 +1,47 @@
-schema_version: v710
-pipeline_batch_size: 10
-odds_priority:
-  sharpapi: 1
-  odds_api: 3
-  propline: 6
-  bzzoiro: 8
-  football_data: 10
-collector_time_windows:
+# gatekeeper_config.yaml — Единая конфигурация GatekeeperAI (§20.3)
+# Env-переменные остаются для секретов (API-ключи, Redis URL).
+# Все настраиваемые параметры — здесь.
+
+collectors:
   sharpapi:
-    days_ahead: 3
-    env: SHARPAPI_DAYS_AHEAD
+    rate_delay: 1.0
+    max_retries: 3
+    timeout: 30
+    max_pages: 5
   odds_api:
-    days_ahead: 3
-    env: ODDS_API_DAYS_AHEAD
-  propline:
-    days_ahead: 3
-    env: PROPLINE_DAYS_AHEAD
+    rate_delay: 0.5
+    max_retries: 3
+    regions: ["eu", "uk"]
+    markets: ["h2h", "spreads", "totals"]
+    odds_format: "decimal"
   bzzoiro:
-    days_ahead: 7
-    env: BZZOIRO_DAYS_AHEAD
+    rate_delay: 2.0
+    enrich_delay: 1.0
+    max_retries: 5
+  propline:
+    rate_delay: 1.5
+    max_retries: 3
+
+redis:
+  read_timeout: 30
+  write_timeout: 30
+  pipeline_batch_size: 10
+  circuit_breaker_threshold: 10
+  circuit_breaker_reset: 60
+
+cleanup:
+  match_ttl_hours: 2
+  index_lookback_days: -2
+  index_lookahead_days: 7
+
 features:
-  schema_validation:
-    enabled: true
-    level: strict
-  audit_log:
-    enabled: true
-  provenance:
-    enabled: true
-  auto_migrate:
-    enabled: false
-  conflict_resolution:
-    enabled: true
-  idempotency_keys:
-    enabled: true
-  graceful_shutdown:
-    enabled: true
-  state_machine:
-    enabled: true
-  metrics:
-    enabled: true
-namespace:
-  prefix: ''
-  domains:
-    football: ''
-    basketball: basket
-canary:
-  enabled: false
-  ttl_hours: 24
-  cleanup_on_success: true
-data_lineage:
-  sharpapi:
-    provides:
-    - odds.1x2.current
-    - odds.1x2.opening
-    - odds.1x2.best
-    consumed_by:
-    - telegram_bot
-    - analytics_pipeline
-    - value_analysis
-  odds_api:
-    provides:
-    - odds.1x2.current
-    - odds.1x2.sources
-    consumed_by:
-    - telegram_bot
-    - odds_aggregator
-  bzzoiro:
-    provides:
-    - stats
-    - predictions
-    - h2h
-    consumed_by:
-    - telegram_bot
-    - analytics_pipeline
-    - xg_calculator
-  propline:
-    provides:
-    - odds.1x2.opening
-    - odds.closing_1x2
-    consumed_by:
-    - value_analysis
-    - telegram_bot
-  football_data:
-    provides:
-    - csv_raw
-    - history.match
-    consumed_by:
-    - analytics_pipeline
-    - model_training
-shared_code:
-  distribution: vendored
-  source_repo: gatekeeper-shared
-  pinned_version: v8.9
-  auto_update: false
-  files:
-  - gatekeeper_hub.py
-  - redis_hub.py
-  - search_module.py
-  - gatekeeper_config.yaml
-orchestration:
-  sequence:
-  - name: sharpapi
-    depends_on: []
-  - name: odds_api
-    depends_on: []
-  - name: bzzoiro
-    depends_on:
-    - sharpapi
-  - name: propline
-    depends_on:
-    - sharpapi
-    - odds_api
-  parallel_groups:
-  - - sharpapi
-    - odds_api
-  cleanup_owner: sharpapi
-environments:
-  prod:
-    redis_url_env: SHARED_UPSTASH_REDIS_REST_URL
-    redis_token_env: SHARED_UPSTASH_REDIS_REST_TOKEN
-    namespace_prefix: ''
-    features:
-      schema_validation:
-        enabled: true
-        level: strict
-      audit_log:
-        enabled: true
-  staging:
-    redis_url_env: STAGING_REDIS_URL
-    redis_token_env: STAGING_REDIS_TOKEN
-    namespace_prefix: staging
-    features:
-      schema_validation:
-        enabled: true
-        level: warn
-      audit_log:
-        enabled: false
-  dev:
-    redis_url_env: DEV_REDIS_URL
-    redis_token_env: DEV_REDIS_TOKEN
-    namespace_prefix: dev
-    features:
-      schema_validation:
-        enabled: false
-      audit_log:
-        enabled: false
+  graceful_shutdown: true
+  auto_migrate: true
+  schema_validation: true
+
+upstream_map:
+  sharpapi: betradar
+  odds_api: betradar
+  bzzoiro: opta
+  propline: pinnacle
+  football_data: bet365
