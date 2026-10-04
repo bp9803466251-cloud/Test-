@@ -24,6 +24,9 @@ import signal
 import random
 from datetime import datetime, timezone, timedelta
 from functools import wraps
+import logging
+
+logger = logging.getLogger("gatekeeper_hub")
 
 # ── Конфигурация ───────────────────────────────────────────
 try:
@@ -97,6 +100,12 @@ __all__ = [
     # Batch
     "process_matches",
     "batch_upsert_matches",
+    # Missing functions (FIX-AUDIT)
+    "get_all_matches",
+    "get_matches_by_date_range",
+    "save_search_results",
+    "save_analysis",
+    "get_from_cache",
 ]
 
 
@@ -254,7 +263,6 @@ def set_match_status(canonical_id, new_status, source="system"):
     match["updated_at"] = now_msk()
 
     # Определяем ключ (live или history)
-    config = load_config()
     key = ns_key("match", canonical_id)
     existing = rh.get_from_cache(key)
     if not existing or not isinstance(existing, dict):
@@ -377,7 +385,17 @@ def log_event(source, level, message, **kwargs):
     if kwargs:
         extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
         parts.append(f"({extra})")
-    print(" ".join(parts), flush=True)
+    line = " ".join(parts)
+    print(line, flush=True)
+    # Also log via logging for GitHub Actions
+    if level == "ERROR":
+        logger.error(line)
+    elif level == "WARN":
+        logger.warning(line)
+    elif level == "INFO":
+        logger.info(line)
+    else:
+        logger.debug(line)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -413,8 +431,8 @@ def _clean_team_name(name):
 
     # Пытаемся использовать team_registry (лучшая нормализация)
     try:
-        from team_registry import normalize_team_name
-        return normalize_team_name(name)
+        from team_registry import clean_team_name
+        return clean_team_name(name)
     except (ImportError, Exception):
         pass
 
@@ -556,6 +574,7 @@ def upsert_match(home_team="", away_team="", date_utc="",
         "score": None,
         "version": 1,
         "schema_version": SCHEMA_VERSION,
+        "created_at": now_msk(),
         "updated_at": now_msk(),
         "sources": [source],
         **extra_fields,
@@ -886,7 +905,6 @@ def save_meta(collector, **kwargs):
     if not rh:
         return
 
-    config = load_config()
     key = ns_key(collector, "meta")
 
     meta = {
@@ -905,7 +923,7 @@ def save_meta(collector, **kwargs):
 # FIX-AUDIT-3: _remove_from_index — удаление canonical_id из шардов
 # ═══════════════════════════════════════════════════════════
 
-INDEX_LOOKBACK_DAYS = 30
+INDEX_LOOKBACK_DAYS = 2
 INDEX_LOOKAHEAD_DAYS = 7
 
 def _remove_from_index(canonical_id):
@@ -954,14 +972,14 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
 
     deleted = 0
     migrated = 0
+    finished_deleted = 0
+    expired_deleted = 0
 
     # Получаем все live-матчи
     all_fields = rh.get_all_fields()
     if not all_fields or not isinstance(all_fields, dict):
         log_event("hub", "WARN", "cleanup_expired: get_all_fields returned empty")
         return {"count": 0, "migrated": 0, "dry_run": dry_run, "reason": "no_data"}
-
-    config = load_config()
 
     for field_id, match_obj in all_fields.items():
         # FIX-8: Graceful shutdown
@@ -986,13 +1004,15 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
         # 1) status == "completed" ИЛИ
         # 2) date_utc + 2 часа < now (temporal leakage cleanup)
         should_delete = False
-        if status == "completed":
+        if status in ("completed", "cancelled", "archived", "finished", "ended"):
             should_delete = True
+            finished_deleted += 1
         elif date_utc:
             try:
                 match_date = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
                 if match_date + timedelta(hours=2) < datetime.now(timezone.utc):
                     should_delete = True
+                    expired_deleted += 1
             except (ValueError, TypeError):
                 pass  # Некорректная дата — не удаляем
 
@@ -1025,27 +1045,24 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
         migrated += 1
 
     # FIX-AUDIT-2: Метрики в system:health (§1.7b)
-    expired_count = deleted  # матчи удалённые по времени
-    finished_count = 0  # пересчитаем
-    # (уже учтены выше — deleted это общее количество)
-
+    # Разделаем: finished_deleted (terminal status) и expired_deleted (по времени)
     health_key = "system:health"
     health_data = {
         "last_cleanup_count": deleted,
         "last_cleanup_at": now_msk(),
-        "last_cleanup_finished": deleted,  # завершённые
-        "last_cleanup_expired": expired_count,  # по времени
+        "last_cleanup_finished": finished_deleted,
+        "last_cleanup_expired": expired_deleted,
     }
     rh.save_to_cache(health_key, health_data)
 
     log_event("hub", "INFO", "cleanup_expired done",
-              deleted=deleted, migrated=migrated, expired=expired_count)
+              deleted=deleted, migrated=migrated, expired=expired_deleted)
     METRICS.inc("cleanup_deleted", deleted)
     METRICS.time("cleanup_duration", time.time() - 0)  # approximate
     return {
         "count": deleted,
         "migrated": migrated,
-        "expired": expired_count,
+        "expired": expired_deleted,
         "dry_run": dry_run,
     }
 
@@ -1074,7 +1091,8 @@ def get_all_odds(match: dict) -> dict:
         # FIX-AUDIT-7: "opening" — primary (схема v710), "open" — backward compat
         open_odds = sec.get("opening", sec.get("open", sec.get("current", {})))
         return {
-            "open": open_odds,
+            "opening": open_odds,
+            "open": open_odds,  # backward compat
             "current": open_odds,  # backward compat для value_engine < v3.1
             "closing": sec.get("closing", {}),
             "sources": match.get("sources", []),
@@ -1087,7 +1105,8 @@ def get_all_odds(match: dict) -> dict:
     if "open" in odds or "current" in odds or "closing" in odds:
         open_odds = odds.get("open", odds.get("current", {}))
         return {
-            "open": open_odds,
+            "opening": open_odds,
+            "open": open_odds,  # backward compat
             "current": open_odds,  # backward compat
             "closing": odds.get("closing", {}),
             "sources": match.get("sources", []),
@@ -1318,6 +1337,77 @@ def get_run_id():
 # ═══════════════════════════════════════════════════════════
 # Module entry point
 # ═══════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════
+# FIX-AUDIT: Missing functions required by main.py and source_diagnostics.py
+# ═══════════════════════════════════════════════════════════
+
+def get_all_matches():
+    """Возвращает все live-матчи из Redis. Для source_diagnostics.py."""
+    rh = _get_redis()
+    if not rh:
+        return []
+    all_fields = rh.get_all_fields()
+    if not all_fields or not isinstance(all_fields, dict):
+        return []
+    matches = []
+    for field_id, raw in all_fields.items():
+        if not field_id.startswith("match:") or ":meta" in field_id or "idem" in field_id or "canary" in field_id:
+            continue
+        match = deserialize_match(raw) if isinstance(raw, str) else raw
+        if match and isinstance(match, dict):
+            matches.append(match)
+    return matches
+
+
+def get_matches_by_date_range(date_from="", date_to=""):
+    """Возвращает матчи в диапазоне дат. Для main.py."""
+    all_matches = get_all_matches()
+    if not all_matches:
+        return []
+    if not date_from and not date_to:
+        return all_matches
+    result = []
+    for m in all_matches:
+        mdate = m.get("date_utc", "")[:10]
+        if date_from and mdate < date_from:
+            continue
+        if date_to and mdate > date_to:
+            continue
+        result.append(m)
+    return result
+
+
+def save_search_results(results):
+    """Сохраняет результаты поиска. Для main.py."""
+    rh = _get_redis()
+    if not rh:
+        return
+    key = "search:results:latest"
+    rh.save_to_cache(key, results)
+    log_event("hub", "INFO", "save_search_results",
+              total=results.get("total_matches", 0) if isinstance(results, dict) else len(results))
+
+
+def save_analysis(canonical_id, analysis):
+    """Сохраняет анализ матча. Для main.py."""
+    rh = _get_redis()
+    if not rh:
+        return
+    key = ns_key("analysis", canonical_id)
+    rh.save_to_cache(key, analysis)
+    log_event("hub", "DEBUG", "save_analysis", cid=canonical_id)
+
+
+def get_from_cache(key):
+    """Прокси к redis_hub.get_from_cache. Для main.py."""
+    rh = _get_redis()
+    if not rh:
+        return None
+    return rh.get_from_cache(key)
+
+
 
 if __name__ == "__main__":
     init = run_initialization("self_test")
