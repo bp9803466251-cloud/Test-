@@ -373,7 +373,6 @@ TEAM_ALIASES = {
     "ceara": "ceara",
     "ceara sc": "ceara",
     "santos": "santos",
-    "gremio": "gremio",
     "juventude": "juventude",
     "cuiaba": "cuiaba",
     "cuiaba ec": "cuiaba",
@@ -464,7 +463,6 @@ TEAM_ALIASES = {
     "mazatlan fc": "mazatlan",
     "necaxa": "necaxa",
     "club necaxa": "necaxa",
-    "atlas": "atlas",
 
     # Turkey
     "galatasaray": "galatasaray",
@@ -488,7 +486,6 @@ TEAM_ALIASES = {
     "mke ankaragucu": "ankaragucu",
     "hatayspor": "hatayspor",
     "pendikspor": "pendikspor",
-    "rizespor": "rizespor",
 
     # Scotland
     "celtic": "celtic",
@@ -629,7 +626,7 @@ TEAM_ALIASES = {
     "lyngby bk": "lyngby",
     "hvidovre": "hvidovre",
     "hvidovre if": "hvidovre",
-    " odense": "odense",
+    "odense": "odense",
     "odense bk": "odense",
     "ob": "odense",
 
@@ -792,8 +789,6 @@ TEAM_ALIASES = {
     "san jose": "san_jose",
     "earthquakes": "san_jose",
     "colorado rapids": "colorado_rapids",
-    "colorado": "colorado_rapids",
-    "rapid vienna": "rapid_vienna",  # duplicate intentional for safety
 
     # Japan (J-League)
     "kashima antlers": "kashima_antlers",
@@ -840,33 +835,44 @@ def clean_team_name(name: str) -> str:
     """
     Нормализация названия команды (§4).
     1. Приведение к нижнему регистру
-    2. Удаление суффиксов: fc, cf, afc, united, city, town
-    3. Удаление спецсимволов и лишних пробелов
-    4. Поиск в TEAM_ALIASES
+    2. Поиск в TEAM_ALIASES (оригинальный ключ, до нормализации)
+    3. Удаление спецсимволов + повторный поиск
+    4. Удаление суффиксов (fc, cf, afc, united, city, town, sc, club) + повторный поиск
+    5. Fallback — заменяем пробелы на подчёркивания
     
     Возвращает нормализованную версию (home_clean/away_clean).
     """
     if not name or not isinstance(name, str):
         return ""
+    
+    try:
+        key = name.strip().lower()
+        
+        # Шаг 1: Прямой lookup (оригинальный ключ с апострофами)
+        if key in TEAM_ALIASES:
+            return TEAM_ALIASES[key]
+        
+        # Шаг 2: Удаление спецсимволов + lookup
+        clean_key = key.replace("'", "").replace(".", "").replace(",", "")
+        clean_key = clean_key.replace("  ", " ").strip()
+        if clean_key in TEAM_ALIASES:
+            return TEAM_ALIASES[clean_key]
+        
+        # Шаг 3: Удаление суффиксов + lookup
+        suffixes = [" fc", " cf", " afc", " sc", " united", " city", " town",
+                    "fc ", "cf ", "afc ", "sc ", " club"]
+        stripped = clean_key
+        for suffix in suffixes:
+            stripped = stripped.replace(suffix, " ")
+        stripped = stripped.replace("  ", " ").strip()
+        if stripped in TEAM_ALIASES:
+            return TEAM_ALIASES[stripped]
+        
+        # Шаг 4: Fallback — заменяем пробелы на подчёркивания
+        return stripped.replace(" ", "_")
+    except Exception:
+        return ""
 
-    key = name.strip().lower()
-    
-    # Удаление суффиксов
-    suffixes = [" fc", " cf", " afc", " sc", " united", " city", " town",
-                "fc ", "cf ", "afc ", "sc ", " club"]
-    for suffix in suffixes:
-        key = key.replace(suffix, " ")
-    
-    # Удаление спецсимволов
-    key = key.replace("'", "").replace(".", "").replace(",", "")
-    key = key.replace("  ", " ").strip()
-    
-    # Поиск в алиасах
-    if key in TEAM_ALIASES:
-        return TEAM_ALIASES[key]
-    
-    # Fallback: заменяем пробелы на подчёркивания
-    return key.replace(" ", "_")
-
+__version__ = "8.10-patched"
 
 __all__ = ["TEAM_ALIASES", "clean_team_name"]
