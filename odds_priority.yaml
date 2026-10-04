@@ -1,8 +1,20 @@
-# odds_priority.yaml — Конфиг приоритетов букмекеров (§19.2)
-# Ранги: primary (1-й) ... senary (6-й)
-# rank_num — для программной сортировки
+# odds_priority.yaml — Конфиг приоритетов букмекеров (§19.2, §20.3)
+# Ранги: primary (1-й) ... senary (6-й) — соответствуют §8.5
+# rank_num — для программной сортировки (1=высший приоритет)
 # rank — для читаемости
+#
+# Часть 1: приоритеты источников (коллекторы) и upstream — для gatekeeper_hub._load_odds_priority()
+# Часть 2: csv_columns — маппинг колонок CSV для football_data_to_redis.py
 
+# ═══════════════════════════════════════════════════════════
+# Часть 1: Приоритеты источников (используется hub'ом)
+# ═══════════════════════════════════════════════════════════
+
+# Ранги коллекторов для should_overwrite() — меньше = выше приоритет
+# sharpapi и propline — равный приоритет (rank 1) — независимые sharp-источники
+# odds_api — верификация (rank 2)
+# bzzoiro — данные Opta (rank 3)
+# football_data — CSV-агрегат (rank 4)
 1x2:
   sharpapi: 1
   propline: 1
@@ -10,6 +22,11 @@
   bzzoiro: 3
   football_data: 4
 
+# Ранги upstream для should_overwrite() — меньше = выше приоритет
+# pinnacle и betradar — равный приоритет (rank 1) — sharp-источники
+# opta — статистический upstream (rank 2)
+# bet365 — soft bookmaker (rank 3)
+# multi_bookmaker — агрегат CSV (rank 4) — только для history
 upstream_map:
   pinnacle: 1
   betradar: 1
@@ -17,28 +34,111 @@ upstream_map:
   bet365: 3
   multi_bookmaker: 4
 
-# Для CSV-источников (football_data_to_redis.py)
+# ═══════════════════════════════════════════════════════════
+# Часть 2: Маппинг CSV-колонок для football_data_to_redis.py
+# Формат: список рангов, каждый с columns + type + rank_num + name
+# type: opening | closing | sharp | aggregate | soft
+# ═══════════════════════════════════════════════════════════
+
 csv_columns:
+  # ── 1x2 (основные коэффициенты) ──
   1x2:
     - rank: primary
-      columns: [B365H, B365D, B365A]
-      type: opening
+      rank_num: 1
+      name: Pinnacle
+      columns: [PPH, PPD, PPA]
+      type: sharp
     - rank: secondary
-      columns: [BWH, BWD, BWA]
-      type: opening
+      rank_num: 2
+      name: Max
+      columns: [MaxH, MaxD, MaxA]
+      type: aggregate
     - rank: tertiary
-      columns: [IWH, IWD, IWA]
-      type: opening
+      rank_num: 3
+      name: Avg
+      columns: [AvgH, AvgD, AvgA]
+      type: aggregate
     - rank: quaternary
-      columns: [PSH, PSD, PSA]
-      type: closing
-  ah:
-    - rank: primary
-      columns: [MaxCAHH, MaxCAHA]
-    - rank: secondary
-      columns: [AHCh]
-      type: closing
+      rank_num: 4
+      name: bet365
+      columns: [B365H, B365D, B365A]
+      type: soft
+    - rank: quinary
+      rank_num: 5
+      name: bwin
+      columns: [BWH, BWD, BWA]
+      type: soft
+    - rank: senary
+      rank_num: 6
+      name: Betfair_Data
+      columns: [BFDH, BFDD, BFDA]
+      type: soft
+
+  # ── Closing 1x2 (закрытие линии) ──
   closing_1x2:
     - rank: primary
+      rank_num: 1
+      name: Pinnacle_Closing
       columns: [PPCH, PPCD, PPCA]
       type: sharp
+    - rank: secondary
+      rank_num: 2
+      name: bet365_Closing
+      columns: [B365CH, B365CD, B365CA]
+      type: soft
+    - rank: tertiary
+      rank_num: 3
+      name: bwin_Closing
+      columns: [BWCH, BWCD, BWCA]
+      type: soft
+
+  # ── Over/Under 2.5 ──
+  ou25:
+    - rank: primary
+      rank_num: 1
+      name: Max
+      columns: [Max>2.5, Max<2.5]
+      type: aggregate
+      fallback: [Avg>2.5, Avg<2.5]
+    - rank: secondary
+      rank_num: 2
+      name: Betfair_Data
+      columns: [BFD>2.5, BFD<2.5]
+      type: soft
+    - rank: tertiary
+      rank_num: 3
+      name: bet365
+      columns: [B365>2.5, B365<2.5]
+      type: soft
+
+  # ── Asian Handicap ──
+  ah:
+    - rank: primary
+      rank_num: 1
+      name: Max
+      columns: [MaxCAHH, MaxCAHA]
+      type: aggregate
+    - rank: secondary
+      rank_num: 2
+      name: AH_Closing
+      columns: [AHCh]
+      type: closing
+    - rank: tertiary
+      rank_num: 3
+      name: Pinnacle_AH
+      columns: [P>2.5, P<2.5]
+      type: sharp
+
+  # ── Both Teams To Score ──
+  btts:
+    - rank: primary
+      rank_num: 1
+      name: Max
+      columns: [Max>2.5, Max<2.5]
+      type: aggregate
+      fallback: [Avg>2.5, Avg<2.5]
+    - rank: secondary
+      rank_num: 2
+      name: bet365
+      columns: [BbMx>2.5, BbMx<2.5]
+      type: soft
