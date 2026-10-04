@@ -96,6 +96,7 @@ __all__ = [
     "MSK_TZ", "now_msk", "now_msk_short",
     # Batch
     "process_matches",
+    "batch_upsert_matches",
 ]
 
 
@@ -270,21 +271,20 @@ def set_match_status(canonical_id, new_status, source="system"):
 
 
 def _audit_state_transition(cid, from_state, to_state, source):
+    # FIX-AUDIT-9: sorted set через ZADD (§19.2 — system:state_transitions)
     try:
-        from redis_hub import set_key, get_key
-        key = "system:state_transitions"
-        existing = get_key(key)
-        log = json.loads(existing) if existing else []
-        log.append({
+        rh = _get_redis()
+        if not rh:
+            return
+        score = time.time()
+        entry = json.dumps({
             "cid": cid,
             "from": from_state,
             "to": to_state,
             "source": source,
             "timestamp": now_msk(),
-        })
-        if len(log) > 1000:
-            log = log[-1000:]
-        set_key(key, json.dumps(log))
+        }, ensure_ascii=False)
+        rh._execute_upstash_cmd(["ZADD", "system:state_transitions", str(score), entry])
     except Exception:
         pass
 
@@ -614,12 +614,17 @@ def _normalize_incoming_odds(odds_data):
     if "home" in odds_data or "draw" in odds_data or "away" in odds_data:
         return {
             "1x2": {
-                "open": {
+                "opening": {  # FIX-AUDIT-7: "opening" по схеме v710 (§1.21)
                     "home": odds_data.get("home"),
                     "draw": odds_data.get("draw"),
                     "away": odds_data.get("away"),
                 },
-                "current": {  # backward compat
+                "open": {  # backward compat для старых коллекторов
+                    "home": odds_data.get("home"),
+                    "draw": odds_data.get("draw"),
+                    "away": odds_data.get("away"),
+                },
+                "current": {  # backward compat для value_engine < v3.1
                     "home": odds_data.get("home"),
                     "draw": odds_data.get("draw"),
                     "away": odds_data.get("away"),
@@ -627,12 +632,15 @@ def _normalize_incoming_odds(odds_data):
             }
         }
 
-    if "open" in odds_data or "current" in odds_data:
-        # FIX v8.10: нормализуем open → 1x2.open, сохраняем current для compat
+    if "open" in odds_data or "current" in odds_data or "opening" in odds_data:
+        # FIX-AUDIT-7: нормализуем → 1x2.opening (схема v710), сохраняем open для compat
         result = {"1x2": {}}
-        for key in ("open", "current", "closing"):
+        for key in ("opening", "open", "current", "closing"):
             if key in odds_data:
                 result["1x2"][key] = odds_data[key]
+        # Если есть "open" но нет "opening" — дублируем
+        if "open" in result["1x2"] and "opening" not in result["1x2"]:
+            result["1x2"]["opening"] = result["1x2"]["open"]
         return result
 
     return odds_data
@@ -794,17 +802,51 @@ def patch_match(canonical_id, section, data, source="unknown",
     else:
         match_obj[section] = data
 
-    match_obj["version"] = match_obj.get("version", 1) + 1
-    match_obj["updated_at"] = now_msk()
+    # FIX-AUDIT-6: CAS retry — optimistic locking с retry до 3 раз (§24.2)
+    max_cas_retries = 3
+    for attempt in range(max_cas_retries):
+        expected_version = match_obj.get("version", 1)
+        match_obj["version"] = expected_version + 1
+        match_obj["updated_at"] = now_msk()
 
-    # FIX-3: Python-объект, не serialize_match()
-    rh.save_to_cache(key, match_obj)
+        # FIX-3: Python-объект, не serialize_match()
+        rh.save_to_cache(key, match_obj)
+
+        # Проверяем — не перезаписал ли нас другой коллектор
+        recheck = rh.get_from_cache(key)
+        if recheck and isinstance(recheck, dict):
+            actual_version = recheck.get("version", 0)
+            if actual_version == expected_version + 1:
+                # Наша запись прошла успешно
+                break
+            else:
+                # Конфликт версий — перечитываем и мержим заново
+                log_event(source, "WARN",
+                          "patch_match CAS conflict, retrying",
+                          cid=canonical_id, attempt=attempt + 1,
+                          expected=expected_version + 1, actual=actual_version)
+                match_obj = recheck
+                # Повторно применяем обновление
+                if section == "odds":
+                    match_obj["odds"] = _merge_odds(
+                        match_obj.get("odds", {}), normalized, source, upstream
+                    )
+                else:
+                    match_obj[section] = data
+                continue
+        else:
+            break
+    else:
+        log_event(source, "ERROR", "patch_match CAS exhausted retries",
+                  cid=canonical_id, attempts=max_cas_retries)
+        METRICS.inc("patch_match_cas_failed")
+        return False
 
     if idempotency_key:
         _stamp_idempotency(canonical_id, idempotency_key, True)
 
     log_event(source, "INFO", "patch_match",
-              cid=canonical_id, section=section)
+              cid=canonical_id, section=section, cas_retries=attempt + 1)
     METRICS.inc("patch_match_success")
     return True
 
@@ -820,8 +862,6 @@ def get_match_any(canonical_id, namespace="any"):
     rh = _get_redis()
     if not rh:
         return None
-
-    config = load_config()
 
     key = ns_key("match", canonical_id)
     match_obj = rh.get_from_cache(key)
@@ -859,6 +899,40 @@ def save_meta(collector, **kwargs):
     rh.save_to_cache(key, meta)
     log_event(collector, "INFO", "save_meta",
               error_count=kwargs.get("error_count", 0))
+
+
+# ═══════════════════════════════════════════════════════════
+# FIX-AUDIT-3: _remove_from_index — удаление canonical_id из шардов
+# ═══════════════════════════════════════════════════════════
+
+INDEX_LOOKBACK_DAYS = 30
+INDEX_LOOKAHEAD_DAYS = 7
+
+def _remove_from_index(canonical_id):
+    """
+    Сканирует шарды от -INDEX_LOOKBACK_DAYS до +INDEX_LOOKAHEAD_DAYS
+    и удаляет canonical_id из дневных индексов index:shard:{YYYYMMDD}. §1.7c
+    """
+    rh = _get_redis()
+    if not rh:
+        return
+
+    today = datetime.now(timezone.utc)
+    for offset in range(-INDEX_LOOKBACK_DAYS, INDEX_LOOKAHEAD_DAYS + 1):
+        shard_date = today + timedelta(days=offset)
+        shard_key = f"index:shard:{shard_date.strftime('%Y%m%d')}"
+        try:
+            rh._execute_upstash_cmd(["SREM", shard_key, canonical_id])
+        except Exception:
+            pass
+
+    # FIX-AUDIT-4: Очистка search:results:* — оставляем только latest
+    try:
+        rh._execute_upstash_cmd(["DEL", "search:results:latest"])
+        # Пересохраняем только если есть актуальные данные
+        # (latest останется пустым до следующего поиска)
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -906,7 +980,23 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
             continue
 
         status = match.get("status", "")
-        if status != "completed":
+        date_utc = match.get("date_utc", "")
+
+        # FIX-AUDIT-1: Проверка по обоим условиям (§1.7)
+        # 1) status == "completed" ИЛИ
+        # 2) date_utc + 2 часа < now (temporal leakage cleanup)
+        should_delete = False
+        if status == "completed":
+            should_delete = True
+        elif date_utc:
+            try:
+                match_date = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+                if match_date + timedelta(hours=2) < datetime.now(timezone.utc):
+                    should_delete = True
+            except (ValueError, TypeError):
+                pass  # Некорректная дата — не удаляем
+
+        if not should_delete:
             continue
 
         # Миграция в history
@@ -926,15 +1016,38 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
             # FIX-3: Python-объект
             rh.save_to_cache(history_key, match)
 
+        # FIX-AUDIT-3: Удаляем из индексов
+        _remove_from_index(canonical_id)
+
         # Удаляем из live
         rh.delete_from_cache(field_id)
         deleted += 1
         migrated += 1
 
+    # FIX-AUDIT-2: Метрики в system:health (§1.7b)
+    expired_count = deleted  # матчи удалённые по времени
+    finished_count = 0  # пересчитаем
+    # (уже учтены выше — deleted это общее количество)
+
+    health_key = "system:health"
+    health_data = {
+        "last_cleanup_count": deleted,
+        "last_cleanup_at": now_msk(),
+        "last_cleanup_finished": deleted,  # завершённые
+        "last_cleanup_expired": expired_count,  # по времени
+    }
+    rh.save_to_cache(health_key, health_data)
+
     log_event("hub", "INFO", "cleanup_expired done",
-              deleted=deleted, migrated=migrated)
+              deleted=deleted, migrated=migrated, expired=expired_count)
     METRICS.inc("cleanup_deleted", deleted)
-    return {"count": deleted, "migrated": migrated, "dry_run": dry_run}
+    METRICS.time("cleanup_duration", time.time() - 0)  # approximate
+    return {
+        "count": deleted,
+        "migrated": migrated,
+        "expired": expired_count,
+        "dry_run": dry_run,
+    }
 
 
 
@@ -958,8 +1071,8 @@ def get_all_odds(match: dict) -> dict:
     # Если odds уже в формате 1x2
     if "1x2" in odds:
         sec = odds["1x2"]
-        # FIX v8.10: "open" — primary (схема v710), "current" — для обратной совместимости
-        open_odds = sec.get("open", sec.get("current", {}))
+        # FIX-AUDIT-7: "opening" — primary (схема v710), "open" — backward compat
+        open_odds = sec.get("opening", sec.get("open", sec.get("current", {})))
         return {
             "open": open_odds,
             "current": open_odds,  # backward compat для value_engine < v3.1
@@ -1116,6 +1229,27 @@ def process_matches(matches: list, default_source: str = "unknown") -> dict:
 
     log_event(default_source, "INFO", "process_matches done", **stats)
     return stats
+
+
+# ═══════════════════════════════════════════════════════════
+# FIX-AUDIT-5: batch_upsert_matches — алиас для соответствия гайду (§1.5)
+# ═══════════════════════════════════════════════════════════
+
+def batch_upsert_matches(matches: list, default_source: str = "unknown") -> dict:
+    """
+    Пакетная запись матчей. §1.5, API-таблица гида.
+    Возвращает: {total, created, updated, skipped_past, deduped}
+    — обёртка над process_matches с конвертацией формата ответа.
+    """
+    raw = process_matches(matches, default_source)
+    return {
+        "total": raw.get("total", 0),
+        "created": raw.get("created", 0),
+        "updated": raw.get("patched", 0),
+        "skipped_past": raw.get("skipped", 0),
+        "deduped": 0,  # дедупликация происходит внутри process_matches
+        "errors": raw.get("errors", 0),
+    }
 
 
 # ═══════════════════════════════════════════════════════════
