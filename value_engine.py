@@ -22,7 +22,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "3.2-patched"
+__version__ = "3.3-patched"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,7 +53,8 @@ except ImportError:
     _CFG_THRESHOLD = None
 
 _DEFAULT_THRESHOLD = _CFG_THRESHOLD or float(
-    os.environ.get("VALUE_BET_THRESHOLD", "0.03")
+    os.environ.get("VALUE_THRESHOLD", "")
+    or os.environ.get("VALUE_BET_THRESHOLD", "0.03")
 )
 
 
@@ -136,6 +137,7 @@ def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, f
     FIX v3.2: Корректно обрабатывает nesting 1x2 (§1.21).
               Schema key = "opening" (не "open").
               "current" — fallback если нет "opening".
+    FIX-AUDIT: Добавлена обработка h2h формата (the-odds-api, propline).
 
     Closing — «истинная» цена рынка (PropLine/Pinnacle).
     Open — коэффициент, на который можно поставить сейчас.
@@ -143,10 +145,22 @@ def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, f
     open_tuple = None
     closing_tuple = None
 
-    # FIX v3.2: odds хранятся в 1x2 (§1.21), но поддерживаем плоский формат
     if not isinstance(all_odds, dict):
         return None, None
 
+    # FIX-AUDIT: h2h формат (the-odds-api / propline)
+    h2h = all_odds.get("h2h")
+    if h2h is not None:
+        if isinstance(h2h, list) and len(h2h) >= 3:
+            h, d, a = _to_float(h2h[0]), _to_float(h2h[1]), _to_float(h2h[2])
+            if h and d and a:
+                open_tuple = (h, d, a)
+            return open_tuple, closing_tuple
+        elif isinstance(h2h, dict):
+            open_tuple = _extract_odds_tuple(h2h)
+            return open_tuple, closing_tuple
+
+    # 1x2 nesting (§1.21) — основной формат
     odds_1x2 = all_odds.get("1x2")
     if not isinstance(odds_1x2, dict):
         # Fallback: плоский формат (без 1x2 обёртки)
@@ -228,7 +242,7 @@ def evaluate_match_full(
 
         # Fallback: если open есть, но нет closing — используем open
         if open_tuple and not closing_tuple:
-            return _evaluate_single(open_tuple, value_threshold, match_data, has_closing=False)
+            return _evaluate_single(open_tuple, value_threshold, match_data)
 
         # Оба есть — считаем реальный value: open vs closing
         return _evaluate_dual(open_tuple, closing_tuple, value_threshold, match_data)
@@ -241,7 +255,6 @@ def _evaluate_single(
     open_odds: Tuple[float, float, float],
     threshold: float,
     match_data: Dict[str, Any],
-    has_closing: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Fallback-оценка без closing odds.
@@ -283,7 +296,7 @@ def _evaluate_single(
 
 def _evaluate_dual(
     open_odds: Tuple[float, float, float],
-    closing: Tuple[float, float, float],
+    closing_odds: Tuple[float, float, float],
     threshold: float,
     match_data: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
@@ -294,18 +307,21 @@ def _evaluate_dual(
     fair_prob = normalised implied prob (без margin).
     value_home = fair_prob_home(closing) - fair_prob_home(open)
     value = max(abs(value_home), abs(value_draw), abs(value_away))
+
+    FIX-AUDIT: Переименованы переменные для читаемости:
+      o_ = open (где ставим), c_ = closing (истина рынка).
     """
-    c_hp, c_dp, c_ap, c_margin = _implied_probs(open_odds)
-    k_hp, k_dp, k_ap, k_margin = _implied_probs(closing)
+    o_hp, o_dp, o_ap, o_margin = _implied_probs(open_odds)
+    c_hp, c_dp, c_ap, c_margin = _implied_probs(closing_odds)
 
     # Normalised probs (убираем margin)
+    o_hn, o_dn, o_an = _normalize_probs((o_hp, o_dp, o_ap))
     c_hn, c_dn, c_an = _normalize_probs((c_hp, c_dp, c_ap))
-    k_hn, k_dn, k_an = _normalize_probs((k_hp, k_dp, k_ap))
 
     # Value = разница normalised probs (closing = истина, open = где ставим)
-    v_home = k_hn - c_hn
-    v_draw = k_dn - c_dn
-    v_away = k_an - c_an
+    v_home = c_hn - o_hn
+    v_draw = c_dn - o_dn
+    v_away = c_an - o_an
 
     value = max(abs(v_home), abs(v_draw), abs(v_away))
 
@@ -325,10 +341,10 @@ def _evaluate_dual(
     return {
         "value": round(value, 5),
         "direction": direction,
-        "margin": round(c_margin, 5),
-        "closing_margin": round(k_margin, 5),
+        "margin": round(o_margin, 5),
+        "closing_margin": round(c_margin, 5),
         "current_odds": open_odds,
-        "closing_odds": closing,
+        "closing_odds": closing_odds,
         "best_source": best_source,
     }
 
