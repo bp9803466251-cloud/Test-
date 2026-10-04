@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper-AI v810-patched — Main Pipeline (Dashboard + Telegram)
+Gatekeeper-AI v811-patched — Main Pipeline (Dashboard + Telegram)
 Value engine + Telegram-дашборд по стандарту §12.
 
 Патчи v8.10:
@@ -25,6 +25,14 @@ Value engine + Telegram-дашборд по стандарту §12.
   AUDIT-5: _send_one — retry на network errors (ConnectionRefused, Timeout).
   AUDIT-6: _ecosystem_line — skip get_from_cache при Redis-down (4 лишних запроса).
   AUDIT-7: Удалены dead imports (get_history, get_current_odds, get_all_odds, urllib.parse).
+
+v8.11-patched:
+  FIX-11: batch_evaluate → run_pipeline — API mismatch (batch_evaluate возвращал
+          {cid: float}, а main.py ожидал {hot, warm, stats}).
+  FIX-12: Meta keys "sharpapi:meta" → "meta:sharpapi" — несоответствие формата
+          ключей с redis_hub и redis_diagnostics (оба используют "meta:{collector}").
+  FIX-13: _split_message → делегирование в telegram_transport.split_html_safe.
+  FIX-14: TG_MAX_CHARS → TELEGRAM_CHUNK_LIMIT из telegram_transport.
 """
 import os
 import sys
@@ -47,14 +55,64 @@ from gatekeeper_hub import (
     now_msk,
     is_shutdown_requested,
 )
-from value_engine import batch_evaluate
+# FIX-11: run_pipeline вместо batch_evaluate — возвращает структурированный результат
+from value_engine import run_pipeline
+
+# FIX-13: Делегирование HTML-разбивки в telegram_transport
+try:
+    from telegram_transport import split_html_safe as _split_html_safe, TELEGRAM_CHUNK_LIMIT
+except ImportError:
+    # Fallback: локальная реализация
+    TELEGRAM_CHUNK_LIMIT = 4000
+
+    def _split_html_safe(text, max_chars):
+        if len(text) <= max_chars:
+            return [text]
+        lines = text.split("\n")
+        parts = []
+        current = ""
+        for line in lines:
+            if len(current) + len(line) + 1 > max_chars:
+                if current:
+                    parts.append(current)
+                    current = ""
+                while len(line) > max_chars:
+                    cut = line[:max_chars]
+                    space_pos = cut.rfind(" ", max_chars - 100)
+                    if space_pos > 0:
+                        parts.append(line[:space_pos])
+                        line = line[space_pos + 1:]
+                    else:
+                        parts.append(cut)
+                        line = line[max_chars:]
+                    if len(line) <= max_chars:
+                        break
+                current = line + "\n"
+            else:
+                current += line + "\n"
+        if current:
+            parts.append(current)
+        # Балансировка HTML-тегов
+        _HTML_TAGS = ("b", "i", "u", "s", "code", "pre")
+        balanced = []
+        for part in parts:
+            for tag in _HTML_TAGS:
+                open_count = part.lower().count(f"<{tag}>")
+                close_count = part.lower().count(f"</{tag}>")
+                if open_count > close_count:
+                    part += f"</{tag}>" * (open_count - close_count)
+                elif close_count > open_count:
+                    part = f"<{tag}>" * (close_count - open_count) + part
+            balanced.append(part)
+        return balanced
+
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [DASH] %(message)s'
 )
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 __all__ = ["main", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
@@ -62,7 +120,8 @@ VALUE_THRESHOLD = float(os.environ.get("VALUE_THRESHOLD", "") or os.environ.get(
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "") or os.environ.get("TELEGRAM_GROUP_ID", "")
-TG_MAX_CHARS = 4000
+# FIX-14: Используем TELEGRAM_CHUNK_LIMIT из telegram_transport
+TG_MAX_CHARS = TELEGRAM_CHUNK_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +132,7 @@ def _send_telegram(text: str) -> bool:
         logging.info("Нет токена или chat_id — пропуск")
         return False
     text = text.replace('%', '&#37;')
-    parts = _split_message(text, TG_MAX_CHARS)
+    parts = _split_html_safe(text, TG_MAX_CHARS)
     logging.info(f"Отправка {len(parts)} сообщений...")
     for i, part in enumerate(parts, 1):
         if not _send_one(part):
@@ -129,53 +188,6 @@ def _send_one(text: str) -> bool:
         return False
 
 
-def _split_message(text: str, max_chars: int) -> list:
-    if len(text) <= max_chars:
-        return [text]
-    lines = text.split("\n")
-    parts = []
-    current = ""
-    for line in lines:
-        if len(current) + len(line) + 1 > max_chars:
-            if current:
-                parts.append(current)
-                current = ""
-            while len(line) > max_chars:
-                cut = line[:max_chars]
-                space_pos = cut.rfind(" ", max_chars - 100)
-                if space_pos > 0:
-                    parts.append(line[:space_pos])
-                    line = line[space_pos + 1:]
-                else:
-                    parts.append(cut)
-                    line = line[max_chars:]
-                if len(line) <= max_chars:
-                    break
-            current = line + "\n"
-        else:
-            current += line + "\n"
-    if current:
-        parts.append(current)
-    # FIX-AUDIT: Балансировка HTML-тегов в каждой части
-    _HTML_TAGS = ("b", "i", "u", "s", "code", "pre")
-    balanced_parts = []
-    open_tags = []
-    for part in parts:
-        for tag in _HTML_TAGS:
-            open_count = part.lower().count(f"<{tag}>")
-            close_count = part.lower().count(f"</{tag}>")
-            if open_count > close_count:
-                for _ in range(open_count - close_count):
-                    part += f"</{tag}>"
-            elif close_count > open_count:
-                prefix = ""
-                for _ in range(close_count - open_count):
-                    prefix = f"<{tag}>" + prefix
-                part = prefix + part
-        balanced_parts.append(part)
-    return balanced_parts
-
-
 # ---------------------------------------------------------------------------
 # Ecosystem markers (§12)
 # ---------------------------------------------------------------------------
@@ -194,11 +206,12 @@ def _ecosystem_line() -> str:
         else:
             markers.append("Flush+")
         return " | ".join(markers)
+    # FIX-12: meta:{collector} вместо {collector}:meta
     for name, meta_key in [
-        ("Bzzoiro", "bzzoiro:meta"),
-        ("Sharp", "sharpapi:meta"),
-        ("PropLine", "propline:meta"),
-        ("OddsAPI", "odds_api:meta"),
+        ("Bzzoiro", "meta:bzzoiro"),
+        ("Sharp", "meta:sharpapi"),
+        ("PropLine", "meta:propline"),
+        ("OddsAPI", "meta:odds_api"),
     ]:
         try:
             meta = get_from_cache(meta_key)
@@ -219,11 +232,12 @@ def _ecosystem_line() -> str:
 # Last module (§12)
 # ---------------------------------------------------------------------------
 def _last_module() -> str:
+    # FIX-12: meta:{collector} вместо {collector}:meta
     modules = [
-        ("Sharp", "sharpapi:meta"),
-        ("Bzzoiro", "bzzoiro:meta"),
-        ("PropLine", "propline:meta"),
-        ("OddsAPI", "odds_api:meta"),
+        ("Sharp", "meta:sharpapi"),
+        ("Bzzoiro", "meta:bzzoiro"),
+        ("PropLine", "meta:propline"),
+        ("OddsAPI", "meta:odds_api"),
     ]
     latest = None
     latest_dt = None
@@ -261,7 +275,10 @@ def _fmt_odds(o) -> str:
 
 
 def _fmt_prob(p: float) -> str:
-    return str(round(p * 100))
+    try:
+        return str(round(p * 100))
+    except (TypeError, ValueError):
+        return "0"
 
 
 def _source_display(source: str) -> str:
@@ -391,7 +408,7 @@ def main():
     global _redis_available
 
     logging.info("=" * 60)
-    logging.info("Gatekeeper-AI Pipeline v8.10-patched")
+    logging.info("Gatekeeper-AI Pipeline v8.11-patched")
     logging.info(f"Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
     logging.info("=" * 60)
 
@@ -439,11 +456,12 @@ def main():
         return
 
     # === ШАГ 3: Value-анализ ===
-    logging.info(f"Value-анализ через value_engine (threshold={VALUE_THRESHOLD})...")
+    logging.info(f"Value-анализ через value_engine.run_pipeline (threshold={VALUE_THRESHOLD})...")
     try:
-        result = batch_evaluate(matches, value_threshold=VALUE_THRESHOLD)
+        # FIX-11: run_pipeline вместо batch_evaluate
+        result = run_pipeline(matches, value_threshold=VALUE_THRESHOLD)
     except Exception as e:
-        logging.error(f"batch_evaluate failed: {e}")
+        logging.error(f"run_pipeline failed: {e}")
         dashboard = (
             "\U0001f310 Redis+ | \U0001f4caValue engine error | "
             f"Пайплайн прерван: {html.escape(str(e))}\n"

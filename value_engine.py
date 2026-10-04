@@ -1,5 +1,6 @@
 # value_engine.py
-# Version: 3.2 — Phase 6: fix 1x2 nesting + opening key + error isolation
+# Version: 3.3-patched — Phase 6: fix 1x2 nesting + opening key + error isolation
+# v8.11-patched: run_pipeline() for main.py, odds-level sources, logging fix
 
 import logging
 import os
@@ -16,6 +17,7 @@ __all__ = [
     "evaluate_match_full",
     "batch_evaluate",
     "batch_evaluate_full",
+    "run_pipeline",
     "calculate_margin",
     "extract_odds_pair",
     "ValueEngineError",
@@ -24,12 +26,11 @@ __all__ = [
 
 __version__ = "3.3-patched"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - [VALUE] %(message)s",
-)
-
+# FIX-1: Убран logging.basicConfig — он влияет на все модули-импортёры.
+# Каждый модуль должен настраивать logging самостоятельно.
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 
 class ValueEngineError(Exception):
@@ -153,7 +154,7 @@ def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, f
     if h2h is not None:
         if isinstance(h2h, list) and len(h2h) >= 3:
             h, d, a = _to_float(h2h[0]), _to_float(h2h[1]), _to_float(h2h[2])
-            if h and d and a:
+            if h is not None and d is not None and a is not None:
                 open_tuple = (h, d, a)
             return open_tuple, closing_tuple
         elif isinstance(h2h, dict):
@@ -180,17 +181,31 @@ def extract_odds_pair(all_odds: Dict[str, Any]) -> Tuple[Optional[Tuple[float, f
     return open_tuple, closing_tuple
 
 
-def _extract_source(sources: List[Dict[str, Any]]) -> Optional[str]:
-    """Выбор лучшего источника по рангу приоритета."""
-    if not sources:
-        return None
+def _extract_best_source(match_data: Dict[str, Any]) -> Optional[str]:
+    """
+    FIX-3: Выбор лучшего источника — из odds-level sources, не match-level.
+    Match-level sources = список коллекторов (["sharpapi", "odds_api"]).
+    Odds-level sources = детальные источники коэффициентов с bookmaker info.
+    """
+    # Сначала пробуем odds-level sources (inside odds.1x2.sources)
+    all_odds = match_data.get("odds", {})
+    if isinstance(all_odds, dict):
+        odds_1x2 = all_odds.get("1x2", {})
+        if isinstance(odds_1x2, dict):
+            sources = odds_1x2.get("sources", [])
+            if isinstance(sources, list) and sources:
+                best = min(sources, key=lambda s: _PRIORITY_MAP.get(
+                    str(s.get("source", "")).lower(), 99))
+                return str(best.get("source"))
 
-    def priority(src: Dict[str, Any]) -> int:
-        name = str(src.get("source", "")).lower()
-        return _PRIORITY_MAP.get(name, 99)
+    # Fallback: match-level sources (коллекторы)
+    match_sources = match_data.get("sources", [])
+    if isinstance(match_sources, list) and match_sources:
+        best_name = min(match_sources, key=lambda s: _PRIORITY_MAP.get(
+            str(s).lower(), 99))
+        return str(best_name)
 
-    best = min(sources, key=priority)
-    return str(best.get("source"))
+    return None
 
 
 def evaluate_match_full(
@@ -280,8 +295,8 @@ def _evaluate_single(
         key=lambda x: abs(x[1]),
     )[0]
 
-    sources = match_data.get("sources", [])
-    best_source = _extract_source(sources) if isinstance(sources, list) else None
+    # FIX-3: Используем _extract_best_source вместо прямого match_data.get
+    best_source = _extract_best_source(match_data)
 
     return {
         "value": round(value, 5),
@@ -335,8 +350,8 @@ def _evaluate_dual(
         key=lambda x: abs(x[1]),
     )[0]
 
-    sources = match_data.get("sources", [])
-    best_source = _extract_source(sources) if isinstance(sources, list) else None
+    # FIX-3: Используем _extract_best_source вместо прямого match_data.get
+    best_source = _extract_best_source(match_data)
 
     return {
         "value": round(value, 5),
@@ -408,3 +423,142 @@ def batch_evaluate_full(
             results[cid] = None
 
     return results
+
+
+# ============================================================================
+# FIX-4: run_pipeline — структурированный результат для main.py
+# ============================================================================
+
+# Пороги для категоризации (env-configurable)
+_HOT_THRESHOLD = float(os.environ.get("VALUE_HOT_THRESHOLD", "0.08"))
+_WARM_THRESHOLD = float(os.environ.get("VALUE_WARM_THRESHOLD", "0.03"))
+_FIRE_THRESHOLD = float(os.environ.get("VALUE_FIRE_THRESHOLD", "0.12"))
+
+
+def run_pipeline(
+    matches: Dict[str, Dict[str, Any]],
+    value_threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Полный value-пайплайн для main.py.
+
+    Возвращает структурированный результат:
+        {
+            "hot": [ {canonical_id, value, direction, ...} ],
+            "warm": [ {canonical_id, value, direction, ...} ],
+            "stats": { total, with_odds, value_bets, with_pred, with_h2h, with_stats },
+        }
+
+    Категоризация:
+        hot  — value >= _HOT_THRESHOLD (env: VALUE_HOT_THRESHOLD, default 0.08)
+        warm — value >= value_threshold (env: VALUE_THRESHOLD, default 0.03)
+        fire — value >= _FIRE_THRESHOLD (env: VALUE_FIRE_THRESHOLD, default 0.12)
+    """
+    if value_threshold is None:
+        value_threshold = _DEFAULT_THRESHOLD
+
+    hot = []
+    warm = []
+    stats = {
+        "total": len(matches),
+        "with_odds": 0,
+        "value_bets": 0,
+        "with_pred": 0,
+        "with_h2h": 0,
+        "with_stats": 0,
+    }
+
+    full_results = batch_evaluate_full(matches, value_threshold)
+
+    for cid, result in full_results.items():
+        match = matches.get(cid, {})
+        if not isinstance(match, dict):
+            continue
+
+        # Подсчёт stats
+        if match.get("odds"):
+            stats["with_odds"] += 1
+        if match.get("predictions"):
+            stats["with_pred"] += 1
+        if match.get("h2h"):
+            stats["with_h2h"] += 1
+        if match.get("stats"):
+            stats["with_stats"] += 1
+
+        if result is None:
+            continue
+
+        stats["value_bets"] += 1
+        value = result.get("value", 0)
+        is_fire = value >= _FIRE_THRESHOLD
+
+        # Извлекаем odds tuple для дашборда
+        open_odds = result.get("current_odds")
+        closing_odds = result.get("closing_odds")
+        direction = result.get("direction", "")
+        best_source = result.get("best_source", "")
+
+        # Вероятности для дашборда
+        if open_odds:
+            hp, dp, ap, _ = _implied_probs(open_odds)
+            hn, dn, an = _normalize_probs((hp, dp, ap))
+            probs = (hn, dn, an)
+        else:
+            probs = (0, 0, 0)
+
+        # Value side odds и probability
+        if open_odds and direction:
+            dir_map = {"home": 0, "draw": 1, "away": 2}
+            idx = dir_map.get(direction, 0)
+            v_odds = open_odds[idx]
+            v_prob = probs[idx]
+        else:
+            v_odds = 0
+            v_prob = 0
+
+        # EV (expected value) — разница между fair prob и implied prob
+        if closing_odds and open_odds:
+            chp, cdp, cap, _ = _implied_probs(closing_odds)
+            chn, cdn, can = _normalize_probs((chp, cdp, cap))
+            dir_map = {"home": 0, "draw": 1, "away": 2}
+            idx = dir_map.get(direction, 0)
+            fair_prob = [chn, cdn, can][idx]
+            implied_prob = [hp, dp, ap][idx] if open_odds else 0
+            value_ev = fair_prob - implied_prob
+        else:
+            value_ev = value
+
+        info = {
+            "canonical_id": cid,
+            "home_team": match.get("home_team", "?"),
+            "away_team": match.get("away_team", "?"),
+            "comp_code": match.get("competition", "?"),
+            "date": match.get("date_utc", "?")[:10] if match.get("date_utc") else "?",
+            "time": match.get("date_utc", "?")[11:16] if match.get("date_utc") else "?",
+            "odds": open_odds or (0, 0, 0),
+            "probs": probs,
+            "value": value,
+            "direction": direction,
+            "v_side": direction,
+            "v_odds": v_odds,
+            "v_prob": v_prob,
+            "value_ev": value_ev,
+            "is_fire": is_fire,
+            "source": best_source,
+            "odds_verification": match.get("odds_verification", {}),
+        }
+
+        if value >= _HOT_THRESHOLD:
+            hot.append(info)
+        elif value >= value_threshold:
+            warm.append(info)
+
+    # Сортировка по убыванию value
+    hot.sort(key=lambda x: x["value"], reverse=True)
+    warm.sort(key=lambda x: x["value"], reverse=True)
+
+    return {
+        "hot": hot,
+        "warm": warm,
+        "stats": stats,
+    }

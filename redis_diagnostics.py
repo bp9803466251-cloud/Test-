@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 __all__ = ["main", "diagnose_redis", "diagnose_matches", "diagnose_indexes",
            "diagnose_sources", "diagnose_errors", "__version__"]
 
@@ -487,7 +487,14 @@ def _do_flush(data, dry_run=False):
                 flushed += 1
             else:
                 try:
-                    rdb.delete_from_cache(key)
+                    if hasattr(rdb, "delete_key"):
+                        rdb.delete_key(key)
+                    elif hasattr(rdb, "delete_from_cache"):
+                        rdb.delete_from_cache(key)
+                    else:
+                        logger.warning(f"No delete method for {key}")
+                        skipped += 1
+                        continue
                     flushed += 1
                 except Exception as e:
                     logger.warning(f"Flush {key}: {e}")
@@ -531,10 +538,19 @@ def _do_history_only(dry_run=False):
             flushed += 1
         else:
             try:
+                deleted = False
                 if hasattr(rdb, "delete_key"):
                     rdb.delete_key(key)
-                else:
+                    deleted = True
+                elif hasattr(rdb, "delete_from_cache"):
                     rdb.delete_from_cache(key)
+                    deleted = True
+                elif hasattr(rdb, "delete_keys_by_pattern"):
+                    rdb.delete_keys_by_pattern(key)
+                    deleted = True
+                if not deleted:
+                    logger.warning(f"No delete method for {key}")
+                    continue
                 flushed += 1
             except Exception as e:
                 logger.warning(f"Delete {key}: {e}")
@@ -857,12 +873,12 @@ def main():
             print("❌ redis_config unavailable")
             return
         info = cfg.get_redis_info()
-        print(f"Redis configured: {'✅' if info['configured'] else '❌'}")
-        print(f"Token set: {'✅' if info['token_set'] else '❌'}")
-        print(f"Timeout: {info['timeout']}s")
-        print(f"Hash name: {info['hash_name']}")
-        print(f"CB threshold: {info['cb_threshold']}")
-        print(f"CB recovery: {info['cb_recovery']}s")
+        print(f"Redis configured: {'✅' if info.get('configured', bool(info.get('url'))) else '❌'}")
+        print(f"Token set: {'✅' if info.get('token_set') else '❌'}")
+        print(f"Timeout: {info.get('timeout', '?')}s")
+        print(f"Hash name: {info.get('hash_name', '?')}")
+        print(f"CB threshold: {info.get('cb_threshold', '?')}")
+        print(f"CB recovery: {info.get('cb_recovery', '?')}s")
         return
 
     # ── --metrics (§24.5) ──
