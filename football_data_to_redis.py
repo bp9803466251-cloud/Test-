@@ -115,7 +115,6 @@ try:
     from redis_hub import PipelineBatch, is_redis_available
     _PIPELINE_BATCH_AVAILABLE = True
 except ImportError:
-    from redis_hub import is_redis_available
     _PIPELINE_BATCH_AVAILABLE = False
 
     class PipelineBatch:
@@ -126,14 +125,23 @@ except ImportError:
         def add(self, *args):
             self._ops.append(args)
         def flush(self):
-            from redis_hub import set_key as _sk
-            if self.dry_run:
-                self._ops.clear()
-                return
-            for op in self._ops:
-                if op[0] == "SET":
-                    _sk(op[1], op[2])
+            try:
+                from redis_hub import set_key as _sk
+                if self.dry_run:
+                    self._ops.clear()
+                    return
+                for op in self._ops:
+                    if op[0] == "SET":
+                        _sk(op[1], op[2])
+            except ImportError:
+                logger.warning("redis_hub not available — batch flush skipped")
             self._ops.clear()
+
+    try:
+        from redis_hub import is_redis_available
+    except ImportError:
+        def is_redis_available():
+            return False
 
 # ============================================================================
 # CONFIG
@@ -448,8 +456,15 @@ def now_msk():
 
 
 def now_iso():
-    """ISO timestamp для created_at/updated_at."""
-    return now_msk().strftime("%Y-%m-%dT%H:%M:%SZ")
+    """ISO timestamp для created_at/updated_at.
+    FIX: now_msk() from gatekeeper_config returns a string, not datetime.
+    Handle both string and datetime returns."""
+    ts = now_msk()
+    if isinstance(ts, str):
+        # gatekeeper_config.now_msk returns "YYYY-MM-DDTHH:MM:SS+03:00"
+        return ts.replace("+03:00", "Z")
+    # Fallback now_msk returns datetime
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def clean_team_name(name):
@@ -672,6 +687,9 @@ def build_odds_block(row, ts):
     current = closing_bm.get("pinnacle") or max_closing
     if not current and closing_bm:
         current = list(closing_bm.values())[0]
+
+    # FIX: `closing` was undefined — NameError at runtime. Define from closing odds.
+    closing = current  # closing = best closing price (same as current for completed matches)
 
     opening = opening_bm.get("pinnacle") or max_opening
     if not opening and opening_bm:
@@ -952,19 +970,14 @@ class FootballDataCollector:
         key = "football_data:meta"
         data = json.dumps(self._meta_entries, ensure_ascii=False)
         if _HUB_AVAILABLE:
+            # FIX: save_meta from hub may not accept arbitrary kwargs (season, league_code, etc.)
+            # Use direct set_key instead — meta is not a match object
             try:
-                from gatekeeper_hub import save_meta as _hub_save_meta
-                _hub_save_meta(SOURCE_NAME, **self._meta_entries.get(
-                    list(self._meta_entries.keys())[-1], {}
-                ))
-            except Exception:
-                # Fallback на прямой SET через redis_hub
-                try:
-                    from redis_hub import set_key
-                    if not self.dry_run:
-                        set_key(key, data)
-                except Exception as e:
-                    logger.error(f"flush_meta fallback failed: {e}")
+                from redis_hub import set_key
+                if not self.dry_run:
+                    set_key(key, data)
+            except Exception as e:
+                logger.error(f"flush_meta failed: {e}")
         else:
             try:
                 from redis_hub import set_key
