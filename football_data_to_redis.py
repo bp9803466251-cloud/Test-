@@ -9,8 +9,8 @@ v7.0 (Phase 2):
   - upsert_match() через хаб (не прямой SET) — match hub envelope
   - source/sources в payload — хаб видит football_data
   - idempotency_key — защита от дублей при повторном CI
-  - team_registry.normalize_team_name — единый реестр (75+ алиасов)
-  - team_registry.build_canonical_id — единый canonical_id
+  - team_registry.clean_team_name — единый реестр (257+ алиасов)
+  - team_registry.build_canonical_id — единый canonical_id (257+ алиасов)
   - gatekeeper_config.now_msk — единое MSK-время
   - flush_meta после каждой лиги (не в конце) — crash-safe
   - run_id из хаба — трассировка
@@ -37,11 +37,13 @@ import argparse
 import csv
 import io
 import json
+import logging
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Единый транспортный слой — хаб
 try:
@@ -94,7 +96,9 @@ except ImportError:
 
 # Единый реестр команд
 try:
-    from team_registry import normalize_team_name as _registry_normalize
+    from team_registry import clean_team_name as _registry_normalize
+    from team_registry import build_canonical_id as _registry_build_cid
+    from team_registry import TEAM_ALIASES as _REGISTRY_ALIASES
     _REGISTRY_AVAILABLE = True
 except ImportError:
     _REGISTRY_AVAILABLE = False
@@ -107,17 +111,43 @@ except ImportError:
     _NOW_MSK_AVAILABLE = False
 
 # redis_hub для fallback и is_redis_available
-from redis_hub import PipelineBatch, is_redis_available
+try:
+    from redis_hub import PipelineBatch, is_redis_available
+    _PIPELINE_BATCH_AVAILABLE = True
+except ImportError:
+    from redis_hub import is_redis_available
+    _PIPELINE_BATCH_AVAILABLE = False
+
+    class PipelineBatch:
+        """Fallback: simple batch using redis_hub.set_key."""
+        def __init__(self, dry_run=False, max_batch=50, batch_delay=0.15):
+            self.dry_run = dry_run
+            self._ops = []
+        def add(self, *args):
+            self._ops.append(args)
+        def flush(self):
+            from redis_hub import set_key as _sk
+            if self.dry_run:
+                self._ops.clear()
+                return
+            for op in self._ops:
+                if op[0] == "SET":
+                    _sk(op[1], op[2])
+            self._ops.clear()
 
 # ============================================================================
 # CONFIG
 # ============================================================================
 
-VERSION = "7.0.0"
-__version__ = "7.0.0"
+VERSION = "8.10-patched"
+__version__ = "8.10-patched"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [FOOTBALL_DATA] %(message)s")
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "FootballDataCollector",
+    "PipelineBatch",
     "collect_and_process",
     "build_payload",
     "build_canonical_id",
@@ -423,15 +453,18 @@ def now_iso():
 
 
 def clean_team_name(name):
-    """Делегирует в team_registry.normalize_team_name() — единый реестр (75+ алиасов).
+    """Делегирует в team_registry.clean_team_name() — единый реестр (257+ алиасов).
     Fallback: локальные TEAM_ALIASES (130 алиасов)."""
     if not name:
         return ""
     # Приоритет — team_registry (единый реестр)
     if _REGISTRY_AVAILABLE:
-        result = _registry_normalize(name)
-        if result:
-            return result
+        try:
+            result = _registry_normalize(name)
+            if result:
+                return result
+        except Exception:
+            pass
     # Fallback — локальные TEAM_ALIASES
     n = name.strip().lower()
     return TEAM_ALIASES.get(n, n)
@@ -439,11 +472,11 @@ def clean_team_name(name):
 
 def build_canonical_id(home_team, away_team, date_utc):
     """Единый canonical_id. Приоритет — team_registry, fallback — локальный."""
-    try:
-        from team_registry import build_canonical_id as _registry_build
-        return _registry_build(home_team, away_team, date_utc)
-    except ImportError:
-        pass
+    if _REGISTRY_AVAILABLE:
+        try:
+            return _registry_build_cid(home_team, away_team, date_utc)
+        except Exception:
+            pass
     # Fallback — локальная реализация (совместима с хабом)
     home_clean = clean_team_name(home_team).replace(" ", "_")
     away_clean = clean_team_name(away_team).replace(" ", "_")
@@ -667,6 +700,8 @@ def build_odds_block(row, ts):
         odds_1x2["opening"] = opening
     if best:
         odds_1x2["best"] = best
+    if closing:
+        odds_1x2["closing"] = closing
     if sources:
         odds_1x2["sources"] = sources
     if opening_bm:
@@ -790,7 +825,7 @@ class FootballDataCollector:
         self.errors = 0
         self.skipped = 0
         self._meta_entries = {}
-        self._batch = PipelineBatch(dry_run=dry_run, max_batch=50, batch_delay=0.15) if not _HUB_AVAILABLE else None
+        self._batch = PipelineBatch(dry_run=dry_run, max_batch=50, batch_delay=0.15) if (not _HUB_AVAILABLE and _PIPELINE_BATCH_AVAILABLE) else None
 
     def download_csv(self, season, league_code):
         """Download CSV for a season+league from football-data.co.uk. 3 попытки."""
@@ -808,19 +843,17 @@ class FootballDataCollector:
                 if attempt < 2:
                     wait = 3 * (attempt + 1)
                     print(f"  [RETRY] HTTP {e.code} for {url}, ждём {wait}s...")
-                    import time as _time
-                    _time.sleep(wait)
+                    time.sleep(wait)
                     continue
-                print(f"  [ERROR] HTTP {e.code} for {url}")
+                logger.error(f"HTTP {e.code} for {url}")
                 return None
             except (urllib.error.URLError, OSError) as e:
                 if attempt < 2:
                     wait = 3 * (attempt + 1)
                     print(f"  [RETRY] {e} for {url}, ждём {wait}s...")
-                    import time as _time
-                    _time.sleep(wait)
+                    time.sleep(wait)
                     continue
-                print(f"  [ERROR] {e} for {url}")
+                logger.error(f"Error {e} for {url}")
                 return None
         return None
 
@@ -850,7 +883,7 @@ class FootballDataCollector:
                 payload = build_payload(row, season, league_code, run_id=self.run_id)
             except Exception as e:
                 self.errors += 1
-                print(f"    [PARSE ERROR] {e}")
+                logger.error(f"Parse error: {e}")
                 continue
 
             if payload is None:
@@ -882,7 +915,7 @@ class FootballDataCollector:
                 )
             except Exception as e:
                 self.errors += 1
-                print(f"    [WRITE ERROR] {e}")
+                logger.error(f"Write error: {e}")
                 continue
 
             count += 1
@@ -912,28 +945,33 @@ class FootballDataCollector:
         self._flush_meta()
 
     def _flush_meta(self):
-        """Write accumulated meta. v7.0: вызывается после каждой лиги."""
+        """Write accumulated meta. v7.0: вызывается после каждой лиги (crash-safe).
+        Использует save_meta из хаба (§1.27), не upsert_match (meta — не матч)."""
         if not self._meta_entries:
             return
         key = "football_data:meta"
+        data = json.dumps(self._meta_entries, ensure_ascii=False)
         if _HUB_AVAILABLE:
-            # Через хаб
             try:
-                upsert_match(
-                    {"canonical_id": "football_data:meta", "meta": self._meta_entries},
-                    source=SOURCE_NAME,
-                    idempotency_key=f"{self.run_id}:meta",
-                    dry_run=self.dry_run,
-                )
+                from gatekeeper_hub import save_meta as _hub_save_meta
+                _hub_save_meta(SOURCE_NAME, **self._meta_entries.get(
+                    list(self._meta_entries.keys())[-1], {}
+                ))
             except Exception:
-                # Fallback на прямой SET
-                if self._batch:
-                    self._batch.add("SET", key, json.dumps(self._meta_entries, ensure_ascii=False))
-                    self._batch.flush()
+                # Fallback на прямой SET через redis_hub
+                try:
+                    from redis_hub import set_key
+                    if not self.dry_run:
+                        set_key(key, data)
+                except Exception as e:
+                    logger.error(f"flush_meta fallback failed: {e}")
         else:
-            if self._batch:
-                self._batch.add("SET", key, json.dumps(self._meta_entries, ensure_ascii=False))
-                self._batch.flush()
+            try:
+                from redis_hub import set_key
+                if not self.dry_run:
+                    set_key(key, data)
+            except Exception as e:
+                logger.error(f"flush_meta failed: {e}")
 
     def flush_remaining(self):
         """Финальный flush для fallback batch."""
