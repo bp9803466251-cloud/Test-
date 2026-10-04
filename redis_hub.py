@@ -3,21 +3,36 @@ redis_hub.py — Транспортный слой GatekeeperAI.
 Реализация на базе встроенной urllib.request (правило 1.3).
 Circuit Breaker: 10 ошибок → 60с → авто-восстановление (правило 1.9).
 Конверт v700-prod для live-данных (§6).
+
+Интеграция с redis_config.py:
+  Все параметры (URL, TOKEN, timeout, circuit breaker, hash name, batch size)
+  импортируются из redis_config.py — единой точки конфигурации Redis.
+  Локальные env-чтения удалены — устранён дублирующий код (правило 1.3).
 """
 
-import os
 import json
 import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 
+# ── Конфигурация из redis_config.py (единая точка) ─────────
+from redis_config import (
+    REDIS_REST_URL,
+    REDIS_REST_TOKEN,
+    REDIS_TIMEOUT,
+    REDIS_HASH_NAME,
+    CB_FAILURE_THRESHOLD,
+    CB_RECOVERY_TIMEOUT,
+    REDIS_MAX_PIPELINE,
+)
+
 # ── Константы ──────────────────────────────────────────────
 ENVELOPE_VERSION = "v700-prod"
-HASH_NAME = "GatekeeperAI"
-REDIS_TIMEOUT = 30  # секунд
-CB_THRESHOLD = 10
-CB_RESET_SECONDS = 60
+HASH_NAME = REDIS_HASH_NAME
+REDIS_TIMEOUT = REDIS_TIMEOUT
+CB_THRESHOLD = CB_FAILURE_THRESHOLD
+CB_RESET_SECONDS = CB_RECOVERY_TIMEOUT
 BATCH_SIZE = 50  # для HKEYS + HMGET
 
 MSK_TZ = timezone(timedelta(hours=3))
@@ -69,13 +84,13 @@ def reset_circuit_breaker():
 
 # ── Подключение ─────────────────────────────────────────────
 def _get_redis_url():
-    return os.environ.get("SHARED_UPSTASH_REDIS_REST_URL", 
-                          os.environ.get("UPSTASH_REDIS_REST_URL", ""))
+    """Возвращает URL из redis_config (без env-чтения)."""
+    return REDIS_REST_URL
 
 
 def _get_redis_token():
-    return os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN",
-                          os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""))
+    """Возвращает токен из redis_config (без env-чтения)."""
+    return REDIS_REST_TOKEN
 
 
 def _execute_upstash_cmd(args):
@@ -109,7 +124,7 @@ def _execute_upstash_cmd(args):
             result = json.loads(body)
             _cb_on_success()
             return result.get("result")
-    except (urllib.error.URLError, urllib.error.HTTPError, 
+    except (urllib.error.URLError, urllib.error.HTTPError,
             json.JSONDecodeError, OSError, TimeoutError) as e:
         _cb_on_failure()
         print(f"[REDIS_HUB] Error: {type(e).__name__}: {e}")
