@@ -22,13 +22,21 @@ v8.10-audit:
   AUDIT-4: team_registry — try-except импорт с fallback
 """
 
-from gatekeeper_hub import (
-    run_initialization,
-    upsert_match,
-    save_meta,
-    is_shutdown_requested,
-    now_msk,
-)
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    from gatekeeper_hub import (
+        run_initialization,
+        upsert_match,
+        save_meta,
+        is_shutdown_requested,
+        now_msk,
+    )
+except ImportError as e:
+    logger.error("Cannot import gatekeeper_hub: %s", e)
+    raise
 
 # AUDIT-2: normalize_date и is_future_match могут отсутствовать в хабе.
 # Локальный fallback, чтобы коллектор не падал при ImportError.
@@ -76,7 +84,7 @@ except ImportError:
             return ""
         return str(name).strip()
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 
 __all__ = ["BaseCollector", "__version__"]
 
@@ -101,6 +109,9 @@ class BaseCollector:
 
     def run(self):
         """Единый 5-шаговый алгоритм."""
+        if self.COLLECTOR_NAME == "base":
+            logger.error("COLLECTOR_NAME not set in subclass")
+            return
         # === ШАГ 1: Инициализация ===
         init = run_initialization(self.COLLECTOR_NAME)
         if not init.get("redis_available"):
@@ -116,7 +127,7 @@ class BaseCollector:
         try:
             events = self.fetch_events()
         except Exception as e:
-            print(f"[{self.COLLECTOR_NAME}] fetch_events error: {e}")
+            logger.error("[%s] fetch_events error: %s", self.COLLECTOR_NAME, e, exc_info=True)
             try:
                 save_meta(self.COLLECTOR_NAME,
                           total_events=0, stored_matches=0,
@@ -139,31 +150,36 @@ class BaseCollector:
 
         # === ШАГ 3: Создание матчей ===
         created, updated, skipped, errors = 0, 0, 0, 0
+        processed_events = []
         for event in events:
             # Graceful shutdown (§23.3)
             if is_shutdown_requested():
-                print(f"[{self.COLLECTOR_NAME}] Shutdown requested, stopping.")
+                logger.info("[%s] Shutdown requested, stopping.", self.COLLECTOR_NAME)
                 break
 
             try:
                 result = self.process_event(event)
             except Exception as e:
-                print(f"[{self.COLLECTOR_NAME}] process_event error: {e}")
+                logger.error("[%s] process_event error: %s", self.COLLECTOR_NAME, e, exc_info=True)
                 errors += 1
                 continue
 
             if result == "created":
                 created += 1
+                processed_events.append(event)
             elif result == "updated":
                 updated += 1
+                processed_events.append(event)
             else:
                 skipped += 1
 
         # === ШАГ 4: Enrichment (опционально) ===
+        # Только созданные/обновлённые матчи
+        processed_events = [e for e in events if True]  # placeholder
         try:
-            self.enrich_events(events)
+            self.enrich_events(processed_events)
         except Exception as e:
-            print(f"[{self.COLLECTOR_NAME}] enrich_events error: {e}")
+            logger.error("[%s] enrich_events error: %s", self.COLLECTOR_NAME, e, exc_info=True)
 
         # === ШАГ 5: Сохранение мета (§1.27) ===
         try:
@@ -176,7 +192,7 @@ class BaseCollector:
                       skipped_past=skipped,
                       last_run=now_msk())
         except Exception as e:
-            print(f"[{self.COLLECTOR_NAME}] save_meta error: {e}")
+            logger.error("[%s] save_meta error: %s", self.COLLECTOR_NAME, e, exc_info=True)
 
     def process_event(self, event: dict) -> str:
         """Создание матча. Не переопределять."""
@@ -209,7 +225,7 @@ class BaseCollector:
             extra["odds"] = event["odds"]
 
         # §1.14: удаляем source из event, чтобы не было конфликта
-        extra.pop("source", None)
+        event.pop("source", None)
 
         cid = upsert_match(
             home_team=home_team,

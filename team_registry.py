@@ -8,6 +8,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["TEAM_ALIASES", "clean_team_name", "normalize_team_name", "build_canonical_id", "__version__"]
+
 # ── TEAM_ALIASES — 257+ записей ─────────────────────────────
 TEAM_ALIASES = {
     # England
@@ -685,8 +687,8 @@ TEAM_ALIASES = {
     "mjalby": "mjalby",
     "mjalby aif": "mjalby",
     "gais": "gais",
-    "goteborg": "gais",
-    "ifk goteborg": "gais",
+    "goteborg": "ifk_goteborg",
+    "ifk goteborg": "ifk_goteborg",
     "sirius": "sirius",
     "ik sirius": "sirius",
     "brostrop": "brostrop",
@@ -918,6 +920,14 @@ def build_canonical_id(home: str, away: str, date_str: str) -> str:
         return ""
 
 
-__version__ = "8.10-patched"
 
-__all__ = ["TEAM_ALIASES", "clean_team_name", "build_canonical_id", "__version__"]
+def normalize_team_name(name: str) -> str:
+    """
+    Синоним для clean_team_name.
+    Коллекторы (odds_api, bzzoiro) импортируют normalize_team_name.
+    """
+    return clean_team_name(name)
+
+__version__ = "8.11-patched"
+
+# __all__ moved to top
