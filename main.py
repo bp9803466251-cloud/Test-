@@ -16,6 +16,15 @@ Value engine + Telegram-дашборд по стандарту §12.
   FIX-8: Ecosystem marker: "!" при Redis-down (был всегда "+").
   FIX-9: __version__, __all__ добавлены.
   FIX-10: save_search_results — расширенный payload (hot/warm детали, stats).
+
+Аудит-патчи:
+  AUDIT-1: VALUE_THRESHOLD вместо VALUE_BET_THRESHOLD (workflow передаёт VALUE_THRESHOLD).
+  AUDIT-2: TELEGRAM_CHAT_ID вместо TELEGRAM_GROUP_ID (workflow передаёт TELEGRAM_CHAT_ID).
+  AUDIT-3: _split_message — балансировка HTML-тегов (предотвращает отклонение Telegram).
+  AUDIT-4: _fmt_odds — защита от str/None (value_engine может вернуть строку).
+  AUDIT-5: _send_one — retry на network errors (ConnectionRefused, Timeout).
+  AUDIT-6: _ecosystem_line — skip get_from_cache при Redis-down (4 лишних запроса).
+  AUDIT-7: Удалены dead imports (get_history, get_current_odds, get_all_odds, urllib.parse).
 """
 import os
 import sys
@@ -24,7 +33,6 @@ import time
 import html
 import logging
 import urllib.request
-import urllib.parse
 import urllib.error
 from datetime import datetime, timezone, timedelta
 
@@ -32,9 +40,6 @@ from gatekeeper_hub import (
     run_initialization,
     get_matches_by_date_range,
     get_match,
-    get_history,
-    get_current_odds,
-    get_all_odds,
     save_search_results,
     save_analysis,
     save_meta,
@@ -53,10 +58,10 @@ __version__ = "8.10-patched"
 __all__ = ["main", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
-VALUE_THRESHOLD = float(os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
+VALUE_THRESHOLD = float(os.environ.get("VALUE_THRESHOLD", "") or os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_GROUP_ID", "")
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "") or os.environ.get("TELEGRAM_GROUP_ID", "")
 TG_MAX_CHARS = 4000
 
 
@@ -108,7 +113,19 @@ def _send_one(text: str) -> bool:
         logging.warning(f"HTTP {e.code}: {body[:200]}")
         return False
     except Exception as e:
-        logging.warning(f"Ошибка: {e}")
+        # FIX-AUDIT: Retry на network errors (ConnectionRefused, Timeout)
+        if not hasattr(_send_one, "_retry_count"):
+            _send_one._retry_count = 0
+        if _send_one._retry_count < 2:
+            _send_one._retry_count += 1
+            delay = 2 ** _send_one._retry_count
+            logging.warning(f"Network error, retry {_send_one._retry_count}/2 после {delay}с: {e}")
+            time.sleep(delay)
+            result = _send_one(text)
+            _send_one._retry_count = 0
+            return result
+        _send_one._retry_count = 0
+        logging.warning(f"Ошибка отправки (нет retry): {e}")
         return False
 
 
@@ -139,7 +156,24 @@ def _split_message(text: str, max_chars: int) -> list:
             current += line + "\n"
     if current:
         parts.append(current)
-    return parts
+    # FIX-AUDIT: Балансировка HTML-тегов в каждой части
+    _HTML_TAGS = ("b", "i", "u", "s", "code", "pre")
+    balanced_parts = []
+    open_tags = []
+    for part in parts:
+        for tag in _HTML_TAGS:
+            open_count = part.lower().count(f"<{tag}>")
+            close_count = part.lower().count(f"</{tag}>")
+            if open_count > close_count:
+                for _ in range(open_count - close_count):
+                    part += f"</{tag}>"
+            elif close_count > open_count:
+                prefix = ""
+                for _ in range(close_count - open_count):
+                    prefix = f"<{tag}>" + prefix
+                part = prefix + part
+        balanced_parts.append(part)
+    return balanced_parts
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +186,14 @@ def _ecosystem_line() -> str:
     eco_marker = "+" if _redis_available else "!"
     redis_marker = "+" if _redis_available else "-"
     markers = [f"Ecosystem{eco_marker}", f"Redis{redis_marker}"]
+    # FIX-AUDIT: Skip get_from_cache когда Redis недоступен
+    if not _redis_available:
+        markers.extend(["Bzzoiro-", "Sharp-", "PropLine-", "OddsAPI-"])
+        if os.environ.get("SHARPAPI_FLUSH_OLD") == "1":
+            markers.append("Flush\U0001f9f9")
+        else:
+            markers.append("Flush+")
+        return " | ".join(markers)
     for name, meta_key in [
         ("Bzzoiro", "bzzoiro:meta"),
         ("Sharp", "sharpapi:meta"),
@@ -208,7 +250,12 @@ def _last_module() -> str:
 # ---------------------------------------------------------------------------
 # Форматирование (§12 — HTML bold tags)
 # ---------------------------------------------------------------------------
-def _fmt_odds(o: float) -> str:
+def _fmt_odds(o) -> str:
+    """Форматирование коэффициента. FIX-AUDIT: защита от str/None."""
+    try:
+        o = float(o)
+    except (TypeError, ValueError):
+        return str(o) if o else "0"
     s = f"{o:.2f}".rstrip("0").rstrip(".")
     return s if s else "0"
 
