@@ -12,26 +12,73 @@ v8.10-patched:
   FIX-6: is_shutdown_requested в цикле (§23.3)
   FIX-7: source ключ удаляется из event перед **extra (§1.14)
   FIX-8: try-except в run() для save_meta при падении Redis
-  FIX-9: удалены неиспользуемые импорты (time, patch_match, now_msk)
-  FIX-10: __version__
-"""
+  FIX-9: удалены неиспользуемые импорты (time)
+  FIX-10: __version__, __all__
 
-import time
+v8.10-audit:
+  AUDIT-1: import time удалён (не используется)
+  AUDIT-2: normalize_date, is_future_match — try-except импорт с fallback
+  AUDIT-3: __all__ расширен: BaseCollector, __version__
+  AUDIT-4: team_registry — try-except импорт с fallback
+"""
 
 from gatekeeper_hub import (
     run_initialization,
     upsert_match,
     save_meta,
-    normalize_date,
-    is_future_match,
     is_shutdown_requested,
     now_msk,
 )
-from team_registry import clean_team_name
+
+# AUDIT-2: normalize_date и is_future_match могут отсутствовать в хабе.
+# Локальный fallback, чтобы коллектор не падал при ImportError.
+try:
+    from gatekeeper_hub import normalize_date
+except ImportError:
+    from datetime import datetime, timezone, timedelta
+    _MSK = timezone(timedelta(hours=3))
+
+    def normalize_date(raw):
+        """Fallback: нормализация даты в ISO формат МСК."""
+        if not raw:
+            return ""
+        try:
+            if isinstance(raw, str) and "T" in raw:
+                return raw
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            return dt.astimezone(_MSK).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+        except Exception:
+            return str(raw)
+
+try:
+    from gatekeeper_hub import is_future_match
+except ImportError:
+    from datetime import datetime, timezone, timedelta
+    _MSK = timezone(timedelta(hours=3))
+
+    def is_future_match(date_str):
+        """Fallback: проверка, что матч в будущем."""
+        if not date_str:
+            return False
+        try:
+            dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+            return dt > datetime.now(_MSK)
+        except Exception:
+            return True  # лучше обработать, чем пропустить
+
+# AUDIT-4: team_registry может отсутствовать — fallback на простую нормализацию
+try:
+    from team_registry import clean_team_name
+except ImportError:
+    def clean_team_name(name):
+        """Fallback: простая нормализация имени команды."""
+        if not name:
+            return ""
+        return str(name).strip()
 
 __version__ = "8.10-patched"
 
-__all__ = ["BaseCollector"]
+__all__ = ["BaseCollector", "__version__"]
 
 
 class BaseCollector:
