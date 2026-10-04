@@ -5,8 +5,16 @@ gatekeeper_config.py — Единая конфигурация GatekeeperAI (§2
 """
 
 import os
-import yaml
+import logging
+try:
+    import yaml
+except ImportError:
+    yaml = None
 from datetime import datetime, timezone, timedelta
+
+__version__ = "8.10-patched"
+
+logger = logging.getLogger(__name__)
 
 # ── Константы ──────────────────────────────────────────────
 MSK_TZ = timezone(timedelta(hours=3))
@@ -45,11 +53,22 @@ def load_config(reload=False):
     config = {}
 
     # Загрузка YAML
-    try:
-        with open("gatekeeper_config.yaml", "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-    except (FileNotFoundError, yaml.YAMLError):
+    if yaml is None:
+        logger.info("PyYAML not installed, using defaults only")
         config = {}
+    else:
+        try:
+            with open("gatekeeper_config.yaml", "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            logger.warning("gatekeeper_config.yaml not found, using defaults")
+            config = {}
+        except yaml.YAMLError as e:
+            logger.error("gatekeeper_config.yaml parse error: %s", e)
+            config = {}
+        except Exception as e:
+            logger.error("gatekeeper_config.yaml error: %s", e)
+            config = {}
 
     # Fallback значения
     if "collectors" not in config:
@@ -86,8 +105,8 @@ def reload_config():
     for cb in _RELOAD_CALLBACKS:
         try:
             cb()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Reload callback failed: %s", e, exc_info=True)
     return config
 
 
@@ -103,18 +122,31 @@ def get_env():
 
 
 # ── Feature flags ──────────────────────────────────────────
+# Фичи, которые включены по умолчанию
+_FEATURE_DEFAULTS = {
+    "graceful_shutdown": True,
+    "auto_migrate": True,
+}
+
+
 def is_feature_enabled(feature_name):
     """
     Проверка включённости фича-флага (§24.3).
     Принимает 1 аргумент (FIX-7).
+    Если флаг отсутствует в конфиге — используется значение по умолчанию.
     """
     config = load_config()
     features = config.get("features", {})
-    return features.get(feature_name, False)
+    if feature_name in features:
+        return features[feature_name]
+    return _FEATURE_DEFAULTS.get(feature_name, False)
 
 
 # ── Cleanup ─────────────────────────────────────────────────
-_CLEANUP_OWNERS = {"sharpapi", "odds_api", "bzzoiro", "propline", "main", "self_test"}
+_CLEANUP_OWNERS = {
+    "sharpapi", "odds_api", "bzzoiro", "propline",
+    "football_data", "main", "self_test",
+}
 
 
 def should_run_cleanup(collector):
@@ -124,6 +156,29 @@ def should_run_cleanup(collector):
     Все live-коллекторы являются cleanup owners.
     """
     return collector in _CLEANUP_OWNERS
+
+
+# ── Value threshold ────────────────────────────────────────
+# FIX: value_engine.py импортирует VALUE_THRESHOLD отсюда.
+# Приоритет: config → ENV → default 0.03
+def _get_value_threshold():
+    config = load_config()
+    cfg_val = config.get("value", {}).get("threshold")
+    if cfg_val is not None:
+        try:
+            return float(cfg_val)
+        except (TypeError, ValueError):
+            pass
+    env_val = os.environ.get("VALUE_THRESHOLD", "") or os.environ.get("VALUE_BET_THRESHOLD", "")
+    if env_val:
+        try:
+            return float(env_val)
+        except (TypeError, ValueError):
+            pass
+    return 0.03
+
+
+VALUE_THRESHOLD = _get_value_threshold()
 
 
 # ── Ошибки конфигурации ─────────────────────────────────────
@@ -140,6 +195,14 @@ def get_config_errors():
        not os.environ.get("UPSTASH_REDIS_REST_TOKEN"):
         errors.append("SHARED_UPSTASH_REDIS_REST_TOKEN not set")
 
+    # Проверка value threshold
+    try:
+        vt = float(config.get("value", {}).get("threshold", 0.03))
+        if vt <= 0 or vt > 1:
+            errors.append(f"value.threshold out of range: {vt}")
+    except (TypeError, ValueError):
+        errors.append("value.threshold is not a valid number")
+
     return errors
 
 
@@ -148,4 +211,5 @@ __all__ = [
     "load_config", "reload_config", "register_reload_callback",
     "get_env", "is_feature_enabled",
     "should_run_cleanup", "get_config_errors",
+    "VALUE_THRESHOLD", "__version__",
 ]
