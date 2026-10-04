@@ -2,7 +2,7 @@ name: Collector OddsAPI
 
 on:
   schedule:
-    - cron: "*/15 * * * *"       # каждые 15 минут
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -32,7 +32,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          cache: pip
 
       - name: Install dependencies
         run: |
