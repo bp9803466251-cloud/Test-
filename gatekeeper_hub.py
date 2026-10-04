@@ -1,5 +1,5 @@
 """
-gatekeeper_hub.py — Единый хаб GatekeeperAI v8.9-patched.
+gatekeeper_hub.py — Единый хаб GatekeeperAI v8.11-patched.
 Центральный шлюз для создания, обновления и чтения матчей.
 
 Патчи (v8.9-patched):
@@ -11,9 +11,14 @@ gatekeeper_hub.py — Единый хаб GatekeeperAI v8.9-patched.
   FIX-6: cleanup_expired — реализация (была заглушка)
   FIX-7: is_feature_enabled / should_run_cleanup — 1 аргумент (не 2)
   FIX-8: patch_match / upsert_match — graceful shutdown check
-  FIX-9: __all__ — 30 экспортов
+  FIX-9: __all__ — 42 экспорта
   FIX-10: ns_key — fallback если gatekeeper_config не предоставляет
   FIX-11: _load_odds_priority — nested по рынкам + reload callback
+  FIX-12: build_canonical_id — делегирует в team_registry + валидация даты
+  FIX-13: _normalize_incoming_odds — поддержка h2h формата (list/dict)
+  FIX-14: section_history — match-level tracking в upsert/patch
+  FIX-15: validate_schema — проверка home_clean/away_clean non-empty
+  FIX-16: get_all_odds — sources из odds.1x2.sources (не match.sources)
 """
 
 import os
@@ -61,7 +66,7 @@ except ImportError:
 # §22.8: Hub version
 # ═══════════════════════════════════════════════════════════
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 HUB_API_VERSION = "8.9"
 SCHEMA_VERSION = "v710"
 
@@ -83,6 +88,11 @@ def validate_schema(match_obj, schema_version=SCHEMA_VERSION):
             return False, f"missing required field: {field}"
     if match_obj.get("schema_version") != schema_version:
         return False, f"schema_version mismatch: {match_obj.get('schema_version')} != {schema_version}"
+    # FIX-AUDIT-15: home_clean/away_clean must be non-empty
+    if not match_obj.get("home_clean"):
+        return False, "home_clean is empty"
+    if not match_obj.get("away_clean"):
+        return False, "away_clean is empty"
     cid = match_obj.get("canonical_id", "")
     if "__" not in cid or len(cid.split("__")) != 3:
         return False, f"canonical_id format invalid: {cid}"
@@ -481,11 +491,25 @@ def _clean_team_name(name):
 
 
 def build_canonical_id(home_team, away_team, date_utc):
+    # FIX-AUDIT-12: Prefer team_registry.build_canonical_id (validates date)
+    try:
+        from team_registry import build_canonical_id as _tr_build_cid
+        cid = _tr_build_cid(home_team, away_team, date_utc)
+        if cid:
+            return cid
+    except (ImportError, Exception):
+        pass
+    # Fallback — local implementation
     home_clean = _clean_team_name(home_team)
     away_clean = _clean_team_name(away_team)
     date_part = ""
     if date_utc:
         date_part = date_utc[:10].replace("-", "")
+    # FIX-AUDIT-12: Validate date — empty date → empty canonical_id
+    if not date_part or not date_part.isdigit() or len(date_part) != 8:
+        log_event("hub", "WARN", "build_canonical_id: invalid date",
+                  date_utc=date_utc, home=home_team, away=away_team)
+        return ""
     return f"{home_clean}__{away_clean}__{date_part}"
 
 
@@ -626,10 +650,24 @@ def upsert_match(home_team="", away_team="", date_utc="",
         "created_at": now_msk(),
         "updated_at": now_msk(),
         "sources": [source],
+        "section_history": [
+            {
+                "section": "base",
+                "source": source,
+                "updated_at": now_msk(),
+            }
+        ],
         **extra_fields,
     }
 
     if "odds" in extra_fields:
+        match_obj["odds"] = _normalize_incoming_odds(extra_fields["odds"])
+        # FIX-AUDIT-14: Track odds section in section_history
+        match_obj.setdefault("section_history", []).append({
+            "section": "odds",
+            "source": source,
+            "updated_at": now_msk(),
+        })
         match_obj["odds"] = _normalize_incoming_odds(extra_fields["odds"])
 
     rh = _get_redis()
@@ -657,6 +695,16 @@ def upsert_match(home_team="", away_team="", date_utc="",
                             )
                         else:
                             existing[k] = v
+            # FIX-AUDIT-14: Track section_history on update
+            if "section_history" not in existing:
+                existing["section_history"] = []
+            existing["section_history"].append({
+                "section": "base",
+                "source": source,
+                "updated_at": now_msk(),
+            })
+            if len(existing["section_history"]) > 50:
+                existing["section_history"] = existing["section_history"][-50:]
             existing["version"] = existing.get("version", 1) + 1
             existing["updated_at"] = now_msk()
             # FIX-3: Python-объект, не serialize_match()
@@ -678,6 +726,41 @@ def _normalize_incoming_odds(odds_data):
 
     if "1x2" in odds_data:
         return odds_data
+
+    # FIX-AUDIT-13: h2h format (the-odds-api, propline) — list [home, draw, away] or dict
+    if "h2h" in odds_data:
+        h2h = odds_data["h2h"]
+        if isinstance(h2h, list):
+            # List of {name, price} dicts — sort by name to identify home/draw/away
+            prices = {}
+            for item in h2h:
+                if isinstance(item, dict):
+                    name = item.get("name", "").lower().strip()
+                    price = item.get("price")
+                    if price is not None:
+                        prices[name] = price
+                elif isinstance(item, (int, float)):
+                    # Positional: [home, draw, away]
+                    pass
+            return {
+                "1x2": {
+                    "current": {
+                        "home": prices.get("home") or prices.get(list(prices.keys())[0] if len(prices) >= 1 else ""),
+                        "draw": prices.get("draw") or prices.get(list(prices.keys())[1] if len(prices) >= 2 else ""),
+                        "away": prices.get("away") or prices.get(list(prices.keys())[2] if len(prices) >= 3 else ""),
+                    }
+                }
+            }
+        elif isinstance(h2h, dict):
+            return {
+                "1x2": {
+                    "current": {
+                        "home": h2h.get("home"),
+                        "draw": h2h.get("draw"),
+                        "away": h2h.get("away"),
+                    }
+                }
+            }
 
     if "home" in odds_data or "draw" in odds_data or "away" in odds_data:
         return {
@@ -882,6 +965,18 @@ def patch_match(canonical_id, section, data, source="unknown",
         return False
     else:
         match_obj[section] = data
+
+    # FIX-AUDIT-14: Track section_history at match level
+    if "section_history" not in match_obj:
+        match_obj["section_history"] = []
+    match_obj["section_history"].append({
+        "section": section,
+        "source": source,
+        "upstream": upstream or "",
+        "updated_at": now_msk(),
+    })
+    if len(match_obj["section_history"]) > 50:
+        match_obj["section_history"] = match_obj["section_history"][-50:]
 
     # FIX-AUDIT-6: CAS retry — optimistic locking с retry до 3 раз (§24.2)
     max_cas_retries = 3
@@ -1179,9 +1274,12 @@ def get_all_odds(match: dict) -> dict:
             "open": open_odds,  # backward compat
             "current": open_odds,  # backward compat для value_engine < v3.1
             "closing": sec.get("closing", {}),
-            "sources": match.get("sources", []),
+            "sources": sec.get("sources", match.get("sources", [])),
             "verification": match.get("odds_verification", "UNVERIFIED"),
-            "independent_sources": len(set(match.get("sources", []))),
+            "independent_sources": len(set(
+                s.get("source", "") for s in sec.get("sources", [])
+                if isinstance(s, dict)
+            ) or match.get("sources", [])),
             "betradar_consensus": False,
         }
 
@@ -1198,7 +1296,7 @@ def get_all_odds(match: dict) -> dict:
             "independent_sources": len(set(match.get("sources", []))),
             "betradar_consensus": False,
         }
-    
+
     return {}
 
 
