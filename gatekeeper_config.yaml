@@ -11,6 +11,7 @@ collectors:
   odds_api:
     rate_delay: 0.5
     max_retries: 3
+    timeout: 30
     regions: ["eu", "uk"]
     markets: ["h2h", "spreads", "totals"]
     odds_format: "decimal"
@@ -18,9 +19,14 @@ collectors:
     rate_delay: 2.0
     enrich_delay: 1.0
     max_retries: 5
+    timeout: 30
   propline:
     rate_delay: 1.5
     max_retries: 3
+    timeout: 30
+
+# §20.3: odds_priority импортируется из отдельного файла, не дублируется здесь
+odds_priority: !include odds_priority.yaml
 
 redis:
   read_timeout: 30
@@ -35,9 +41,9 @@ cleanup:
   index_lookahead_days: 7
 
 features:
-  graceful_shutdown: true
-  auto_migrate: true
-  schema_validation: true
+  graceful_shutdown: true      # §23.3 — is_shutdown_requested()
+  auto_migrate: true            # §20.5 — cleanup_expired(auto_migrate=True)
+  schema_validation: true       # §19.6 — validate_schema() перед записью
 
 upstream_map:
   sharpapi: betradar
