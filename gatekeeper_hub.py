@@ -1062,7 +1062,7 @@ def save_meta(collector, **kwargs):
     if not rh:
         return
 
-    key = ns_key(collector, "meta")
+    key = f"meta:{collector}"  # FIX-17: meta key format "meta:{collector}"
 
     meta = {
         "last_run": now_msk(),
