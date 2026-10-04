@@ -24,10 +24,9 @@ import urllib.error
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [ODDS_API] %(message)s'
-)
+logger = logging.getLogger("odds_api")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
@@ -49,9 +48,9 @@ except ImportError:
         return False
 
 try:
-    from team_registry import normalize_team_name, build_canonical_id
+    from team_registry import normalize_team_name, build_canonical_id, clean_team_name
 except ImportError:
-    logging.error("team_registry не найден")
+    logger.error("team_registry не найден")
     normalize_team_name = lambda x: x.strip().lower() if x else ""
     build_canonical_id = lambda h, a, d: f"{h}__{a}__{d[:10].replace('-','')}"
 
@@ -60,7 +59,7 @@ COLLECTOR_NAME = "odds_api"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 DAYS_AHEAD = int(os.environ.get("ODDS_API_DAYS_AHEAD", "3"))
 
-__version__ = "700.2"
+__version__ = "8.11-patched"
 __all__ = [
     "collect_odds_api",
     "collect_and_process",
@@ -79,15 +78,15 @@ def _fetch_odds_api(url: str, max_retries: int = 1) -> Optional[dict]:
                 return {"data": data, "quota_remaining": remaining, "quota_used": used}
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                logging.warning("HTTP 429 — Rate Limit. Прерываем запросы, переходим на кэш.")
+                logger.warning("HTTP 429 — Rate Limit. Прерываем запросы, переходим на кэш.")
                 return None
-            logging.warning(f"HTTP {e.code}: {e.reason}")
+            logger.warning(f"HTTP {e.code}: {e.reason}")
             if attempt < max_retries:
                 time.sleep(2)
                 continue
             return None
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-            logging.warning(f"Request error: {e}")
+            logger.warning(f"Request error: {e}")
             if attempt < max_retries:
                 time.sleep(2)
                 continue
@@ -109,14 +108,14 @@ def _normalize_odds_value(val) -> Optional[float]:
 def collect_odds_api() -> Dict[str, Any]:
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
-        logging.error("ODDS_API_KEY не задан")
+        logger.error("ODDS_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     dry_run = os.environ.get("DRY_RUN", "0") == "1"
     
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     if not init_metrics.get("redis_available", False):
-        logging.error("Redis недоступен")
+        logger.error("Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     run_id = init_metrics.get("run_id", "")
@@ -131,12 +130,12 @@ def collect_odds_api() -> Dict[str, Any]:
     sports_url = f"{ODDS_API_BASE}/sports/?apiKey={api_key}"
     sports_data = _fetch_odds_api(sports_url, max_retries=max_retries)
     if sports_data is None:
-        logging.error("Не удалось получить список спортов")
+        logger.error("Не удалось получить список спортов")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1, "run_id": run_id}
 
     sports = sports_data.get("data", [])
     football_sports = [s for s in sports if s.get("group") == "Soccer" and s.get("active", True)]
-    logging.info(f"Активных футбольных лиг: {len(football_sports)}")
+    logger.info(f"Активных футбольных лиг: {len(football_sports)}")
 
     stored = 0
     created = 0
@@ -150,7 +149,7 @@ def collect_odds_api() -> Dict[str, Any]:
 
     for sport in football_sports:
         if is_shutdown_requested():
-            logging.info("Graceful shutdown — прерываем цикл спортов")
+            logger.info("Graceful shutdown — прерываем цикл спортов")
             break
 
         sport_key = sport.get("key", "")
@@ -172,7 +171,7 @@ def collect_odds_api() -> Dict[str, Any]:
         events = odds_data.get("data", [])
         for ev in events:
             if is_shutdown_requested():
-                logging.info("Graceful shutdown — прерываем цикл матчей")
+                logger.info("Graceful shutdown — прерываем цикл матчей")
                 break
 
             home_team_raw = ev.get("home_team", "")
@@ -237,7 +236,6 @@ def collect_odds_api() -> Dict[str, Any]:
 
             # 1. Создать матч (с sources)
             if dry_run:
-                total_events += 1
                 stored += 1
                 created += 1
                 continue
@@ -262,12 +260,14 @@ def collect_odds_api() -> Dict[str, Any]:
                 else:
                     created += 1
 
-                # 2. Patch odds как float
-                odds_current = {
-                    "home": odds_home,
-                    "draw": odds_draw,
-                    "away": odds_away,
-                }
+                # 2. Patch odds как float — только не-None значения
+                odds_current = {}
+                if odds_home is not None:
+                    odds_current["home"] = float(odds_home)
+                if odds_draw is not None:
+                    odds_current["draw"] = float(odds_draw)
+                if odds_away is not None:
+                    odds_current["away"] = float(odds_away)
                 idempotency_key = f"{run_id}:{cid}:odds"
                 patch_match(cid, "odds", {"current": odds_current},
                            source=COLLECTOR_NAME, upstream="betradar",
@@ -275,7 +275,7 @@ def collect_odds_api() -> Dict[str, Any]:
 
         time.sleep(rate_delay)
 
-    logging.info(f"Получено матчей: {total_events}, записано: {stored}, "
+    logger.info(f"Получено матчей: {total_events}, записано: {stored}, "
                  f"прошлое: {skipped_past}, будущее: {skipped_future}")
 
     meta = {
@@ -308,7 +308,7 @@ if __name__ == "__main__":
                         help="Не писать в Redis (dry-run)")
     args = parser.parse_args()
     if args.dry_run:
-        logging.info("[ODDS_API] DRY-RUN mode")
+        logger.info("[ODDS_API] DRY-RUN mode")
         os.environ["DRY_RUN"] = "1"
     result = collect_odds_api()
-    logging.info(f"Result: {result}")
+    logger.info(f"Result: {result}")

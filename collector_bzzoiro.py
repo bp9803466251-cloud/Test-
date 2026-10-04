@@ -29,10 +29,9 @@ from collections import defaultdict
 
 import requests
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [BZZOIRO] %(message)s'
-)
+logger = logging.getLogger("bzzoiro")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 try:
     from gatekeeper_hub import (
@@ -44,10 +43,9 @@ try:
         is_future_match,
         now_msk,
         save_meta,
-        build_canonical_id,
     )
 except ImportError:
-    logging.error("gatekeeper_hub не найден")
+    logger.error("gatekeeper_hub не найден")
     sys.exit(1)
 
 try:
@@ -57,9 +55,9 @@ except ImportError:
         return False
 
 try:
-    from team_registry import normalize_team_name, build_canonical_id
+    from team_registry import normalize_team_name, build_canonical_id, clean_team_name
 except ImportError:
-    logging.error("team_registry не найден")
+    logger.error("team_registry не найден")
     normalize_team_name = lambda x: x.strip().lower() if x else ""
     build_canonical_id = lambda h, a, d: f"{h}__{a}__{d[:10].replace('-','')}"
 
@@ -78,7 +76,7 @@ PAGE_LIMIT = 200
 
 BZZOIRO_UPSTREAM = "opta"
 
-__version__ = "2.2"
+__version__ = "2.3"
 __all__ = [
     "collect_bzzoiro",
     "collect_and_process",
@@ -111,14 +109,14 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
                 return _NOT_FOUND
             if resp.status_code == 429:
                 wait = 2 ** (attempt + 2)
-                logging.warning(f"Rate limit. Waiting {wait}s")
+                logger.warning(f"Rate limit. Waiting {wait}s")
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
                 if attempt < max_retries:
                     time.sleep(RATE_DELAY * 2)
                     continue
-                logging.error(f"HTTP {resp.status_code}: {url}")
+                logger.error(f"HTTP {resp.status_code}: {url}")
                 return None
 
             data = resp.json()
@@ -130,7 +128,7 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue
-            logging.error(f"Request error: {e}")
+            logger.error(f"Request error: {e}")
             return None
 
 
@@ -262,29 +260,29 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         "Accept": "application/json",
     }
 
-    print("=" * 60)
-    print(f"[BZZOIRO] Collector Bzzoiro v{__version__} started.")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info(f"[BZZOIRO] Collector Bzzoiro v{__version__} started.")
+    logger.info("=" * 60)
 
     dry_run = os.environ.get("DRY_RUN", "0") == "1"
     
-    print("[BZZOIRO] Шаг 0: Инициализация Redis...")
+    logger.info("[BZZOIRO] Шаг 0: Инициализация Redis...")
     # §2.6: передаём collector= для трассировки
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     if not init_metrics or not init_metrics.get("redis_available"):
-        print("[BZZOIRO] ERROR: Redis init failed")
+        logger.info("[BZZOIRO] ERROR: Redis init failed")
         save_meta(COLLECTOR_NAME, stored_matches=0, error_count=1,
                   events_only=events_only, run_id="")
         return {"error": "redis_init_failed"}
 
     run_id = init_metrics.get("run_id", "")
-    print(f"[BZZOIRO] Run ID: {run_id}")
-    print(f"[BZZOIRO] Cleanup: {init_metrics.get('cleanup_count', 0)} ключей удалено")
+    logger.info("[BZZOIRO] Run ID: {run_id}")
+    logger.info("[BZZOIRO] Cleanup: {init_metrics.get('cleanup_count', 0)} ключей удалено")
 
     existing_keys = set(get_all_fields().keys())
 
     # --- Шаг 1: Загрузка событий ---
-    print("[BZZOIRO] Шаг 1: Загрузка событий...")
+    logger.info("[BZZOIRO] Шаг 1: Загрузка событий...")
     now = dt.datetime.now(dt.timezone.utc)
     date_from = now.strftime("%Y-%m-%d")
     date_to = (now + dt.timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
@@ -296,14 +294,14 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     while url:
         # FIX-4: Graceful shutdown
         if _is_shutdown():
-            print("[BZZOIRO] Shutdown requested — остановка загрузки событий")
+            logger.info("[BZZOIRO] Shutdown requested — остановка загрузки событий")
             break
 
         data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
         pages_fetched += 1
 
         if data is None:
-            print(f"[BZZOIRO] Ошибка загрузки страницы {pages_fetched}")
+            logger.info("[BZZOIRO] Ошибка загрузки страницы {pages_fetched}")
             break
         if data is _NOT_FOUND:
             break
@@ -320,7 +318,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
         all_events.extend(items)
         total_count = data.get("count", 0) if isinstance(data, dict) else 0
-        print(f"[BZZOIRO] Загружено: {len(all_events)}/{total_count}")
+        logger.info("[BZZOIRO] Загружено: {len(all_events)}/{total_count}")
 
         if isinstance(data, dict):
             url = data.get("next")
@@ -334,7 +332,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             break
 
     all_events.sort(key=_parse_event_date)
-    print(f"[BZZOIRO] Всего событий: {len(all_events)} (страниц: {pages_fetched})")
+    logger.info("[BZZOIRO] Всего событий: {len(all_events)} (страниц: {pages_fetched})")
 
     # --- Шаг 1.5: Pre-fetch лиг ---
     league_ids = set()
@@ -344,18 +342,18 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             league_ids.add(lid)
 
     if league_ids:
-        print(f"[BZZOIRO] Шаг 1.5: Pre-fetch {len(league_ids)} лиг...")
+        logger.info("[BZZOIRO] Шаг 1.5: Pre-fetch {len(league_ids)} лиг...")
         for lid in league_ids:
             # FIX-4: Graceful shutdown
             if _is_shutdown():
-                print("[BZZOIRO] Shutdown requested — пропуск pre-fetch лиг")
+                logger.info("[BZZOIRO] Shutdown requested — пропуск pre-fetch лиг")
                 break
             _fetch_league_info(lid, headers)
             time.sleep(RATE_DELAY)
-        print(f"[BZZOIRO] Pre-fetch лиг завершён: {len(_league_cache)} в кэше")
+        logger.info("[BZZOIRO] Pre-fetch лиг завершён: {len(_league_cache)} в кэше")
 
     # --- Шаг 2: Запись матчей ---
-    print("[BZZOIRO] Шаг 2: Запись матчей в Redis...")
+    logger.info("[BZZOIRO] Шаг 2: Запись матчей в Redis...")
     stored_matches: list[tuple[str, int, dict]] = []
     created = 0
     updated = 0
@@ -368,7 +366,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     for idx, ev in enumerate(all_events):
         # FIX-4: Graceful shutdown
         if _is_shutdown():
-            print("[BZZOIRO] Shutdown requested — остановка записи матчей")
+            logger.info("[BZZOIRO] Shutdown requested — остановка записи матчей")
             break
 
         bzzoiro_id = ev.get("id")
@@ -407,7 +405,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             continue
 
         if idx < DEBUG_EVENT_COUNT:
-            print(f"[BZZOIRO DEBUG] Событие #{idx}: keys={list(ev.keys())}")  # §1.23: no payload
+            logger.debug("[BZZOIRO DEBUG] Событие #{idx}: keys={list(ev.keys())}")  # §1.23: no payload
 
         league_id = ev.get("league_id")
         league_info = _fetch_league_info(league_id, headers) if league_id else {"name": "", "country": ""}
@@ -441,7 +439,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         else:
             skipped_past += 1
 
-    print(f"[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}")
+    logger.info("[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}")
 
     # --- Шаг 3: Enrichment ---
     odds_enriched = 0
@@ -453,16 +451,16 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     not_found = 0
 
     if events_only:
-        print("[BZZOIRO] Режим events-only — enrichment пропущен")
+        logger.info("[BZZOIRO] Режим events-only — enrichment пропущен")
     elif dry_run:
-        print("[BZZOIRO] DRY-RUN — enrichment пропущен")
+        logger.info("[BZZOIRO] DRY-RUN — enrichment пропущен")
     elif stored_matches:
-        print(f"[BZZOIRO] Шаг 3: Обогащение {len(stored_matches)} матчей...")
+        logger.info("[BZZOIRO] Шаг 3: Обогащение {len(stored_matches)} матчей...")
 
         for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
             # FIX-4: Graceful shutdown
             if _is_shutdown():
-                print("[BZZOIRO] Shutdown requested — остановка enrichment")
+                logger.info("[BZZOIRO] Shutdown requested — остановка enrichment")
                 break
 
             status = ev.get("status", "")
@@ -504,7 +502,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 enrichment_errors += 1
 
             if idx < DEBUG_EVENT_COUNT:
-                print(f"[BZZOIRO DEBUG] Odds #{idx}: {'found' if odds_data is not _NOT_FOUND else 404}")  # §1.23
+                logger.debug("[BZZOIRO DEBUG] Odds #{idx}: {'found' if odds_data is not _NOT_FOUND else 404}")  # §1.23
 
             time.sleep(ENRICH_DELAY)
 
@@ -532,7 +530,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     enrichment_errors += 1
 
                 if idx < DEBUG_EVENT_COUNT:
-                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: {'found' if pred_data is not _NOT_FOUND else 404}")  # §1.23
+                    logger.debug("[BZZOIRO DEBUG] Prediction #{idx}: {'found' if pred_data is not _NOT_FOUND else 404}")  # §1.23
 
                 time.sleep(ENRICH_DELAY)
 
@@ -595,15 +593,15 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 time.sleep(ENRICH_DELAY)
 
             if (idx + 1) % 50 == 0:
-                print(f"[BZZOIRO] Обогащение: {idx + 1}/{len(stored_matches)} (odds={odds_enriched}, pred={pred_enriched}, stats={stats_enriched}, h2h={h2h_enriched}, score={score_enriched})")
+                logger.info("[BZZOIRO] Обогащение: {idx + 1}/{len(stored_matches)} (odds={odds_enriched}, pred={pred_enriched}, stats={stats_enriched}, h2h={h2h_enriched}, score={score_enriched})")
 
     # --- Итоги ---
     shutdown_triggered = _is_shutdown()
-    print(f"[BZZOIRO] Готово: матчей {len(stored_matches)} (создано {created}, обновлено {updated})")
-    print(f"[BZZOIRO]   Odds: {odds_enriched}, Predictions: {pred_enriched}, Stats: {stats_enriched}, H2H: {h2h_enriched}, Score: {score_enriched}")
-    print(f"[BZZOIRO]   Ошибки: {enrichment_errors}, Not Found: {not_found}")
+    logger.info("[BZZOIRO] Готово: матчей {len(stored_matches)} (создано {created}, обновлено {updated})")
+    logger.info("[BZZOIRO]   Odds: {odds_enriched}, Predictions: {pred_enriched}, Stats: {stats_enriched}, H2H: {h2h_enriched}, Score: {score_enriched}")
+    logger.info("[BZZOIRO]   Ошибки: {enrichment_errors}, Not Found: {not_found}")
     if shutdown_triggered:
-        print("[BZZOIRO]   ⚠ Shutdown был запрошен — данные могут быть неполными")
+        logger.info("[BZZOIRO]   ⚠ Shutdown был запрошен — данные могут быть неполными")
 
     result = {
         "last_run": now_msk(),
@@ -630,7 +628,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         "no_date": no_date_count,
         "shutdown_triggered": shutdown_triggered,
     }
-    print(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
+    logger.info("[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
 
     save_meta(COLLECTOR_NAME,
               last_run=now_msk(),
@@ -670,7 +668,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
-        print("[BZZOIRO] DRY-RUN mode — данные НЕ будут записаны в Redis")
+        logger.info("[BZZOIRO] DRY-RUN mode — данные НЕ будут записаны в Redis")
 
     result = collect_bzzoiro(events_only=args.events_only)
-    print(f"[BZZOIRO] Result: {result}")
+    logger.info("[BZZOIRO] Result: {result}")

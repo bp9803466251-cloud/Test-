@@ -25,10 +25,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [PROPLINE] %(message)s'
-)
+logger = logging.getLogger("propline")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 # ── gatekeeper_hub ─────────────────────────────────────────
 try:
@@ -42,7 +41,7 @@ try:
         save_meta,
     )
 except ImportError:
-    logging.error("gatekeeper_hub не найден")
+    logger.error("gatekeeper_hub не найден")
     sys.exit(1)
 
 # Graceful shutdown — §2.3
@@ -56,7 +55,7 @@ except ImportError:
 try:
     from team_registry import clean_team_name
 except ImportError:
-    logging.error("team_registry не найден — clean_team_name fallback")
+    logger.error("team_registry не найден — clean_team_name fallback")
     def clean_team_name(name: str) -> str:
         return name.lower().strip().replace(" ", "_") if name else ""
 
@@ -68,7 +67,7 @@ SOCCER_LEAGUES = [
 ]
 DAYS_AHEAD = int(os.environ.get("PROPLINE_DAYS_AHEAD", "3"))
 
-__version__ = "810-patched"
+__version__ = "8.11-patched"
 __all__ = ["collect_propline", "collect_and_process", "__version__"]
 
 
@@ -92,14 +91,14 @@ def _fetch_odds(sport_key: str, markets: str = "h2h,spreads,totals",
     """Получает odds от PropLine API."""
     api_key = os.environ.get("PROPLINE_API_KEY", "")
     if not api_key:
-        logging.error("PROPLINE_API_KEY не задан")
+        logger.error("PROPLINE_API_KEY не задан")
         return None
 
     url = f"{BASE_URL}/sports/{sport_key}/odds?apiKey={api_key}&markets={markets}"
 
     for attempt in range(max_retries):
         if is_shutdown_requested():
-            logging.info("Shutdown requested — остановка fetch")
+            logger.info("Shutdown requested — остановка fetch")
             break
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "GatekeeperAI"})
@@ -107,18 +106,18 @@ def _fetch_odds(sport_key: str, markets: str = "h2h,spreads,totals",
                 data = json.loads(response.read().decode("utf-8"))
                 remaining = response.headers.get("X-Daily-Remaining")
                 if remaining:
-                    logging.info(f"Quota remaining: {remaining}")
+                    logger.info(f"Quota remaining: {remaining}")
                 return data
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 retry_after = int(e.headers.get("Retry-After", 5))
-                logging.warning(f"Rate limit. Waiting {retry_after}s...")
+                logger.warning(f"Rate limit. Waiting {retry_after}s...")
                 time.sleep(retry_after)
                 continue
-            logging.error(f"HTTP {e.code}: {e.reason}")
+            logger.error(f"HTTP {e.code}: {e.reason}")
             break
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-            logging.error(f"Network error: {e}")
+            logger.error(f"Network error: {e}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
     return None
@@ -130,7 +129,7 @@ def collect_propline() -> Dict[str, Any]:
 
     api_key = os.environ.get("PROPLINE_API_KEY")
     if not api_key:
-        logging.error("PROPLINE_API_KEY не задан")
+        logger.error("PROPLINE_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     rate_delay = float(os.environ.get("PROPLINE_RATE_DELAY", "0.2"))
@@ -141,10 +140,10 @@ def collect_propline() -> Dict[str, Any]:
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     run_id = init_metrics.get("run_id", "unknown")
     if not init_metrics.get("redis_available", False):
-        logging.error("Redis недоступен")
+        logger.error("Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
-    logging.info(f"Propline collector started (run_id={run_id}, dry_run={dry_run})")
+    logger.info(f"Propline collector started (run_id={run_id}, dry_run={dry_run})")
 
     stored = 0
     created = 0
@@ -158,22 +157,22 @@ def collect_propline() -> Dict[str, Any]:
 
     for sport_key in SOCCER_LEAGUES:
         if is_shutdown_requested():
-            logging.info("Shutdown — остановка цикла лиг")
+            logger.info("Shutdown — остановка цикла лиг")
             break
 
-        logging.info(f"Fetching odds for {sport_key}...")
+        logger.info(f"Fetching odds for {sport_key}...")
         data = _fetch_odds(sport_key, max_retries=max_retries, timeout=timeout)
 
         if not data or "events" not in data:
-            logging.info(f"No events for {sport_key}")
+            logger.info(f"No events for {sport_key}")
             continue
 
         events = data.get("events", [])
-        logging.info(f"Got {len(events)} events for {sport_key}")
+        logger.info(f"Got {len(events)} events for {sport_key}")
 
         for ev in events:
             if is_shutdown_requested():
-                logging.info("Shutdown — остановка цикла матчей")
+                logger.info("Shutdown — остановка цикла матчей")
                 break
 
             event_id = str(ev.get("id", ""))
@@ -250,7 +249,7 @@ def collect_propline() -> Dict[str, Any]:
             sport_title = ev.get("sport_title", sport_key)
 
             if dry_run:
-                logging.info(f"[DRY] Would upsert: {home_team} vs {away_team} ({date_utc})")
+                logger.info(f"[DRY] Would upsert: {home_team} vs {away_team} ({date_utc})")
                 stored += 1
                 created += 1
                 continue
@@ -289,7 +288,7 @@ def collect_propline() -> Dict[str, Any]:
 
             time.sleep(rate_delay)
 
-    logging.info(f"Propline done: events={total_events}, stored={stored}, "
+    logger.info(f"Propline done: events={total_events}, stored={stored}, "
                  f"created={created}, past={skipped_past}, future={skipped_future}, "
                  f"deduped={deduped}")
 
@@ -323,7 +322,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
-        logging.info("DRY-RUN mode — данные НЕ будут записаны в Redis")
+        logger.info("DRY-RUN mode — данные НЕ будут записаны в Redis")
 
     result = collect_propline()
-    logging.info(f"Result: {result}")
+    logger.info(f"Result: {result}")
