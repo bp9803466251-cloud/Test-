@@ -1,6 +1,6 @@
 """
 telegram_transport.py — Транспорт для отправки Telegram-дашбордов.
-GatekeeperAI v8.10-patched.
+GatekeeperAI v8.11-patched.
 
 Гарантирует:
 - корректную разбивку HTML по частям <= 4000 символов без разрыва тегов;
@@ -22,7 +22,7 @@ import urllib.error
 import json
 from typing import List, Dict, Any
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 
 __all__ = [
     "split_html_safe",
@@ -32,6 +32,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger("telegram_transport")
+logger.addHandler(logging.NullHandler())
 
 # ── Константы ──────────────────────────────────────────────
 TELEGRAM_TIMEOUT = 10
@@ -193,13 +194,13 @@ def send_telegram_dashboard(dashboard_text: str) -> Dict[str, Any]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     # FIX: все YAML-воркфлоу передают TELEGRAM_CHAT_ID, не TELEGRAM_GROUP_ID.
     # Без этого фикса chat_id всегда None — дашборд никогда не отправлялся.
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_GROUP_ID")
+    chat_id = os.environ.get("TELEGRAM_GROUP_ID") or os.environ.get("TELEGRAM_CHAT_ID")
 
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN не задан в окружении")
         return {"success": False, "sent_parts": 0, "total_parts": 0}
     if not chat_id:
-        logger.error("TELEGRAM_CHAT_ID (или TELEGRAM_GROUP_ID) не задан в окружении")
+        logger.error("TELEGRAM_GROUP_ID (или TELEGRAM_CHAT_ID) не задан в окружении")
         return {"success": False, "sent_parts": 0, "total_parts": 0}
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
