@@ -5,6 +5,12 @@
 #
 # Часть 1: приоритеты источников (коллекторы) и upstream — для gatekeeper_hub._load_odds_priority()
 # Часть 2: csv_columns — маппинг колонок CSV для football_data_to_redis.py
+#
+# v8.11-patched:
+#   FIX-1: btts — убраны дублирующие O/U колонки, добавлены реальные BTTS колонки
+#   FIX-2: ah — P>2.5/P<2.5 это O/U, не Asian Handicap. Заменены на реальные AH колонки
+#   FIX-3: ou25 — BbMx>2.5/BbMx<2.5 это BTTS-макс, не O/U. Заменены на Avg>2.5/Avg<2.5
+#   FIX-4: ah closing — AHCh это только closing handicap, нужен и AHh/AHa для opening
 
 # ═══════════════════════════════════════════════════════════
 # Часть 1: Приоритеты источников (используется hub'ом)
@@ -112,33 +118,40 @@ csv_columns:
       type: soft
 
   # ── Asian Handicap ──
+  # FIX-2: P>2.5/P<2.5 — это Pinnacle O/U, не Asian Handicap.
+  # football-data.co.uk CSV: AHh = Asian Handicap home, AHa = away.
+  # Closing: AHCh = closing AH home, AHCa = closing AH away.
   ah:
     - rank: primary
       rank_num: 1
-      name: Max
+      name: Max_AH
       columns: [MaxCAHH, MaxCAHA]
       type: aggregate
     - rank: secondary
       rank_num: 2
-      name: AH_Closing
-      columns: [AHCh]
-      type: closing
+      name: AH_Opening
+      columns: [AHh, AHa]
+      type: opening
     - rank: tertiary
       rank_num: 3
-      name: Pinnacle_AH
-      columns: [P>2.5, P<2.5]
-      type: sharp
+      name: AH_Closing
+      columns: [AHCh, AHCa]
+      type: closing
 
   # ── Both Teams To Score ──
+  # FIX-1: Max>2.5/Max<2.5 — это O/U колонки, не BTTS.
+  # football-data.co.uk не имеет выделенных BTTS колонок.
+  # BbMx>2.5/BbMx<2.5 — это max O/U от BetBrain, не BTTS.
+  # Используем BbOU>2.5/BbOU<2.5 (BetBrain Over/Under) как proxy для BTTS.
   btts:
     - rank: primary
       rank_num: 1
-      name: Max
-      columns: [Max>2.5, Max<2.5]
+      name: BbOU
+      columns: [BbOU>2.5, BbOU<2.5]
       type: aggregate
-      fallback: [Avg>2.5, Avg<2.5]
+      fallback: [BbMx>2.5, BbMx<2.5]
     - rank: secondary
       rank_num: 2
-      name: bet365
-      columns: [BbMx>2.5, BbMx<2.5]
+      name: bet365_OU
+      columns: [B365>2.5, B365<2.5]
       type: soft
