@@ -44,6 +44,7 @@ try:
         is_future_match,
         now_msk,
         save_meta,
+        build_canonical_id,
     )
 except ImportError:
     logging.error("gatekeeper_hub не найден")
@@ -378,8 +379,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             continue
 
         # FIX-2: Нормализация команд через team_registry
-        home_norm = normalize_team_name(home_team)
-        away_norm = normalize_team_name(away_team)
+        home_norm = clean_team_name(home_team)
+        away_norm = clean_team_name(away_team)
 
         status = ev.get("status", "scheduled") or "scheduled"
 
@@ -388,6 +389,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             continue
 
         date_str = _extract_date(ev)
+        date_str = normalize_date(date_str)  # §1.5: normalize to ISO 8601 UTC
         # FIX-8: dedup_key через нормализованные имена
         dedup_key = f"{home_norm}|{away_norm}|{date_str}"
         if dedup_key in seen:
@@ -403,8 +405,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             continue
 
         if idx < DEBUG_EVENT_COUNT:
-            print(f"[BZZOIRO DEBUG] Событие #{idx}: keys={list(ev.keys())}")
-            print(f"[BZZOIRO DEBUG] Событие #{idx}: {json.dumps(ev, ensure_ascii=False)[:500]}")
+            print(f"[BZZOIRO DEBUG] Событие #{idx}: keys={list(ev.keys())}")  # §1.23: no payload
 
         league_id = ev.get("league_id")
         league_info = _fetch_league_info(league_id, headers) if league_id else {"name": "", "country": ""}
@@ -495,7 +496,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 enrichment_errors += 1
 
             if idx < DEBUG_EVENT_COUNT:
-                print(f"[BZZOIRO DEBUG] Odds #{idx}: {json.dumps(odds_data, ensure_ascii=False)[:500] if odds_data is not _NOT_FOUND else 404}")
+                print(f"[BZZOIRO DEBUG] Odds #{idx}: {'found' if odds_data is not _NOT_FOUND else 404}")  # §1.23
 
             time.sleep(ENRICH_DELAY)
 
@@ -523,7 +524,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     enrichment_errors += 1
 
                 if idx < DEBUG_EVENT_COUNT:
-                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: {json.dumps(pred_data, ensure_ascii=False)[:500] if pred_data is not _NOT_FOUND else 404}")
+                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: {'found' if pred_data is not _NOT_FOUND else 404}")  # §1.23
 
                 time.sleep(ENRICH_DELAY)
 
@@ -624,6 +625,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     print(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
 
     save_meta(COLLECTOR_NAME,
+              last_run=now_msk(),
               total_events=len(all_events),
               stored_matches=len(stored_matches),
               created=created,

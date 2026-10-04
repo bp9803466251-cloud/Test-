@@ -18,6 +18,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
@@ -25,7 +26,7 @@ from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
 )
-from redis_hub import get_all_fields, delete_from_cache
+# Direct redis_hub import removed — §1.4: hub is the only gateway
 
 # Graceful shutdown — аудит §2.3
 try:
@@ -34,17 +35,24 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
-# team_registry — аудит §2.4
+# team_registry — аудит §2.4, §4: clean_team_name из search_module
 try:
-    from team_registry import normalize_team_name
+    from search_module import clean_team_name
 except ImportError:
-    def normalize_team_name(name: str) -> str:
-        return name.lower().strip()
+    from team_registry import clean_team_name
+except ImportError:
+    def clean_team_name(name: str) -> str:
+        return name.lower().strip().replace(" ", "_")
 
 SHARP_API_BASE = "https://api.sharpapi.io/api/v1"
 DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "3"))
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [SHARPAPI] %(message)s')
+
 COLLECTOR_NAME = "sharpapi"
+
+__version__ = "8.10-patched"
+__all__ = ["collect_sharpapi", "__version__"]
 
 
 # ---------------------------------------------------------------------------
@@ -151,29 +159,26 @@ def _fetch_sharpapi(url, headers):
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            print("[SHARPAPI] HTTP 429 — Rate Limit. Прерываем запросы, переходим на кэш.")
+            logging.info(f"[SHARPAPI] HTTP 429 — Rate Limit. Прерываем запросы, переходим на кэш.")
             return None
-        print(f"[SHARPAPI HTTP {e.code}] {e.reason}")
+        logging.warning(f"[SHARPAPI HTTP {e.code}] {e.reason}")
         try:
             body = e.read().decode("utf-8", errors="replace")
-            print(f"[SHARPAPI HTTP body] {body[:500]}")
+            logging.warning(f"[SHARPAPI HTTP body] {body[:500]}")
         except Exception:
             pass
         return None
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-        print(f"[SHARPAPI ERROR] {e}")
+        logging.error(f"[SHARPAPI ERROR] {e}")
         return None
 
 
 def _flush_old_matches():
-    all_fields = get_all_fields()
-    deleted = 0
-    for key in all_fields:
-        if key.startswith("match:"):
-            delete_from_cache(key)
-            deleted += 1
-    print(f"[SHARPAPI] Flush: удалено {deleted} старых ключей match:*")
-    return deleted
+    """§1.12: Flush-режим — использует cleanup_expired из хаба (§1.4)."""
+    from gatekeeper_hub import cleanup_expired
+    result = cleanup_expired(dry_run=False, auto_migrate=True)
+    logging.info(f"[SHARPAPI] Flush: cleanup_expired удалено {result.get('count', 0)} ключей")
+    return result.get('count', 0)
 
 
 def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
@@ -185,14 +190,14 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
     for page in range(max_pages):
         # Graceful shutdown — аудит §2.3
         if is_shutdown_requested():
-            print("[SHARPAPI] Получен SIGTERM, останавливаем сбор страниц")
+            logging.info(f"[SHARPAPI] Получен SIGTERM, останавливаем сбор страниц")
             break
 
         url = f"{SHARP_API_BASE}/odds?sport=soccer&market=moneyline&limit={limit}"
         if cursor:
             url += f"&cursor={urllib.parse.quote(cursor)}"
 
-        print(f"[SHARPAPI] Запрос /odds: page={page + 1}, cursor={'да' if cursor else 'нет'}")
+        logging.info(f"[SHARPAPI] Запрос /odds: page={page + 1}, cursor={'да' if cursor else 'нет'}")
 
         data = _fetch_sharpapi(url, headers)
         if data is None:
@@ -201,11 +206,11 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
         rows = data.get("data", [])
         if isinstance(rows, list):
             all_rows.extend(rows)
-            print(f"[SHARPAPI] Страница {page + 1}: {len(rows)} записей")
+            logging.info(f"[SHARPAPI] Страница {page + 1}: {len(rows)} записей")
 
             if not debug_printed and rows:
                 sample = rows[0]
-                print(f"[SHARPAPI DEBUG] Образец строки:")
+                logging.debug(f"[SHARPAPI DEBUG] Образец строки:")
                 print(f"  event_id: {sample.get('event_id', 'НЕТ')}")
                 print(f"  selection_type: {sample.get('selection_type', 'НЕТ')}")
                 print(f"  odds_decimal: {sample.get('odds_decimal', 'НЕТ')}")
@@ -217,12 +222,12 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
                 print(f"  Все ключи: {list(sample.keys())}")
                 debug_printed = True
         else:
-            print(f"[SHARPAPI] Страница {page + 1}: data не список ({type(rows)})")
+            logging.info(f"[SHARPAPI] Страница {page + 1}: data не список ({type(rows)})")
 
         pages += 1
 
         if len(rows) < limit:
-            print(f"[SHARPAPI] Конец данных на странице {page + 1}")
+            logging.info(f"[SHARPAPI] Конец данных на странице {page + 1}")
             break
 
         pagination = data.get("pagination", {})
@@ -250,10 +255,10 @@ def collect_sharpapi():
         # Fallback на старое имя для обратной совместимости
         api_key = os.environ.get("SHARP_API_KEY")
         if api_key:
-            print("[SHARPAPI] Внимание: используется устаревший SHARP_API_KEY. "
+            logging.info(f"[SHARPAPI] Внимание: используется устаревший SHARP_API_KEY. "
                   "Переименуйте в SHARPAPI_API_KEY.")
         else:
-            print("[SHARPAPI] SHARPAPI_API_KEY не задан")
+            logging.info(f"[SHARPAPI] SHARPAPI_API_KEY не задан")
             return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     headers = {
@@ -270,15 +275,15 @@ def collect_sharpapi():
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     run_id = init_metrics.get("run_id", "unknown")
     if not init_metrics.get("redis_available", False):
-        print("[SHARPAPI] Redis недоступен")
+        logging.info(f"[SHARPAPI] Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     if flush_old:
         _flush_old_matches()
 
-    print("[SHARPAPI] Сбор матчей из /odds?sport=soccer&market=moneyline ...")
+    logging.info(f"[SHARPAPI] Сбор матчей из /odds?sport=soccer&market=moneyline ...")
     odds_rows, pages = _fetch_odds_pages(headers, max_pages, limit, rate_delay)
-    print(f"[SHARPAPI] Получено строк odds: {len(odds_rows)} (страниц: {pages})")
+    logging.info(f"[SHARPAPI] Получено строк odds: {len(odds_rows)} (страниц: {pages})")
 
     if not odds_rows:
         meta = {
@@ -320,8 +325,8 @@ def collect_sharpapi():
             home_raw = row.get("home_team", "")
             away_raw = row.get("away_team", "")
             events_map[eid] = {
-                "home_team": normalize_team_name(home_raw) if home_raw else "",
-                "away_team": normalize_team_name(away_raw) if away_raw else "",
+                "home_team": clean_team_name(home_raw) if home_raw else "",
+                "away_team": clean_team_name(away_raw) if away_raw else "",
                 "home_team_raw": home_raw,
                 "away_team_raw": away_raw,
                 "start_time": row.get("event_start_time", "") or row.get("start_time", ""),
@@ -337,7 +342,7 @@ def collect_sharpapi():
     sel_types_found = set()
     for ev in events_map.values():
         sel_types_found.update(ev["odds"].keys())
-    print(f"[SHARPAPI] Найдено selection_type: {sel_types_found}")
+    logging.info(f"[SHARPAPI] Найдено selection_type: {sel_types_found}")
 
     # --- Записать в Redis ---
     stored = 0
@@ -345,14 +350,13 @@ def collect_sharpapi():
     skipped_future = 0
     deduped = 0
     seen_keys = set()
-    existing_keys = set(get_all_fields().keys())
     created = 0
     updated = 0
 
     for eid, ev in events_map.items():
         # Graceful shutdown — аудит §2.3
         if is_shutdown_requested():
-            print("[SHARPAPI] Получен SIGTERM, останавливаем запись матчей")
+            logging.info(f"[SHARPAPI] Получен SIGTERM, останавливаем запись матчей")
             break
 
         home_team = ev["home_team"]
@@ -402,10 +406,7 @@ def collect_sharpapi():
 
         if cid:
             stored += 1
-            if f"match:{cid}" in existing_keys:
-                updated += 1
-            else:
-                created += 1
+            created += 1
 
             # FIX §2.1: odds как float (вместо str)
             # FIX §2.2: idempotency_key в patch_match
@@ -426,7 +427,7 @@ def collect_sharpapi():
                 )
 
     total_events = len(events_map)
-    print(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, "
+    logging.info(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, "
           f"прошлое: {skipped_past}, будущее: {skipped_future}, дедупликатов: {deduped}")
 
     meta = {
@@ -449,4 +450,4 @@ def collect_sharpapi():
 
 if __name__ == "__main__":
     result = collect_sharpapi()
-    print(f"[SHARPAPI] Result: {result}")
+    logging.info(f"[SHARPAPI] Result: {result}")

@@ -32,6 +32,7 @@ logging.basicConfig(
 from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
+    get_match_any,
 )
 
 try:
@@ -171,8 +172,8 @@ def collect_odds_api() -> Dict[str, Any]:
                 continue
 
             # §2.4: Нормализация через team_registry
-            home_team = normalize_team_name(home_team_raw)
-            away_team = normalize_team_name(away_team_raw)
+            home_team = clean_team_name(home_team_raw)
+            away_team = clean_team_name(away_team_raw)
 
             raw_date = ev.get("commence_time", "") or ev.get("start_time", "")
             date_utc = normalize_date(raw_date)
@@ -212,7 +213,7 @@ def collect_odds_api() -> Dict[str, Any]:
                         if price_float is None:
                             continue
                         # Сравниваем с нормализованным именем
-                        name_norm = normalize_team_name(name)
+                        name_norm = clean_team_name(name)
                         if name_norm == home_team or home_team in name_norm or name_norm in home_team:
                             if odds_home is None or price_float > odds_home:
                                 odds_home = price_float
@@ -240,6 +241,11 @@ def collect_odds_api() -> Dict[str, Any]:
 
             if cid:
                 stored += 1
+                existing = get_match_any(cid)
+                if existing:
+                    updated += 1
+                else:
+                    created += 1
 
                 # 2. Patch odds как float
                 odds_current = {

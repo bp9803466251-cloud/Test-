@@ -48,8 +48,10 @@ from gatekeeper_hub import (
     now_msk,
     save_meta,
     is_shutdown_requested,
+    get_match_any,
 )
-from team_registry import normalize_team_name, build_canonical_id
+from search_module import clean_team_name
+from gatekeeper_hub import build_canonical_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -304,8 +306,8 @@ def collect_propline() -> Dict[str, Any]:
                     pass
 
             # FIX-2: Нормализация имён команд
-            home_norm = normalize_team_name(home_team)
-            away_norm = normalize_team_name(away_team)
+            home_norm = clean_team_name(home_team)
+            away_norm = clean_team_name(away_team)
 
             sport_title = ev.get("sport_title", league_title)
             event_id = str(ev.get("id", ""))
@@ -342,7 +344,11 @@ def collect_propline() -> Dict[str, Any]:
                 continue
 
             stored += 1
-            created += 1  # FIX-6: created counter
+            existing = get_match_any(cid)
+            if existing:
+                updated += 1
+            else:
+                created += 1
 
             # Извлекаем odds — только Pinnacle (или указанный bookmaker)
             odds_home: Optional[float] = None  # FIX-1: float, None вместо "-"
