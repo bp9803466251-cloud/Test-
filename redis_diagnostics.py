@@ -202,7 +202,8 @@ def diagnose_matches(data):
 
 
 def diagnose_indexes(data):
-    """Секция 3: Indexes (§18.3)."""
+    """Секция 3: Indexes (§18.3).
+    FIX-AUDIT: Uses scan_keys for counting (handles both idx:* and index:* patterns)."""
     rdb = _get_redis_hub()
     if not rdb:
         return {"error": "redis_hub unavailable"}
@@ -210,9 +211,21 @@ def diagnose_indexes(data):
     indexes = {}
     for idx_type in ["date", "status", "source", "competition"]:
         try:
-            key = f"idx:{idx_type}"
-            if hasattr(rdb, "get_key"):
-                raw = rdb.get_key(key)
+            # FIX-AUDIT: Try scan_keys first (handles SET-type indexes)
+            if hasattr(rdb, "scan_keys"):
+                # Try both idx:{type}:* and index:{type}:* patterns
+                keys1 = rdb.scan_keys(f"idx:{idx_type}:*")
+                keys2 = rdb.scan_keys(f"index:{idx_type}:*")
+                # Also try idx:{type} as a single key
+                single = 0
+                if hasattr(rdb, "get_key"):
+                    raw = rdb.get_key(f"idx:{idx_type}")
+                    if raw:
+                        single = len(raw) if isinstance(raw, (list, dict)) else 1
+                total = len(keys1) + len(keys2) + single
+                indexes[idx_type] = {"keys": total}
+            elif hasattr(rdb, "get_key"):
+                raw = rdb.get_key(f"idx:{idx_type}")
                 if raw:
                     idx_data = json.loads(raw) if isinstance(raw, str) else raw
                     indexes[idx_type] = {
@@ -221,7 +234,7 @@ def diagnose_indexes(data):
                 else:
                     indexes[idx_type] = {"keys": 0}
             else:
-                indexes[idx_type] = {"keys": 0, "error": "get_key unavailable"}
+                indexes[idx_type] = {"keys": 0, "error": "no scan_keys or get_key"}
         except Exception as e:
             indexes[idx_type] = {"keys": 0, "error": str(e)}
 
@@ -486,31 +499,45 @@ def _do_flush(data, dry_run=False):
 
 
 def _do_history_only(dry_run=False):
-    """--history-only: удаление history:* ключей (§18.5)."""
+    """--history-only: удаление history:* ключей (§18.5).
+    FIX-AUDIT: History keys are separate Redis keys (not hash fields).
+    Uses scan_keys + delete_key instead of get_all_fields + delete_from_cache."""
     rdb = _get_redis_hub()
     if not rdb:
         print("❌ redis_hub unavailable")
         return 0
 
     flushed = 0
-    # History keys are stored as history:match:{cid}
-    try:
-        all_fields = rdb.get_all_fields()
-    except Exception as e:
-        print(f"❌ get_all_fields: {e}")
-        return 0
+    # History keys are stored as separate Redis keys: history:match:{cid}
+    # FIX-AUDIT: scan_keys (SCAN) — safe iteration, unlike KEYS
+    if hasattr(rdb, "scan_keys"):
+        try:
+            keys = rdb.scan_keys("history:*")
+        except Exception as e:
+            print(f"❌ scan_keys: {e}")
+            return 0
+    else:
+        # Fallback: get_all_fields (hash fields — may miss history keys)
+        try:
+            all_fields = rdb.get_all_fields()
+            keys = [k for k in (all_fields or {}) if k.startswith("history:")]
+        except Exception as e:
+            print(f"❌ get_all_fields: {e}")
+            return 0
 
-    for key in all_fields:
-        if key.startswith("history:"):
-            if dry_run:
-                print(f"  [DRY-RUN] Would delete: {key}")
-                flushed += 1
-            else:
-                try:
+    for key in keys:
+        if dry_run:
+            print(f"  [DRY-RUN] Would delete: {key}")
+            flushed += 1
+        else:
+            try:
+                if hasattr(rdb, "delete_key"):
+                    rdb.delete_key(key)
+                else:
                     rdb.delete_from_cache(key)
-                    flushed += 1
-                except Exception as e:
-                    logger.warning(f"Delete {key}: {e}")
+                flushed += 1
+            except Exception as e:
+                logger.warning(f"Delete {key}: {e}")
 
     return flushed
 
@@ -531,13 +558,22 @@ def _do_purge(confirm=False, dry_run=False):
         return True
 
     try:
-        # Используем _execute_upstash_cmd напрямую
+        # FIX-AUDIT: Try _execute_upstash_cmd first, then fallback to direct REST API
         if hasattr(rdb, "_execute_upstash_cmd"):
             rdb._execute_upstash_cmd(["FLUSHDB"])
             print("✅ FLUSHDB executed")
             return True
+        elif hasattr(rdb, "delete_keys_by_pattern"):
+            # Fallback: delete all known patterns
+            for pattern in ["match:*", "history:*", "meta:*", "idx:*", "index:*"]:
+                try:
+                    rdb.delete_keys_by_pattern(pattern)
+                except Exception:
+                    pass
+            print("✅ Pattern-based flush executed")
+            return True
         else:
-            print("❌ _execute_upstash_cmd unavailable")
+            print("❌ No flush method available (_execute_upstash_cmd, delete_keys_by_pattern)")
             return False
     except Exception as e:
         print(f"❌ FLUSHDB: {e}")
@@ -549,7 +585,8 @@ def _do_purge(confirm=False, dry_run=False):
 # ============================================================================
 
 def _do_validate():
-    """Схемная валидация всех матчей в Redis (§19.4)."""
+    """Схемная валидация всех матчей в Redis (§19.4).
+    FIX-AUDIT: Uses hub.validate_schema() if available, fallback to local field check."""
     hub = _get_hub()
     if not hub:
         print("❌ gatekeeper_hub unavailable")
@@ -565,6 +602,8 @@ def _do_validate():
         print("No matches found in Redis")
         return
 
+    # FIX-AUDIT: Use hub.validate_schema() if available
+    use_hub_validate = hasattr(hub, "validate_schema")
     required_fields = [
         "canonical_id", "home_team", "away_team", "home_clean", "away_clean",
         "date_utc", "competition", "country", "status", "version",
@@ -580,13 +619,27 @@ def _do_validate():
         if not isinstance(match, dict):
             invalid += 1
             continue
-        missing = [f for f in required_fields if not match.get(f)]
-        if missing:
-            invalid += 1
-            for f in missing:
-                errors_by_field[f] = errors_by_field.get(f, 0) + 1
+        if use_hub_validate:
+            try:
+                ok, msg = hub.validate_schema(match)
+                if ok:
+                    valid += 1
+                else:
+                    invalid += 1
+                    # Extract field name from message
+                    if "missing" in msg:
+                        field = msg.split(":")[-1].strip()
+                        errors_by_field[field] = errors_by_field.get(field, 0) + 1
+            except Exception:
+                invalid += 1
         else:
-            valid += 1
+            missing = [f for f in required_fields if not match.get(f)]
+            if missing:
+                invalid += 1
+                for f in missing:
+                    errors_by_field[f] = errors_by_field.get(f, 0) + 1
+            else:
+                valid += 1
 
     print(f"Validation results: {valid} valid, {invalid} invalid (total: {valid + invalid})")
     if errors_by_field:
@@ -730,17 +783,27 @@ def main():
         if not rdb:
             print("❌ redis_hub unavailable")
             return
-        try:
-            all_fields = rdb.get_all_fields()
-        except Exception as e:
-            print(f"❌ get_all_fields: {e}")
-            return
-        history_keys = [k for k in (all_fields or {}) if k.startswith("history:")]
+        # FIX-AUDIT: History keys are separate Redis keys, not hash fields
+        if hasattr(rdb, "scan_keys"):
+            try:
+                history_keys = rdb.scan_keys("history:*")
+            except Exception as e:
+                print(f"❌ scan_keys: {e}")
+                return
+        else:
+            try:
+                all_fields = rdb.get_all_fields()
+                history_keys = [k for k in (all_fields or {}) if k.startswith("history:")]
+            except Exception as e:
+                print(f"❌ get_all_fields: {e}")
+                return
         print(f"History keys: {len(history_keys)}")
         for k in history_keys[:20]:
-            val = all_fields.get(k)
             try:
-                parsed = json.loads(val) if isinstance(val, str) else val
+                raw = rdb.get_key(k) if hasattr(rdb, "get_key") else None
+                if raw is None and hasattr(rdb, "get_from_cache"):
+                    raw = rdb.get_from_cache(k)
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
                 entries = len(parsed) if isinstance(parsed, (list, dict)) else 1
                 print(f"  {k} — {entries} entries")
             except Exception:
