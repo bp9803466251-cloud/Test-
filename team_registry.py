@@ -837,32 +837,39 @@ TEAM_ALIASES = {
 def clean_team_name(name: str) -> str:
     """
     Нормализация названия команды (§4).
-    1. Приведение к нижнему регистру
+    1. Приведение к нижнему регистру + нормализация диакритиков
     2. Поиск в TEAM_ALIASES (оригинальный ключ, до нормализации)
     3. Удаление спецсимволов + повторный поиск
-    4. Удаление суффиксов (fc, cf, afc, united, city, town, sc, club) + повторный поиск
-    5. Fallback — заменяем пробелы на подчёркивания
-    
+    4. Удаление суффиксов (fc, cf, afc, united, city, town, sc, club, bk, if, ac, as) + повторный поиск
+    5. Нормализация слэшей и дефисов + повторный поиск
+    6. Fallback — заменяем пробелы на подчёркивания
+
     Возвращает нормализованную версию (home_clean/away_clean).
     """
     if not name or not isinstance(name, str):
         return ""
-    
+
     try:
-        key = name.strip().lower()
-        
+        # FIX-AUDIT: Нормализация диакритиков (Köln -> koln, Malmö -> malmo)
+        import unicodedata
+        normalized = unicodedata.normalize("NFD", name)
+        key = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
+        key = key.strip().lower()
+
         # Шаг 1: Прямой lookup (оригинальный ключ с апострофами)
         if key in TEAM_ALIASES:
             return TEAM_ALIASES[key]
-        
+
         # Шаг 2: Удаление спецсимволов + lookup
         clean_key = key.replace("'", "").replace(".", "").replace(",", "")
         clean_key = clean_key.replace("  ", " ").strip()
         if clean_key in TEAM_ALIASES:
             return TEAM_ALIASES[clean_key]
-        
+
         # Шаг 3: Удаление суффиксов (только с конца) + lookup
-        suffixes = [" fc", " cf", " afc", " sc", " united", " city", " town", " club"]
+        # FIX-AUDIT: добавлены " bk", " if", " ac", " as" для скандинавских и латинских команд
+        suffixes = [" fc", " cf", " afc", " sc", " united", " city", " town",
+                    " club", " bk", " if", " ac", " as"]
         stripped = clean_key
         for suffix in suffixes:
             if stripped.endswith(suffix):
@@ -870,8 +877,17 @@ def clean_team_name(name: str) -> str:
                 break  # only strip one suffix
         if stripped in TEAM_ALIASES:
             return TEAM_ALIASES[stripped]
-        
-        # Шаг 4: Fallback — заменяем пробелы на подчёркивания
+
+        # Шаг 4: Нормализация слэшей и дефисов + lookup
+        # FIX-AUDIT: "bodoe/glimt" -> "bodoeglimt" -> lookup, "ham-kam" -> "hamkam"
+        slash_key = clean_key.replace("/", "").replace("-", " ").strip()
+        if slash_key in TEAM_ALIASES:
+            return TEAM_ALIASES[slash_key]
+        slash_key2 = slash_key.replace(" ", "")
+        if slash_key2 in TEAM_ALIASES:
+            return TEAM_ALIASES[slash_key2]
+
+        # Шаг 5: Fallback — заменяем пробелы на подчёркивания
         return stripped.replace(" ", "_")
     except Exception as e:
         logger.warning("clean_team_name error for %r: %s", name, e)
@@ -892,6 +908,10 @@ def build_canonical_id(home: str, away: str, date_str: str) -> str:
         if "T" in d:
             d = d.split("T")[0]
         d = d.replace("-", "")
+        # FIX-AUDIT: Валидация даты — 8 цифр
+        if len(d) != 8 or not d.isdigit():
+            logger.warning("build_canonical_id: invalid date %r", date_str)
+            return ""
         return f"{h}__{a}__{d}"
     except Exception as e:
         logger.warning("build_canonical_id error: %s", e)
