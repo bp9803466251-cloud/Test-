@@ -1,0 +1,72 @@
+name: Telegram Dashboard
+
+on:
+  schedule:
+    # Каждый час
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Send Telegram dashboard
+        run: |
+          python -c "
+          from redis_hub import is_redis_available, get_from_cache
+          from gatekeeper_hub import METRICS, get_all_matches
+          from metrics import collect_system_metrics, format_dashboard
+          from telegram_transport import send_telegram_dashboard
+
+          redis_ok = is_redis_available()
+          report = METRICS.report() if redis_ok else {}
+
+          # Подсчёт live-матчей
+          live_count = 0
+          if redis_ok:
+              try:
+                  matches = get_all_matches()
+                  live_count = len(matches) if matches else 0
+              except Exception:
+                  live_count = 0
+
+          metrics = collect_system_metrics(report)
+
+          stats = {
+              'redis_available': redis_ok,
+              'total_input': live_count,
+              'odds_enriched': report.get('counters', {}).get('odds_enriched', 0),
+              'value_count': report.get('counters', {}).get('value_found', 0),
+              'pred_count': report.get('counters', {}).get('predictions_added', 0),
+              'h2h_count': report.get('counters', {}).get('h2h_added', 0),
+              'stats_count': report.get('counters', {}).get('stats_added', 0),
+              'time': metrics.get('timestamp', ''),
+              'last_module': 'dashboard'
+          }
+
+          dashboard = format_dashboard(stats)
+          send_telegram_dashboard(dashboard)
+          "
+        env:
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GATEKEEPER_ENV: prod
+          
