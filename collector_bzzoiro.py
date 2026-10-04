@@ -266,6 +266,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     print(f"[BZZOIRO] Collector Bzzoiro v{__version__} started.")
     print("=" * 60)
 
+    dry_run = os.environ.get("DRY_RUN", "0") == "1"
+    
     print("[BZZOIRO] Шаг 0: Инициализация Redis...")
     # §2.6: передаём collector= для трассировки
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
@@ -414,6 +416,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         country = league_info.get("country", "")
 
         # §2.2: idempotency_key + sources для upsert_match
+        if dry_run:
+            created += 1
+            stored_matches.append((f"dry_run_{bzzoiro_id}", bzzoiro_id, ev))
+            continue
         result_id = upsert_match(
             home_team=home_norm,
             away_team=away_norm,
@@ -448,6 +454,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
     if events_only:
         print("[BZZOIRO] Режим events-only — enrichment пропущен")
+    elif dry_run:
+        print("[BZZOIRO] DRY-RUN — enrichment пропущен")
     elif stored_matches:
         print(f"[BZZOIRO] Шаг 3: Обогащение {len(stored_matches)} матчей...")
 
@@ -657,7 +665,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=f"Collector Bzzoiro v{__version__}")
     parser.add_argument("--events-only", action="store_true",
                         help="Только события, без enrichment")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Не писать в Redis (dry-run)")
     args = parser.parse_args()
+    if args.dry_run:
+        os.environ["DRY_RUN"] = "1"
+        print("[BZZOIRO] DRY-RUN mode — данные НЕ будут записаны в Redis")
 
     result = collect_bzzoiro(events_only=args.events_only)
     print(f"[BZZOIRO] Result: {result}")

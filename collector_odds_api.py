@@ -32,8 +32,15 @@ logging.basicConfig(
 from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
-    get_match_any,
 )
+# FIX: get_match_any может отсутствовать — fallback на get_match
+try:
+    from gatekeeper_hub import get_match_any
+except ImportError:
+    try:
+        from gatekeeper_hub import get_match as get_match_any
+    except ImportError:
+        get_match_any = lambda cid: None
 
 try:
     from gatekeeper_hub import is_shutdown_requested
@@ -105,6 +112,8 @@ def collect_odds_api() -> Dict[str, Any]:
         logging.error("ODDS_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
+    dry_run = os.environ.get("DRY_RUN", "0") == "1"
+    
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     if not init_metrics.get("redis_available", False):
         logging.error("Redis недоступен")
@@ -227,6 +236,12 @@ def collect_odds_api() -> Dict[str, Any]:
             total_events += 1
 
             # 1. Создать матч (с sources)
+            if dry_run:
+                total_events += 1
+                stored += 1
+                created += 1
+                continue
+
             cid = upsert_match(
                 home_team=home_team,
                 away_team=away_team,
@@ -287,5 +302,13 @@ def collect_and_process():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Collector OddsAPI")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Не писать в Redis (dry-run)")
+    args = parser.parse_args()
+    if args.dry_run:
+        logging.info("[ODDS_API] DRY-RUN mode")
+        os.environ["DRY_RUN"] = "1"
     result = collect_odds_api()
     logging.info(f"Result: {result}")

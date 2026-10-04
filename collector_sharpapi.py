@@ -35,14 +35,16 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
-# team_registry — аудит §2.4, §4: clean_team_name из search_module
+# team_registry — аудит §2.4: clean_team_name
+# FIX: nested try-except (двойной except на одном уровне — dead code)
 try:
-    from search_module import clean_team_name
-except ImportError:
     from team_registry import clean_team_name
 except ImportError:
-    def clean_team_name(name: str) -> str:
-        return name.lower().strip().replace(" ", "_")
+    try:
+        from search_module import clean_team_name
+    except ImportError:
+        def clean_team_name(name: str) -> str:
+            return name.lower().strip().replace(" ", "_")
 
 SHARP_API_BASE = "https://api.sharpapi.io/api/v1"
 DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "3"))
@@ -271,6 +273,9 @@ def collect_sharpapi():
     limit = int(os.environ.get("SHARPAPI_LIMIT", "200"))
     flush_old = os.environ.get("SHARPAPI_FLUSH_OLD", "0") == "1"
 
+    # FIX: dry-run support
+    dry_run = os.environ.get("DRY_RUN", "0") == "1"
+    
     # FIX §2.6: run_initialization с collector=
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     run_id = init_metrics.get("run_id", "unknown")
@@ -418,7 +423,7 @@ def collect_sharpapi():
             if "away" in ev_odds:
                 odds_current["away"] = float(ev_odds["away"])
 
-            if odds_current:
+            if odds_current and not dry_run:
                 patch_match(
                     cid, "odds", {"current": odds_current},
                     source=COLLECTOR_NAME,
@@ -449,5 +454,13 @@ def collect_sharpapi():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Collector SharpAPI")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Не писать в Redis (dry-run)")
+    args = parser.parse_args()
+    if args.dry_run:
+        logging.info("[SHARPAPI] DRY-RUN mode — данные НЕ будут записаны в Redis")
+        os.environ["DRY_RUN"] = "1"
     result = collect_sharpapi()
     logging.info(f"[SHARPAPI] Result: {result}")
