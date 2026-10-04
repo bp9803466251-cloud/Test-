@@ -1,39 +1,44 @@
-# ═══════════════════════════════════════════════════════════════════════
-# Odds Priority — ранги источников коэффициентов (§19.2)
-# Меньший ранг = высший приоритет. Источник с рангом 1 перебивает ранг 6.
-# Загружается из odds_priority.yaml, включается через !include в config.
-# Заменяет хардкод UPSTREAM_MAP из §1.20.
-# ═══════════════════════════════════════════════════════════════════════
+# odds_priority.yaml — Конфиг приоритетов букмекеров (§19.2)
+# Ранги: primary (1-й) ... senary (6-й)
+# rank_num — для программной сортировки
+# rank — для читаемости
 
-# ── Основные 1x2 ──────────────────────────────────────────────────────
 1x2:
-  sharpapi:    1    # sharp-букмекер, высший приоритет
-  odds_api:    3    # агрегатор
-  propline:    6    # pinnacle
-  bzzoiro:     8    # soft
-  football_data: 10 # historical
+  sharpapi: 1
+  propline: 1
+  odds_api: 2
+  bzzoiro: 3
+  football_data: 4
 
-# ── Тоталы (over/under) ───────────────────────────────────────────────
-ou25:
-  sharpapi:    1
-  odds_api:    3
-  propline:    6
-
-# ── Фора (азиатский гандикап) ─────────────────────────────────────────
-ah:
-  sharpapi:    1
-  odds_api:    3
-  propline:    6
-
-# ── Закрытие линии ────────────────────────────────────────────────────
-closing_1x2:
-  propline:    1    # closing odds — только Pinnacle
-  sharpapi:    2
-
-# ── Upstream-маппинг (fallback) ───────────────────────────────────────
 upstream_map:
-  sharpapi: "betradar"
-  odds_api: "betradar"
-  bzzoiro: "opta"
-  propline: "pinnacle"
-  football_data: "bet365"
+  pinnacle: 1
+  betradar: 1
+  opta: 2
+  bet365: 3
+  multi_bookmaker: 4
+
+# Для CSV-источников (football_data_to_redis.py)
+csv_columns:
+  1x2:
+    - rank: primary
+      columns: [B365H, B365D, B365A]
+      type: opening
+    - rank: secondary
+      columns: [BWH, BWD, BWA]
+      type: opening
+    - rank: tertiary
+      columns: [IWH, IWD, IWA]
+      type: opening
+    - rank: quaternary
+      columns: [PSH, PSD, PSA]
+      type: closing
+  ah:
+    - rank: primary
+      columns: [MaxCAHH, MaxCAHA]
+    - rank: secondary
+      columns: [AHCh]
+      type: closing
+  closing_1x2:
+    - rank: primary
+      columns: [PPCH, PPCD, PPCA]
+      type: sharp
