@@ -37,11 +37,13 @@
     },
     "home_clean": {
       "type": "string",
-      "description": "Нормализованное название (через clean_team_name)"
+      "description": "Нормализованное название (через clean_team_name)",
+      "minLength": 1
     },
     "away_clean": {
       "type": "string",
-      "description": "Нормализованное название (через clean_team_name)"
+      "description": "Нормализованное название (через clean_team_name)",
+      "minLength": 1
     },
     "competition": {
       "type": "string",
@@ -88,7 +90,11 @@
           ]
         }
       },
-      "description": "Плоский счёт {home: int, away: int} — §1.18"
+      "description": "Плоский счёт {home: int, away: int} — §1.18",
+      "required": [
+        "home",
+        "away"
+      ]
     },
     "version": {
       "type": "integer",
@@ -101,7 +107,10 @@
       "description": "Версия схемы — gatekeeper для миграций (§20.8)"
     },
     "odds": {
-      "type": "object",
+      "type": [
+        "object",
+        "null"
+      ],
       "description": "Коэффициенты в формате 1x2 (§1.21)",
       "properties": {
         "1x2": {
@@ -184,7 +193,8 @@
         "type": "string"
       },
       "description": "Уникальные источники данных (список) — §1.28",
-      "uniqueItems": true
+      "uniqueItems": true,
+      "minItems": 1
     },
     "section_history": {
       "type": "array",
@@ -200,12 +210,16 @@
           },
           "updated_at": {
             "type": "string"
+          },
+          "upstream": {
+            "type": "string"
           }
         },
         "required": [
           "section",
           "source",
-          "updated_at"
+          "updated_at",
+          "upstream"
         ]
       },
       "description": "FIFO-буфер, не более 20 записей (§19.1)"
@@ -283,4 +297,4 @@
     }
   },
   "additionalProperties": true
-                  }
+}
