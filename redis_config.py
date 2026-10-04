@@ -96,6 +96,10 @@ def get_redis_config_errors() -> list:
         errors.append(f"CB_RECOVERY_TIMEOUT={CB_RECOVERY_TIMEOUT} must be positive")
     if REDIS_MAX_PIPELINE <= 0:
         errors.append(f"REDIS_MAX_PIPELINE={REDIS_MAX_PIPELINE} must be positive")
+    if not REDIS_HASH_NAME:
+        errors.append("REDIS_HASH_NAME is empty")
+    if REDIS_REST_URL and not REDIS_REST_URL.startswith(("https://", "http://")):
+        errors.append("REDIS_REST_URL should start with https:// or http://")
     return errors
 
 
@@ -107,7 +111,8 @@ def is_redis_configured() -> bool:
 def get_redis_info() -> dict:
     """Возвращает краткую информацию о конфигурации Redis (без токена)."""
     return {
-        "url": bool(REDIS_REST_URL),  # не показываем URL — безопасность
+        "url_host": REDIS_REST_URL.split("/")[2] if REDIS_REST_URL and "/" in REDIS_REST_URL else "",
+        "url_set": bool(REDIS_REST_URL),
         "token_set": bool(REDIS_REST_TOKEN),
         "timeout": REDIS_TIMEOUT,
         "hash_name": REDIS_HASH_NAME,
