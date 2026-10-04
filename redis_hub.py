@@ -8,10 +8,20 @@ Circuit Breaker: 10 ошибок → 60с → авто-восстановлен�
   Все параметры (URL, TOKEN, timeout, circuit breaker, hash name, batch size)
   импортируются из redis_config.py — единой точки конфигурации Redis.
   Локальные env-чтения удалены — устранён дублирующий код (правило 1.3).
+
+v8.10-patched:
+  FIX-1: logging вместо print (§1.23)
+  FIX-2: Делегирование сериализации в serialize_match/deserialize_match (§20.1)
+  FIX-3: Retry с exponential backoff (§9.5)
+  FIX-4: is_redis_available() → is_redis_configured() + PING
+  FIX-5: __version__, расширенный __all__
+  FIX-6: REDIS_MAX_PIPELINE используется в get_all_fields()
+  FIX-7: Безопасное логирование — без payload (§1.23)
 """
 
 import json
 import time
+import logging
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
@@ -28,14 +38,23 @@ from redis_config import (
 )
 
 # ── Константы ──────────────────────────────────────────────
+__version__ = "8.10-patched"
 ENVELOPE_VERSION = "v700-prod"
 HASH_NAME = REDIS_HASH_NAME
 REDIS_TIMEOUT = REDIS_TIMEOUT
 CB_THRESHOLD = CB_FAILURE_THRESHOLD
 CB_RESET_SECONDS = CB_RECOVERY_TIMEOUT
-BATCH_SIZE = 50  # для HKEYS + HMGET
+BATCH_SIZE = REDIS_MAX_PIPELINE or 50  # для HKEYS + HMGET
+MAX_RETRIES = 2  # ретраи для transport-уровня (§9.5)
+RETRY_BASE_DELAY = 0.5  # базовая задержка для exponential backoff
 
 MSK_TZ = timezone(timedelta(hours=3))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - [REDIS_HUB] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # ── Circuit Breaker ─────────────────────────────────────────
 _cb_state = "closed"  # closed | open | half-open
@@ -50,6 +69,7 @@ def _cb_can_pass():
     if _cb_state == "open":
         if time.monotonic() - _cb_opened_at >= CB_RESET_SECONDS:
             _cb_state = "half-open"
+            logger.info("Circuit breaker → half-open")
             return True
         return False
     if _cb_state == "half-open":
@@ -59,6 +79,8 @@ def _cb_can_pass():
 
 def _cb_on_success():
     global _cb_state, _cb_failures
+    if _cb_state != "closed":
+        logger.info("Circuit breaker → closed (recovered)")
     _cb_failures = 0
     _cb_state = "closed"
 
@@ -69,6 +91,7 @@ def _cb_on_failure():
     if _cb_failures >= CB_THRESHOLD and _cb_state != "open":
         _cb_state = "open"
         _cb_opened_at = time.monotonic()
+        logger.warning("Circuit breaker → open after %d failures", _cb_failures)
 
 
 def get_circuit_breaker_status():
@@ -80,6 +103,37 @@ def reset_circuit_breaker():
     _cb_state = "closed"
     _cb_failures = 0
     _cb_opened_at = 0.0
+    logger.info("Circuit breaker reset")
+
+
+# ── Сериализация через хаб (§20.1) ──────────────────────────
+# Ленивый импорт для избежания циклической зависимости:
+# gatekeeper_hub → redis_hub → gatekeeper_hub
+
+def _serialize(obj):
+    """Делегирует сериализацию в serialize_match из хаба (§20.1)."""
+    try:
+        from gatekeeper_hub import serialize_match
+        return serialize_match(obj)
+    except ImportError:
+        # Fallback — если хаб недоступен
+        return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def _deserialize(raw):
+    """Делегирует десериализацию в deserialize_match из хаба (§20.1)."""
+    try:
+        from gatekeeper_hub import deserialize_match
+        return deserialize_match(raw)
+    except ImportError:
+        # Fallback — если хаб недоступен
+        if not raw or not isinstance(raw, str):
+            return None
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            return None
 
 
 # ── Подключение ─────────────────────────────────────────────
@@ -93,11 +147,12 @@ def _get_redis_token():
     return REDIS_REST_TOKEN
 
 
-def _execute_upstash_cmd(args):
+def _execute_upstash_cmd(args, retry=True):
     """
     Единый транспорт для всех команд Upstash REST API.
     args — список аргументов команды, например ["HGET", "GatekeeperAI", "match:xxx"]
     Возвращает результат (str) или None при ошибке.
+    Retry с exponential backoff для transient-ошибок (§9.5).
     """
     if not _cb_can_pass():
         return None
@@ -118,17 +173,35 @@ def _execute_upstash_cmd(args):
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=REDIS_TIMEOUT) as resp:
-            body = resp.read().decode("utf-8")
-            result = json.loads(body)
-            _cb_on_success()
-            return result.get("result")
-    except (urllib.error.URLError, urllib.error.HTTPError,
-            json.JSONDecodeError, OSError, TimeoutError) as e:
-        _cb_on_failure()
-        print(f"[REDIS_HUB] Error: {type(e).__name__}: {e}")
-        return None
+    last_error = None
+    for attempt in range(MAX_RETRIES + 1 if retry else 1):
+        try:
+            with urllib.request.urlopen(req, timeout=REDIS_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8")
+                result = json.loads(body)
+                _cb_on_success()
+                return result.get("result")
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                json.JSONDecodeError, OSError, TimeoutError) as e:
+            last_error = e
+            # Timeout и network errors — retry; HTTP 4xx — нет
+            if isinstance(e, urllib.error.HTTPError) and e.code < 500:
+                _cb_on_failure()
+                logger.warning("HTTP %d: %s", e.code, type(e).__name__)
+                return None
+            if attempt < MAX_RETRIES and retry:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning("Retry %d/%d after %.1fs: %s",
+                               attempt + 1, MAX_RETRIES, delay, type(e).__name__)
+                time.sleep(delay)
+                continue
+            _cb_on_failure()
+            logger.warning("Error after %d retries: %s: %s",
+                           MAX_RETRIES, type(e).__name__, e)
+            return None
+
+    _cb_on_failure()
+    return None
 
 
 # ── Конверт v700-prod ───────────────────────────────────────
@@ -154,23 +227,30 @@ def _unwrap_envelope(data):
         if "payload" in data and "version" in data:
             return data["payload"]
         return data
-    # Строка — может быть JSON
+    # Строка — может быть JSON (делегируем в deserialize_match — §20.1)
     if isinstance(data, str):
-        try:
-            obj = json.loads(data)
+        obj = _deserialize(data)
+        if obj is not None:
             if isinstance(obj, dict):
                 if "payload" in obj and "version" in obj:
                     return obj["payload"]
                 return obj
-            return obj
-        except (json.JSONDecodeError, TypeError):
-            return None
+        return None
     return data
 
 
 # ── Публичный API ───────────────────────────────────────────
 def is_redis_available():
-    """Health-check Redis (PING) с circuit breaker."""
+    """Health-check Redis (PING) с circuit breaker и config check."""
+    try:
+        from redis_config import is_redis_configured
+        if not is_redis_configured():
+            logger.warning("Redis not configured")
+            return False
+    except ImportError:
+        if not REDIS_REST_URL or not REDIS_REST_TOKEN:
+            return False
+
     result = _execute_upstash_cmd(["PING"])
     return result == "PONG" if result else False
 
@@ -179,14 +259,15 @@ def save_to_cache(field_id, value, sender_repo="unknown"):
     """
     Запись поля в хеш GatekeeperAI с конвертом v700-prod.
     value — Python-объект (dict), не строка (FIX-3 в hub).
+    Сериализация через serialize_match (§20.1).
     """
     if isinstance(value, (dict, list)):
         envelope = _wrap_envelope(value, sender_repo)
-        serialized = json.dumps(envelope, ensure_ascii=False, default=str)
+        serialized = _serialize(envelope)
     elif isinstance(value, str):
         serialized = value
     else:
-        serialized = json.dumps(value, default=str)
+        serialized = _serialize(value)
 
     return _execute_upstash_cmd(["HSET", HASH_NAME, field_id, serialized])
 
@@ -231,6 +312,7 @@ def get_all_fields():
     """
     Возвращает все поля хэш-таблицы (правило 1.15: HKEYS + HMGET).
     При >20 000 полей HGETALL нестабилен.
+    Батчинг через REDIS_MAX_PIPELINE (§9.5).
     """
     keys_raw = _execute_upstash_cmd(["HKEYS", HASH_NAME])
     if not keys_raw or not isinstance(keys_raw, list):
@@ -262,15 +344,16 @@ def get_key(key):
     """
     Чтение отдельного ключа (без конверта, raw JSON).
     Для history:match:* и system:* ключей.
+    Десериализация через deserialize_match (§20.1).
     """
     raw = _execute_upstash_cmd(["GET", key])
     if raw is None:
         return None
     if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return raw
+        obj = _deserialize(raw)
+        if obj is not None:
+            return obj
+        return raw
     return raw
 
 
@@ -278,13 +361,14 @@ def set_key(key, value):
     """
     Запись отдельного ключа (без конверта, raw JSON).
     Для history:match:* и system:* ключей.
+    Сериализация через serialize_match (§20.1).
     """
     if isinstance(value, (dict, list)):
-        serialized = json.dumps(value, ensure_ascii=False, default=str)
+        serialized = _serialize(value)
     elif isinstance(value, str):
         serialized = value
     else:
-        serialized = json.dumps(value, default=str)
+        serialized = _serialize(value)
     return _execute_upstash_cmd(["SET", key, serialized])
 
 
@@ -295,11 +379,13 @@ def delete_key(key):
 
 # ── Экспорт ─────────────────────────────────────────────────
 __all__ = [
+    "__version__",
     "ENVELOPE_VERSION", "HASH_NAME",
+    "MSK_TZ", "BATCH_SIZE", "REDIS_TIMEOUT",
     "is_redis_available",
     "save_to_cache", "get_from_cache", "batch_get_from_cache",
     "delete_from_cache", "get_all_fields", "field_exists",
     "get_key", "set_key", "delete_key",
     "get_circuit_breaker_status", "reset_circuit_breaker",
     "_execute_upstash_cmd",
-]
+  ]
