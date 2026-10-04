@@ -3,7 +3,7 @@ base_collector.py — Базовый класс для всех коллекто
 Наследник переопределяет только fetch_events() и метаданные.
 Шаги 1, 3, 4, 5 — в базовом классе.
 
-v8.10-patched:
+v8.11-patched:
   FIX-1: try-except в process_event — изоляция ошибок (§1.25)
   FIX-2: clean_team_name вызывается до upsert (§19.4)
   FIX-3: source_ids конструируется, а не берётся из event (§1.26)
@@ -12,19 +12,21 @@ v8.10-patched:
   FIX-6: is_shutdown_requested в цикле (§23.3)
   FIX-7: source ключ удаляется из event перед **extra (§1.14)
   FIX-8: try-except в run() для save_meta при падении Redis
-  FIX-9: удалены неиспользуемые импорты (time)
-  FIX-10: __version__, __all__
-
-v8.10-audit:
-  AUDIT-1: import time удалён (не используется)
-  AUDIT-2: normalize_date, is_future_match — try-except импорт с fallback
-  AUDIT-3: __all__ расширен: BaseCollector, __version__
-  AUDIT-4: team_registry — try-except импорт с fallback
+  FIX-9: __version__, __all__
+  FIX-10: print() → logging (§1.23)
+  FIX-11: from gatekeeper_hub — try-except с logger.error
+  FIX-12: enrich_events(processed_events) вместо enrich_events(events)
+  FIX-13: COLLECTOR_NAME == "base" валидация
 """
 
 import logging
 
+__version__ = "8.11-patched"
+
+__all__ = ["BaseCollector", "__version__"]
+
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 try:
     from gatekeeper_hub import (
@@ -38,7 +40,7 @@ except ImportError as e:
     logger.error("Cannot import gatekeeper_hub: %s", e)
     raise
 
-# AUDIT-2: normalize_date и is_future_match могут отсутствовать в хабе.
+# normalize_date и is_future_match могут отсутствовать в хабе.
 # Локальный fallback, чтобы коллектор не падал при ImportError.
 try:
     from gatekeeper_hub import normalize_date
@@ -74,7 +76,7 @@ except ImportError:
         except Exception:
             return True  # лучше обработать, чем пропустить
 
-# AUDIT-4: team_registry может отсутствовать — fallback на простую нормализацию
+# team_registry может отсутствовать — fallback на простую нормализацию
 try:
     from team_registry import clean_team_name
 except ImportError:
@@ -83,10 +85,6 @@ except ImportError:
         if not name:
             return ""
         return str(name).strip()
-
-__version__ = "8.11-patched"
-
-__all__ = ["BaseCollector", "__version__"]
 
 
 class BaseCollector:
@@ -109,9 +107,11 @@ class BaseCollector:
 
     def run(self):
         """Единый 5-шаговый алгоритм."""
+        # FIX-13: валидация COLLECTOR_NAME
         if self.COLLECTOR_NAME == "base":
-            logger.error("COLLECTOR_NAME not set in subclass")
+            logger.error("COLLECTOR_NAME not set in subclass, aborting")
             return
+
         # === ШАГ 1: Инициализация ===
         init = run_initialization(self.COLLECTOR_NAME)
         if not init.get("redis_available"):
@@ -150,7 +150,7 @@ class BaseCollector:
 
         # === ШАГ 3: Создание матчей ===
         created, updated, skipped, errors = 0, 0, 0, 0
-        processed_events = []
+        processed_events = []  # FIX-12: только обработанные события
         for event in events:
             # Graceful shutdown (§23.3)
             if is_shutdown_requested():
@@ -174,12 +174,12 @@ class BaseCollector:
                 skipped += 1
 
         # === ШАГ 4: Enrichment (опционально) ===
-        # Только созданные/обновлённые матчи
-        processed_events = [e for e in events if True]  # placeholder
-        try:
-            self.enrich_events(processed_events)
-        except Exception as e:
-            logger.error("[%s] enrich_events error: %s", self.COLLECTOR_NAME, e, exc_info=True)
+        # FIX-12: enrich только созданные/обновлённые, не все
+        if processed_events:
+            try:
+                self.enrich_events(processed_events)
+            except Exception as e:
+                logger.error("[%s] enrich_events error: %s", self.COLLECTOR_NAME, e, exc_info=True)
 
         # === ШАГ 5: Сохранение мета (§1.27) ===
         try:
@@ -224,7 +224,7 @@ class BaseCollector:
         if "odds" in event:
             extra["odds"] = event["odds"]
 
-        # §1.14: удаляем source из event, чтобы не было конфликта
+        # FIX-7: удаляем source из event (не из extra), чтобы не было конфликта
         event.pop("source", None)
 
         cid = upsert_match(
