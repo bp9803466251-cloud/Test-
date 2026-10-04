@@ -2,7 +2,7 @@ name: Collector Bzzoiro
 
 on:
   schedule:
-    - cron: "0 * * * *"          # каждый час
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       events_only:
@@ -35,7 +35,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          cache: pip
 
       - name: Install dependencies
         run: |
@@ -46,12 +46,12 @@ jobs:
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-          BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || 0.3 }}
-          BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || 0.2 }}
-          BZZOIRO_MAX_RETRIES: ${{ vars.BZZOIRO_MAX_RETRIES || 1 }}
+          BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || '0.3' }}
+          BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || '0.2' }}
+          BZZOIRO_MAX_RETRIES: ${{ vars.BZZOIRO_MAX_RETRIES || '1' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           ARGS=""
