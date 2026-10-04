@@ -5,7 +5,7 @@ GatekeeperAI v8.10-patched.
 Гарантирует:
 - корректную разбивку HTML по частям <= 4000 символов без разрыва тегов;
 - балансировку HTML-тегов между чанками;
-- жесткую нормализацию маркеров: все стрелки → ➔ (U+2794, монохром);
+- жесткую нормализацию маркеров: все стрелки → \u2794 (монохром);
 - добавление пробелов после маркера и вокруг | для читаемости;
 - точечное оборачивание O: и P: в <code> для предотвращения подсветки;
 - retry для transient-ошибок API Telegram (с exponential backoff);
@@ -74,6 +74,29 @@ def _reopen_tags(tags: List[str]) -> str:
     return "".join(f"<{t}>" for t in tags)
 
 
+def _safe_cut_point(line: str, max_chars: int) -> int:
+    """
+    Ищет безопасную точку разреза в длинной строке.
+    Приоритет: пробел → конец тега > → начало тега < → hard fallback.
+    """
+    search_start = max(0, max_chars - 200)
+    search_end = max_chars
+    # 1. Пробел
+    pos = line.rfind(" ", search_start, search_end)
+    if pos > 0:
+        return pos
+    # 2. Конец тега >
+    pos = line.rfind(">", search_start, search_end)
+    if pos > 0:
+        return pos + 1
+    # 3. Начало тега <
+    pos = line.rfind("<", search_start, search_end)
+    if pos > 0:
+        return pos
+    # 4. Hard fallback
+    return max_chars
+
+
 def split_html_safe(text: str, max_chars: int = TELEGRAM_CHUNK_LIMIT) -> List[str]:
     """
     Безопасно разбивает HTML-текст на части <= max_chars.
@@ -100,23 +123,19 @@ def split_html_safe(text: str, max_chars: int = TELEGRAM_CHUNK_LIMIT) -> List[st
                 parts.append(current)
                 current = line
         else:
-            if len(line) > max_chars:
-                search_start = max(0, max_chars - 200)
-                search_end = max_chars
-                cut_pos = line.rfind(" ", search_start, search_end)
-                if cut_pos <= 0:
-                    cut_pos = max_chars - 1
+            # Очень длинная строка — режем
+            while len(line) > max_chars:
+                cut_pos = _safe_cut_point(line, max_chars)
                 chunk = line[:cut_pos]
                 open_tags = _scan_open_tags(chunk)
                 if open_tags:
                     chunk += _close_tags(open_tags)
                     parts.append(chunk)
-                    current = _reopen_tags(open_tags) + line[cut_pos:]
+                    line = _reopen_tags(open_tags) + line[cut_pos:]
                 else:
                     parts.append(chunk)
-                    current = line[cut_pos:]
-            else:
-                current = line
+                    line = line[cut_pos:]
+            current = line
 
     if current:
         parts.append(current)
@@ -149,13 +168,15 @@ def normalize_dashboard_text(dashboard_text: str) -> str:
     dashboard_text = re.sub(r"\u2794(\d)", r"\u2794 \1", dashboard_text)
     dashboard_text = re.sub(r"\s*\|\s*", " | ", dashboard_text)
 
-    # Точечно оборачиваем значения O: и P: до | — strip убирает лишние пробелы
+    # FIX: [^|\n<] — не заходим внутрь HTML-тегов.
+    # Раньше [^|\n]+ захватывал <b>1.85</b> целиком и оборачивал в <code>,
+    # создавая вложенные теги <code><b>1.85</b></code>.
     def protect_values(match):
         prefix = match.group(1)  # 'O' или 'P'
-        val = match.group(2).strip()  # значение без пробелов по краям
+        val = match.group(2).strip()
         return f"{prefix}: <code>{val}</code>"
 
-    processed_text = re.sub(r"\b(O|P):([^|\n]+)", protect_values, dashboard_text)
+    processed_text = re.sub(r"\b(O|P):([^|\n<]+)", protect_values, dashboard_text)
 
     return processed_text
 
@@ -170,13 +191,15 @@ def send_telegram_dashboard(dashboard_text: str) -> Dict[str, Any]:
     Возвращает {"success": bool, "sent_parts": int, "total_parts": int}.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_GROUP_ID")
+    # FIX: все YAML-воркфлоу передают TELEGRAM_CHAT_ID, не TELEGRAM_GROUP_ID.
+    # Без этого фикса chat_id всегда None — дашборд никогда не отправлялся.
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_GROUP_ID")
 
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN не задан в окружении")
         return {"success": False, "sent_parts": 0, "total_parts": 0}
     if not chat_id:
-        logger.error("TELEGRAM_GROUP_ID не задан в окружении")
+        logger.error("TELEGRAM_CHAT_ID (или TELEGRAM_GROUP_ID) не задан в окружении")
         return {"success": False, "sent_parts": 0, "total_parts": 0}
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -217,7 +240,6 @@ def send_telegram_dashboard(dashboard_text: str) -> Dict[str, Any]:
                         error_desc = res.get("description", "unknown error")
                         error_code = res.get("error_code", 0)
                         logger.warning(f"Часть {i+1}/{total_parts}: API error — {error_desc}")
-                        # 400, 403, 404 — не повторяем (клиентская ошибка)
                         if error_code in (400, 403, 404):
                             break
                         retry_count += 1
