@@ -5,6 +5,10 @@ redis_config.py — Конфигурация подключения к Upstash R
 §1.9: Circuit breaker — 10 ошибок → 60с (env-configurable).
 §1.10: SHARED_ переменные с fallback || ''.
 
+v8.11-patched:
+  FIX-1: get_redis_info() — safe split() с try/except (IndexError на malformed URL)
+  FIX-2: reload_config() — перечитывание env без перезагрузки модуля
+
 Переменные окружения (GitHub Actions secrets):
   SHARED_UPSTASH_REDIS_REST_URL    — Base URL Upstash REST API
   SHARED_UPSTASH_REDIS_REST_TOKEN  — Bearer token для аутентификации
@@ -22,7 +26,7 @@ redis_config.py — Конфигурация подключения к Upstash R
 import os
 import logging
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 
 __all__ = [
     "REDIS_REST_URL",
@@ -35,6 +39,7 @@ __all__ = [
     "get_redis_config_errors",
     "is_redis_configured",
     "get_redis_info",
+    "reload_config",
     "__version__",
 ]
 
@@ -53,31 +58,48 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
-# ── Upstash REST API URL ────────────────────────────────────
-# §1.10: Приоритет SHARED_ → fallback → пустая строка
-REDIS_REST_URL = (
-    os.getenv("SHARED_UPSTASH_REDIS_REST_URL", "")
-    or os.getenv("SHARED_REDIS_REST_URL", "")
-    or os.getenv("UPSTASH_REDIS_REST_URL", "")
-)
+# ── Модульные переменные (заполняются _load_from_env) ──────
+REDIS_REST_URL = ""
+REDIS_REST_TOKEN = ""
+REDIS_TIMEOUT = 30
+CB_FAILURE_THRESHOLD = 10
+CB_RECOVERY_TIMEOUT = 60
+REDIS_HASH_NAME = "GatekeeperAI"
+REDIS_MAX_PIPELINE = 10
 
-# ── Upstash REST API Token ───────────────────────────────────
-REDIS_REST_TOKEN = (
-    os.getenv("SHARED_UPSTASH_REDIS_REST_TOKEN", "")
-    or os.getenv("SHARED_REDIS_REST_TOKEN", "")
-    or os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-)
 
-# ── Таймауты (§6: 30с для Redis) ─────────────────────────────
-REDIS_TIMEOUT = _get_int_env("REDIS_TIMEOUT", 30)
+def _load_from_env():
+    """Перечитывание всех параметров из env (FIX-2)."""
+    global REDIS_REST_URL, REDIS_REST_TOKEN, REDIS_TIMEOUT
+    global CB_FAILURE_THRESHOLD, CB_RECOVERY_TIMEOUT
+    global REDIS_HASH_NAME, REDIS_MAX_PIPELINE
 
-# ── Circuit Breaker параметры (§1.9) ─────────────────────────
-CB_FAILURE_THRESHOLD = _get_int_env("CB_FAILURE_THRESHOLD", 10)
-CB_RECOVERY_TIMEOUT = _get_int_env("CB_RECOVERY_TIMEOUT", 60)
+    # §1.10: Приоритет SHARED_ → fallback → пустая строка
+    REDIS_REST_URL = (
+        os.getenv("SHARED_UPSTASH_REDIS_REST_URL", "")
+        or os.getenv("SHARED_REDIS_REST_URL", "")
+        or os.getenv("UPSTASH_REDIS_REST_URL", "")
+    )
+    REDIS_REST_TOKEN = (
+        os.getenv("SHARED_UPSTASH_REDIS_REST_TOKEN", "")
+        or os.getenv("SHARED_REDIS_REST_TOKEN", "")
+        or os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    )
+    REDIS_TIMEOUT = _get_int_env("REDIS_TIMEOUT", 30)
+    CB_FAILURE_THRESHOLD = _get_int_env("CB_FAILURE_THRESHOLD", 10)
+    CB_RECOVERY_TIMEOUT = _get_int_env("CB_RECOVERY_TIMEOUT", 60)
+    REDIS_HASH_NAME = os.getenv("REDIS_HASH_NAME", "GatekeeperAI")
+    REDIS_MAX_PIPELINE = _get_int_env("REDIS_MAX_PIPELINE", 10)
 
-# ── Дополнительные параметры ─────────────────────────────────
-REDIS_HASH_NAME = os.getenv("REDIS_HASH_NAME", "GatekeeperAI")
-REDIS_MAX_PIPELINE = _get_int_env("REDIS_MAX_PIPELINE", 10)
+
+def reload_config():
+    """Перечитать конфигурацию из env (FIX-2). Для тестов и hot-reload."""
+    _load_from_env()
+    logger.info("redis_config reloaded: url_set=%s, hash=%s", bool(REDIS_REST_URL), REDIS_HASH_NAME)
+
+
+# Первичная загрузка
+_load_from_env()
 
 
 # ── Проверка конфигурации ────────────────────────────────────
@@ -110,8 +132,18 @@ def is_redis_configured() -> bool:
 
 def get_redis_info() -> dict:
     """Возвращает краткую информацию о конфигурации Redis (без токена)."""
+    # FIX-1: safe host extraction — try/except для malformed URLs
+    host = ""
+    if REDIS_REST_URL:
+        try:
+            parts = REDIS_REST_URL.split("/")
+            if len(parts) >= 3:
+                host = parts[2]
+        except (IndexError, AttributeError):
+            host = ""
+
     return {
-        "url_host": REDIS_REST_URL.split("/")[2] if REDIS_REST_URL and "/" in REDIS_REST_URL else "",
+        "url_host": host,
         "url_set": bool(REDIS_REST_URL),
         "token_set": bool(REDIS_REST_TOKEN),
         "timeout": REDIS_TIMEOUT,

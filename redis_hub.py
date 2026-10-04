@@ -9,7 +9,7 @@ Circuit Breaker: 10 ошибок → 60с → авто-восстановлен�
   импортируются из redis_config.py — единой точки конфигурации Redis.
   Локальные env-чтения удалены — устранён дублирующий код (правило 1.3).
 
-v8.10-patched:
+v8.11-patched:
   FIX-1: logging вместо print (§1.23)
   FIX-2: Делегирование сериализации в serialize_match/deserialize_match (§20.1)
   FIX-3: Retry с exponential backoff (§9.5)
@@ -22,6 +22,9 @@ v8.10-patched:
   FIX-10: Request recreation в retry loop (urllib data consumption bug)
   FIX-11: expire_key() / ttl support
   FIX-12: Убран dead code после retry loop
+  FIX-13: PipelineBatch.flush() — Upstash pipeline (массив команд одним POST)
+  FIX-14: is_redis_available() — case-insensitive PONG check
+  FIX-15: _deserialize — fallback для не-dict JSON
 """
 
 import json
@@ -43,10 +46,10 @@ from redis_config import (
 )
 
 # ── Константы ──────────────────────────────────────────────
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 ENVELOPE_VERSION = "v700-prod"
 HASH_NAME = REDIS_HASH_NAME
-REDIS_TIMEOUT = _CFG_TIMEOUT  # FIX-12: убрана self-assignment
+REDIS_TIMEOUT = _CFG_TIMEOUT
 CB_THRESHOLD = CB_FAILURE_THRESHOLD
 CB_RESET_SECONDS = CB_RECOVERY_TIMEOUT
 BATCH_SIZE = REDIS_MAX_PIPELINE or 50
@@ -121,17 +124,29 @@ def _serialize(obj):
 
 
 def _deserialize(raw):
+    """
+    Десериализация JSON-строки в Python-объект.
+    FIX-15: fallback для не-dict JSON (list, int, str).
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    # Пытаемся через хаб (если доступен)
     try:
         from gatekeeper_hub import deserialize_match
-        return deserialize_match(raw)
+        result = deserialize_match(raw)
+        if result is not None:
+            return result
     except ImportError:
-        if not raw or not isinstance(raw, str):
-            return None
-        try:
-            obj = json.loads(raw)
-            return obj if isinstance(obj, dict) else None
-        except (json.JSONDecodeError, TypeError):
-            return None
+        pass
+    # Fallback — собственный json.loads
+    try:
+        obj = json.loads(raw)
+        # Возвращаем любой валидный JSON, не только dict
+        if isinstance(obj, (dict, list, str, int, float, bool)):
+            return obj
+        return None
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 # ── Подключение ─────────────────────────────────────────────
@@ -210,7 +225,77 @@ def _execute_upstash_cmd(args, retry=True):
                            MAX_RETRIES, type(e).__name__, e)
             return None
 
-    # FIX-12: dead code удалён — все пути в loop возвращают
+    _cb_on_failure()
+    return None
+
+
+def _execute_pipeline(commands):
+    """
+    FIX-13: Отправка массива команд одним POST-запросом (Upstash pipeline).
+    commands — список списков: [["HSET", ...], ["SET", ...], ...]
+    Возвращает список результатов или None.
+    """
+    if not commands:
+        return []
+
+    if not _cb_can_pass():
+        return None
+
+    url = _get_redis_url()
+    token = _get_redis_token()
+    if not url or not token:
+        return None
+
+    # Upstash REST API поддерживает массив команд в одном POST
+    payload_bytes = json.dumps(commands).encode("utf-8")
+
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            url,
+            data=payload_bytes,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=REDIS_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8")
+                results = json.loads(body)
+                _cb_on_success()
+                # Upstash возвращает массив результатов для pipeline
+                if isinstance(results, list):
+                    return [r.get("result") if isinstance(r, dict) else r for r in results]
+                return results.get("result") if isinstance(results, dict) else results
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                json.JSONDecodeError, OSError, TimeoutError) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                retry_after = int(e.headers.get("Retry-After", "5"))
+                if attempt < MAX_RETRIES:
+                    logger.warning("Pipeline HTTP 429, waiting %ds (attempt %d/%d)",
+                                   retry_after, attempt + 1, MAX_RETRIES)
+                    time.sleep(retry_after)
+                    continue
+                _cb_on_failure()
+                return None
+
+            if isinstance(e, urllib.error.HTTPError) and e.code < 500:
+                _cb_on_failure()
+                logger.warning("Pipeline HTTP %d: %s", e.code, type(e).__name__)
+                return None
+
+            if attempt < MAX_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning("Pipeline retry %d/%d after %.1fs: %s",
+                               attempt + 1, MAX_RETRIES, delay, type(e).__name__)
+                time.sleep(delay)
+                continue
+
+            _cb_on_failure()
+            logger.warning("Pipeline error after %d retries: %s", MAX_RETRIES, type(e).__name__)
+            return None
+
     _cb_on_failure()
     return None
 
@@ -248,8 +333,9 @@ def _unwrap_envelope(data):
 class PipelineBatch:
     """
     Батч-буфер для массовой записи в Redis.
-    Коллекторы используют его для накопления HSET-команд
-    и отправки одним запросом (или порциями BATCH_SIZE).
+    Коллекторы используют его для накопления HSET/SET-команд
+    и отправки одним POST-запросом (Upstash pipeline).
+    FIX-13: flush() использует _execute_pipeline вместо последовательных запросов.
     """
     def __init__(self, max_size=None):
         self._commands = []
@@ -276,13 +362,23 @@ class PipelineBatch:
         self._commands.append(["SET", key, serialized])
 
     def flush(self):
-        """Выполнить все накопленные команды порциями BATCH_SIZE."""
+        """
+        Выполнить все накопленные команды порциями max_size.
+        FIX-13: каждая порция отправляется одним POST (Upstash pipeline),
+        а не отдельными запросами на каждую команду.
+        """
         total = 0
         for i in range(0, len(self._commands), self._max_size):
             batch = self._commands[i:i + self._max_size]
-            for cmd in batch:
-                _execute_upstash_cmd(cmd, retry=True)
-                total += 1
+            results = _execute_pipeline(batch)
+            if results is not None:
+                total += len(batch)
+            else:
+                # Fallback: последовательная отправка при неудаче pipeline
+                logger.warning("Pipeline failed, falling back to sequential for %d commands", len(batch))
+                for cmd in batch:
+                    _execute_upstash_cmd(cmd, retry=True)
+                    total += 1
         self._commands.clear()
         return total
 
@@ -292,7 +388,10 @@ class PipelineBatch:
 
 # ── Публичный API ───────────────────────────────────────────
 def is_redis_available():
-    """Health-check Redis (PING) с circuit breaker и config check."""
+    """
+    Health-check Redis (PING) с circuit breaker и config check.
+    FIX-14: case-insensitive PONG check — устойчив к регистру и whitespace.
+    """
     try:
         from redis_config import is_redis_configured
         if not is_redis_configured():
@@ -303,7 +402,10 @@ def is_redis_available():
             return False
 
     result = _execute_upstash_cmd(["PING"])
-    return result == "PONG" if result else False
+    if not result:
+        return False
+    # FIX-14: устойчивая проверка PONG
+    return str(result).strip().upper() == "PONG"
 
 
 def save_to_cache(field_id, value, sender_repo="unknown"):
@@ -358,7 +460,7 @@ def delete_from_cache(field_id):
 def get_all_fields():
     """
     Возвращает все поля хэш-таблицы (правило 1.15: HKEYS + HMGET).
-    Батчинг через REDIS_MAX_PIPELINE (§9.5).
+    Батчинг через BATCH_SIZE (§9.5).
     """
     keys_raw = _execute_upstash_cmd(["HKEYS", HASH_NAME])
     if not keys_raw or not isinstance(keys_raw, list):
@@ -484,4 +586,5 @@ __all__ = [
     "get_circuit_breaker_status", "reset_circuit_breaker",
     "PipelineBatch",
     "_execute_upstash_cmd",
+    "_execute_pipeline",
 ]
