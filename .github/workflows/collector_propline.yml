@@ -1,9 +1,6 @@
 name: Collector Propline
 
 on:
-  schedule:
-    # Каждые 2 часа
-    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -12,7 +9,7 @@ on:
         default: false
 
 env:
-  PYTHON_VERSION: "3.12"
+  PYTHON_VERSION: "3.11"
   PYTHONUNBUFFERED: "1"
   GK_CONFIG_FILE: "gatekeeper_config.yaml"
 
@@ -44,10 +41,10 @@ jobs:
 
       - name: Run Collector
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
           PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
           PROPLINE_RATE_DELAY: ${{ vars.PROPLINE_RATE_DELAY || '0.2' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -63,7 +60,7 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
         run: |
           MSG="🔴 <b>Collector Propline FAILED</b>%0ARepo: ${{ github.repository }}%0ARun: ${{ github.run_id }}%0A%0A👉 https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
