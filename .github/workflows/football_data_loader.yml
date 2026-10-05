@@ -1,9 +1,6 @@
 name: Football Data Loader
 
 on:
-  schedule:
-    # Ежедневно в 06:00 UTC (09:00 МСК)
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       seasons:
@@ -46,19 +43,19 @@ jobs:
     timeout-minutes: 180
 
     env:
-      PYTHON_VERSION: '3.12'
+      PYTHON_VERSION: '3.11'
       SEASONS_INPUT: ${{ github.event.inputs.seasons || '' }}
       LEAGUES_INPUT: ${{ github.event.inputs.leagues || '' }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days || '0' }}
       LIMIT_INPUT: ${{ github.event.inputs.limit || '0' }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
       FLUSH_INPUT: ${{ github.event.inputs.flush || 'false' }}
-      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
       GK_CONFIG_FILE: gatekeeper_config.yaml
       FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
       PYTHONUNBUFFERED: "1"
@@ -127,7 +124,12 @@ jobs:
           if [ "${DRY_RUN_INPUT}" = "true" ]; then
             DRY_FLAG="--dry-run"
           fi
-          python -u football_data_to_redis.py             --seasons "${SEASONS_INPUT}"             --leagues "${LEAGUES_INPUT}"             --history-days ${HISTORY_DAYS_INPUT}             --limit ${LIMIT_INPUT}             ${DRY_FLAG}
+          python -u football_data_to_redis.py \
+            --seasons "${SEASONS_INPUT}" \
+            --leagues "${LEAGUES_INPUT}" \
+            --history-days ${HISTORY_DAYS_INPUT} \
+            --limit ${LIMIT_INPUT} \
+            ${DRY_FLAG}
 
       - name: Verify Redis data
         if: always()
@@ -226,6 +228,7 @@ jobs:
         if: failure()
         run: |
           MSG="❌ Football Data Loader FAILED%0A%0ARun: ${{ github.run_id }}%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="${MSG}" || true
-
-          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
+            -d text="${MSG}" || true
+            
