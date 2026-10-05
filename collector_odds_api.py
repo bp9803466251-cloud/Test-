@@ -53,6 +53,7 @@ except ImportError:
     logger.error("team_registry не найден")
     normalize_team_name = lambda x: x.strip().lower() if x else ""
     build_canonical_id = lambda h, a, d: f"{h}__{a}__{d[:10].replace('-','')}"
+    clean_team_name = lambda name: name.lower().strip().replace(" ", "_") if name else ""
 
 COLLECTOR_NAME = "odds_api"
 
@@ -240,17 +241,21 @@ def collect_odds_api() -> Dict[str, Any]:
                 created += 1
                 continue
 
-            cid = upsert_match(
-                home_team=home_team,
-                away_team=away_team,
-                date_utc=date_utc,
-                competition=sport_title,
-                country="",
-                status="scheduled",
-                source=COLLECTOR_NAME,
-                sources=[COLLECTOR_NAME],
-                source_ids={COLLECTOR_NAME: event_id},
-            )
+            try:
+                cid = upsert_match(
+                    home_team=home_team,
+                    away_team=away_team,
+                    date_utc=date_utc,
+                    competition=sport_title,
+                    country="",
+                    status="scheduled",
+                    source=COLLECTOR_NAME,
+                    sources=[COLLECTOR_NAME],
+                    source_ids={COLLECTOR_NAME: event_id},
+                )
+            except Exception as e:
+                logger.error(f"[ODDS_API] upsert error: {e}")
+                cid = None
 
             if cid:
                 stored += 1
@@ -269,9 +274,12 @@ def collect_odds_api() -> Dict[str, Any]:
                 if odds_away is not None:
                     odds_current["away"] = float(odds_away)
                 idempotency_key = f"{run_id}:{cid}:odds"
-                patch_match(cid, "odds", {"current": odds_current},
-                           source=COLLECTOR_NAME, upstream="betradar",
-                           idempotency_key=idempotency_key)
+                try:
+                    patch_match(cid, "odds", {"current": odds_current},
+                               source=COLLECTOR_NAME, upstream="betradar",
+                               idempotency_key=idempotency_key)
+                except Exception as e:
+                    logger.error(f"[ODDS_API] patch error for cid={cid}: {e}")
 
         time.sleep(rate_delay)
 

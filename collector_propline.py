@@ -255,17 +255,21 @@ def collect_propline() -> Dict[str, Any]:
                 continue
 
             # §1.4: upsert через хаб
-            cid = upsert_match(
-                home_team=home_team,
-                away_team=away_team,
-                date_utc=date_utc,
-                competition=sport_title,
-                country="",
-                status="scheduled",
-                source=COLLECTOR_NAME,
-                sources=[COLLECTOR_NAME],
-                source_ids={COLLECTOR_NAME: event_id},
-            )
+            try:
+                cid = upsert_match(
+                    home_team=home_team,
+                    away_team=away_team,
+                    date_utc=date_utc,
+                    competition=sport_title,
+                    country="",
+                    status="scheduled",
+                    source=COLLECTOR_NAME,
+                    sources=[COLLECTOR_NAME],
+                    source_ids={COLLECTOR_NAME: event_id},
+                )
+            except Exception as e:
+                logger.error(f"[PROPLINE] upsert error for {home_team} vs {away_team}: {e}")
+                cid = None
 
             if cid:
                 stored += 1
@@ -282,9 +286,12 @@ def collect_propline() -> Dict[str, Any]:
 
                 if odds_current:
                     idempotency_key = f"{run_id}:{cid}:odds"
-                    patch_match(cid, "odds", {"current": odds_current},
-                               source=COLLECTOR_NAME, upstream="propline",
-                               idempotency_key=idempotency_key)
+                    try:
+                        patch_match(cid, "odds", {"current": odds_current},
+                                   source=COLLECTOR_NAME, upstream="propline",
+                                   idempotency_key=idempotency_key)
+                    except Exception as e:
+                        logger.error(f"[PROPLINE] patch error for cid={cid}: {e}")
 
             time.sleep(rate_delay)
 

@@ -254,7 +254,7 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
 
 def collect_sharpapi():
     # GitHub secret: SHARP_API_KEY (primary). SHARPAPI_API_KEY — legacy fallback.
-    api_key = os.environ.get("SHARP_API_KEY") or os.environ.get("SHARPAPI_API_KEY")
+    api_key = os.environ.get("SHARPAPI_API_KEY") or os.environ.get("SHARP_API_KEY")
     if not api_key:
         logger.error("[SHARPAPI] SHARP_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
@@ -393,17 +393,21 @@ def collect_sharpapi():
         idempotency_key = f"{run_id}:{eid}:odds"
 
         # 1. Создать матч (с source и sources)
-        cid = upsert_match(
-            home_team=home_team,
-            away_team=away_team,
-            date_utc=date_utc,
-            competition=ev["league"],
-            country=ev.get("country", ""),
-            status="scheduled",
-            source=COLLECTOR_NAME,
-            sources=[COLLECTOR_NAME],
-            source_ids={COLLECTOR_NAME: str(eid)},
-        )
+        try:
+            cid = upsert_match(
+                home_team=home_team,
+                away_team=away_team,
+                date_utc=date_utc,
+                competition=ev["league"],
+                country=ev.get("country", ""),
+                status="scheduled",
+                source=COLLECTOR_NAME,
+                sources=[COLLECTOR_NAME],
+                source_ids={COLLECTOR_NAME: str(eid)},
+            )
+        except Exception as e:
+            logger.error(f"[SHARPAPI] upsert error for event {eid}: {e}")
+            continue
 
         if cid:
             stored += 1
@@ -420,12 +424,15 @@ def collect_sharpapi():
                 odds_current["away"] = float(ev_odds["away"])
 
             if odds_current and not dry_run:
-                patch_match(
-                    cid, "odds", {"current": odds_current},
-                    source=COLLECTOR_NAME,
-                    upstream="betradar",
-                    idempotency_key=idempotency_key,
-                )
+                try:
+                    patch_match(
+                        cid, "odds", {"current": odds_current},
+                        source=COLLECTOR_NAME,
+                        upstream="betradar",
+                        idempotency_key=idempotency_key,
+                    )
+                except Exception as e:
+                    logger.error(f"[SHARPAPI] patch error for cid={cid}: {e}")
 
     total_events = len(events_map)
     logger.info(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, "
