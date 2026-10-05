@@ -29,7 +29,7 @@ Value engine + Telegram-дашборд по стандарту §12.
 v8.11-patched:
   FIX-11: batch_evaluate → run_pipeline — API mismatch (batch_evaluate возвращал
           {cid: float}, а main.py ожидал {hot, warm, stats}).
-  FIX-12: Meta keys "sharpapi:meta" → "meta:sharpapi" — несоответствие формата
+  FIX-12: Meta keys "sharpapi:meta" → "sharpapi:meta" — несоответствие формата
           ключей с redis_hub и redis_diagnostics (оба используют "meta:{collector}").
   FIX-13: _split_message → делегирование в telegram_transport.split_html_safe.
   FIX-14: TG_MAX_CHARS → TELEGRAM_CHUNK_LIMIT из telegram_transport.
@@ -114,7 +114,11 @@ __version__ = "8.11-patched"
 __all__ = ["main", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
-VALUE_THRESHOLD = float(os.environ.get("VALUE_THRESHOLD", "") or os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
+try:
+    from gatekeeper_config import get_value_threshold
+    VALUE_THRESHOLD = get_value_threshold()
+except ImportError:
+    VALUE_THRESHOLD = float(os.environ.get("VALUE_THRESHOLD", "") or os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_GROUP_ID", "") or os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -206,10 +210,10 @@ def _ecosystem_line() -> str:
         return " | ".join(markers)
     # FIX-12: meta:{collector} вместо {collector}:meta
     for name, meta_key in [
-        ("Bzzoiro", "meta:bzzoiro"),
-        ("Sharp", "meta:sharpapi"),
-        ("PropLine", "meta:propline"),
-        ("OddsAPI", "meta:odds_api"),
+        ("Bzzoiro", "bzzoiro:meta"),
+        ("Sharp", "sharpapi:meta"),
+        ("PropLine", "propline:meta"),
+        ("OddsAPI", "odds_api:meta"),
     ]:
         try:
             meta = get_from_cache(meta_key)
@@ -232,10 +236,10 @@ def _ecosystem_line() -> str:
 def _last_module() -> str:
     # FIX-12: meta:{collector} вместо {collector}:meta
     modules = [
-        ("Sharp", "meta:sharpapi"),
-        ("Bzzoiro", "meta:bzzoiro"),
-        ("PropLine", "meta:propline"),
-        ("OddsAPI", "meta:odds_api"),
+        ("Sharp", "sharpapi:meta"),
+        ("Bzzoiro", "bzzoiro:meta"),
+        ("PropLine", "propline:meta"),
+        ("OddsAPI", "odds_api:meta"),
     ]
     latest = None
     latest_dt = None
