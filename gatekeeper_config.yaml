@@ -9,6 +9,7 @@ v8.11-patched:
   FIX-3: get_config_errors — проверка SHARED_REDIS_REST_URL fallback (не только UPSTASH_)
   FIX-4: ns_key — валидация входных данных (пустой base/cid → "")
   FIX-5: logging.basicConfig убран (влияет на все импортёры)
+  FIX-6: VALUE_THRESHOLD (exported) синхронизируется в reload_config() — был stale
 """
 
 import os
@@ -124,12 +125,13 @@ def load_config(reload=False):
 
 def reload_config():
     """Принудительная перезагрузка конфигурации + callbacks + VALUE_THRESHOLD."""
-    global _CONFIG_CACHE, _VALUE_THRESHOLD
+    global _CONFIG_CACHE, _VALUE_THRESHOLD, VALUE_THRESHOLD
     _CONFIG_CACHE = None
     _VALUE_THRESHOLD = None  # FIX-2: сброс для пересчёта
     config = load_config(reload=True)
     # FIX-2: пересчитываем VALUE_THRESHOLD после reload
     _VALUE_THRESHOLD = _compute_value_threshold()
+    VALUE_THRESHOLD = _VALUE_THRESHOLD  # FIX-6: sync exported variable
     for cb in _RELOAD_CALLBACKS:
         try:
             cb()
