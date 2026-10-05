@@ -1,60 +1,20 @@
-# ═══════════════════════════════════════════════════════════
-# gatekeeper_config.yaml — Единая конфигурация GatekeeperAI
-# Версия 8.11-patched | Schema v710 | Гайд §20.3
-# Env-переменные остаются для секретов (API-ключи, Redis URL).
-# Все настраиваемые параметры — здесь.
-# ═══════════════════════════════════════════════════════════
-
+# GatekeeperAI v8.11-patched — Configuration (§20.3)
 version: "v811"
 
-# ── Коллекторы ─────────────────────────────────────────────
-collectors:
-  sharpapi:
-    rate_delay: 1.0
-    max_retries: 3
-    timeout: 30
-    max_pages: 5
-    limit: 100
-    days_ahead: 3
-  odds_api:
-    rate_delay: 0.5
-    max_retries: 3
-    regions: ["eu", "uk"]
-    markets: ["h2h", "spreads", "totals"]
-    odds_format: decimal
-  bzzoiro:
-    rate_delay: 2.0
-    enrich_delay: 1.0
-    max_retries: 5
-    days_ahead: 3
-  propline:
-    rate_delay: 1.5
-    max_retries: 3
-  football_data:
-    seasons: ["2425", "2526", "2627"]
-    leagues: "all"
-    pipeline_batch_size: 50
-    history_days: 0
-    limit: 0
+# Pipeline settings
+pipeline_batch_size: 50
+index_lookback_days: 2
+index_lookahead_days: 3
 
-# ── Redis ──────────────────────────────────────────────────
-redis:
-  read_timeout: 30
-  write_timeout: 30
-  pipeline_batch_size: 50          # §1.15: REDIS_MAX_PIPELINE = 50
-  circuit_breaker_threshold: 10
-  circuit_breaker_reset: 60
-
-# ── Очистка (§1.7) ────────────────────────────────────────
-cleanup:
-  match_ttl_hours: 2
-  index_lookback_days: 2           # положительное значение (дней назад)
-  index_lookahead_days: 7
+# Feature flags
+features:
+  graceful_shutdown: true
   auto_migrate: true
+  telegram_dashboard: true
+  value_bets: true
+  safe_mode: true
 
-# ── Collector upstream (§1.20) ─────────────────────────────
-# Маппинг коллектор → upstream провайдер.
-# Не путать с upstream_map в odds_priority.yaml (там: upstream → rank_num).
+# Collector upstream mapping (§19.2)
 collector_upstream:
   sharpapi: betradar
   odds_api: betradar
@@ -62,19 +22,23 @@ collector_upstream:
   propline: pinnacle
   football_data: bet365
 
-# ── Value engine ──────────────────────────────────────────
-value_engine:
-  threshold: 0.03
-  min_odds: 1.01
-  max_odds: 1000.0
+# Value engine
+value_threshold: 0.03
 
-# ── Telegram ──────────────────────────────────────────────
-telegram:
-  dashboard_interval_hours: 1
-  alert_on_failure: true
+# Cleanup settings
+cleanup:
+  enabled: true
+  dry_run: false
+  auto_migrate: true
+  expire_seconds: 86400
 
-# ── Logging (§20.6 — log_event внедрён) ───────────────────
-logging:
-  level: INFO
-  structured: true                 # log_event активирован во всех модулях
-  safe_mode: true                  # §1.23: без payloads в логах
+# Redis settings (env-based, these are defaults)
+redis:
+  timeout: 30
+  hash_name: GatekeeperAI
+  max_pipeline: 50
+
+# Circuit breaker (§1.9)
+circuit_breaker:
+  failure_threshold: 10
+  recovery_timeout: 60
