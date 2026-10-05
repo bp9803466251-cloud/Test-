@@ -27,7 +27,8 @@ from typing import Any, Optional
 import logging
 from collections import defaultdict
 
-import requests
+import urllib.request
+import urllib.error
 
 logger = logging.getLogger("bzzoiro")
 if not logger.handlers:
@@ -63,7 +64,7 @@ except ImportError:
         def decorator(func):
             return func
         return decorator
-    def log_event(module, event, **kwargs):
+    def log_event(source, level, message, **kwargs):
         pass
 try:
     from team_registry import normalize_team_name, build_canonical_id, clean_team_name
@@ -114,29 +115,46 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
 
     for attempt in range(max_retries + 1):
         try:
-            resp = requests.get(url, headers=headers, timeout=30)
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+                body = resp.read().decode("utf-8")
 
-            if resp.status_code == 404:
+            if status == 404:
                 _cache_response(url, _NOT_FOUND)
                 return _NOT_FOUND
-            if resp.status_code == 429:
+            if status == 429:
                 wait = 2 ** (attempt + 2)
                 logger.warning(f"Rate limit. Waiting {wait}s")
                 time.sleep(wait)
                 continue
-            if resp.status_code != 200:
+            if status != 200:
                 if attempt < max_retries:
                     time.sleep(RATE_DELAY * 2)
                     continue
-                logger.error(f"HTTP {resp.status_code}: {url}")
+                logger.error(f"HTTP {status}: {url}")
                 return None
 
-            data = resp.json()
+            data = json.loads(body)
             _cache_response(url, data)
             time.sleep(RATE_DELAY)
             return data
 
-        except (requests.RequestException, json.JSONDecodeError) as e:
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                _cache_response(url, _NOT_FOUND)
+                return _NOT_FOUND
+            if e.code == 429:
+                wait = 2 ** (attempt + 2)
+                logger.warning(f"Rate limit. Waiting {wait}s")
+                time.sleep(wait)
+                continue
+            if attempt < max_retries:
+                time.sleep(RATE_DELAY * 2)
+                continue
+            logger.error(f"HTTP {e.code}: {url}")
+            return None
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue
@@ -295,7 +313,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
     # --- Шаг 1: Загрузка событий ---
     logger.info("[BZZOIRO] Шаг 1: Загрузка событий...")
-    log_event("bzzoiro", "collection_start", days_ahead=DAYS_AHEAD, dry_run=dry_run)
+    log_event("bzzoiro", "INFO", "Collection started", days_ahead=DAYS_AHEAD, dry_run=dry_run)
     now = dt.datetime.now(dt.timezone.utc)
     date_from = now.strftime("%Y-%m-%d")
     date_to = (now + dt.timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
@@ -670,7 +688,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         "shutdown_triggered": shutdown_triggered,
     }
     logger.info(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
-    log_event("bzzoiro", "collection_complete",
+    log_event("bzzoiro", "INFO", "Collection complete",
               total_events=len(all_events), created=created, updated=updated,
               odds_enriched=odds_enriched, predictions=pred_enriched,
               errors=enrichment_errors)

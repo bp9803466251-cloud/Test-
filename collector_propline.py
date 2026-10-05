@@ -51,14 +51,16 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
-# §20.7: Module registry
+# §20.7: Module registry + §20.6: log_event
 try:
-    from gatekeeper_hub import register_module
+    from gatekeeper_hub import register_module, log_event
 except ImportError:
     def register_module(name, **kwargs):
         def deco(func):
             return func
         return deco
+    def log_event(source, level, message, **kwargs):
+        pass
 
 # team_registry — §2.4
 try:
@@ -152,6 +154,7 @@ def collect_propline() -> Dict[str, Any]:
         logger.error("Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
+    log_event("propline", "INFO", "Collection started", run_id=run_id, dry_run=dry_run)
     logger.info(f"Propline collector started (run_id={run_id}, dry_run={dry_run})")
 
     stored = 0
@@ -325,6 +328,8 @@ def collect_propline() -> Dict[str, Any]:
         "deduped": deduped,
         "run_id": run_id,
     }
+    log_event("propline", "INFO", "Collection complete",
+        total_events=total_events, stored=stored, errors=error_count)
     if not dry_run:
         save_meta(COLLECTOR_NAME, **meta)
 
