@@ -22,10 +22,10 @@ jobs:
       GATEKEEPER_ENV: test
       GK_CONFIG_FILE: gatekeeper_config.yaml
       PYTHONUNBUFFERED: "1"
-      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       VALUE_THRESHOLD: '0.03'
 
     steps:
@@ -35,7 +35,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
@@ -49,14 +49,14 @@ jobs:
 
       - name: Syntax check all Python files
         run: |
-          find . -name "*.py" -not -path "./.venv/*" -not -path "./venv/*" | xargs -I{} python -m py_compile {}
+          find . -name "*.py" -not -path "./.venv/*" -not -path "./venv/*" | xargs -r -I{} python -m py_compile {}
           echo "All Python files compile successfully"
 
       - name: Telegram alert on failure
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
         run: |
           MESSAGE="🔴 CI Tests FAILED in ${{ github.repository }}"
           curl -s -X POST \
