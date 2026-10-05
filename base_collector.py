@@ -23,7 +23,7 @@ import logging
 
 __version__ = "8.11-patched"
 
-__all__ = ["BaseCollector", "__version__"]
+__all__ = ["BaseCollector", "__version__", "register_module"]
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -36,6 +36,21 @@ try:
         is_shutdown_requested,
         now_msk,
     )
+    # §20.7: module registry
+    try:
+        from gatekeeper_hub import register_module
+    except ImportError:
+        def register_module(name, role="collector", writes=None, reads=None):
+            """No-op fallback (§20.7)."""
+            def decorator(func):
+                return func
+            return decorator
+    # §20.6: structured logging
+    try:
+        from gatekeeper_hub import log_event
+    except ImportError:
+        def log_event(source, level, message, **kwargs):
+            pass
 except ImportError as e:
     logger.error("Cannot import gatekeeper_hub: %s", e)
     raise
@@ -113,6 +128,8 @@ class BaseCollector:
             return
 
         # === ШАГ 1: Инициализация ===
+        log_event(self.COLLECTOR_NAME, "INFO", "collection_start",
+                  collector=self.COLLECTOR_NAME, source=self.SOURCE_NAME)
         init = run_initialization(self.COLLECTOR_NAME)
         if not init.get("redis_available"):
             try:
@@ -182,6 +199,9 @@ class BaseCollector:
                 logger.error("[%s] enrich_events error: %s", self.COLLECTOR_NAME, e, exc_info=True)
 
         # === ШАГ 5: Сохранение мета (§1.27) ===
+        log_event(self.COLLECTOR_NAME, "INFO", "collection_complete",
+                  total_events=len(events), stored_matches=created + updated,
+                  created=created, updated=updated, errors=errors)
         try:
             save_meta(self.COLLECTOR_NAME,
                       total_events=len(events),
@@ -253,3 +273,20 @@ class BaseCollector:
     def enrich_events(self, events: list):
         """Переопределить при необходимости. Enrichment после создания."""
         pass
+
+    # §20.7: class-level registration for subclasses
+    @classmethod
+    def register(cls, name=None, role="collector", writes=None, reads=None):
+        """Регистрация подкласса в MODULE_REGISTRY (§20.7).
+
+        Использование в наследнике:
+            class SharpapiCollector(BaseCollector):
+                COLLECTOR_NAME = "sharpapi"
+                ...
+            SharpapiCollector.register(writes=["upsert_match", "patch_match", "save_meta"],
+                                       reads=["{collector}:meta"])
+        """
+        mod_name = name or cls.COLLECTOR_NAME
+        # Декорируем run() через register_module
+        cls.run = register_module(mod_name, role=role, writes=writes, reads=reads)(cls.run)
+        return cls
