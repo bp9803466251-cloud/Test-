@@ -195,7 +195,7 @@ def send_telegram_dashboard(dashboard_text: str) -> Dict[str, Any]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     # FIX: все YAML-воркфлоу передают TELEGRAM_CHAT_ID, не TELEGRAM_GROUP_ID.
     # Без этого фикса chat_id всегда None — дашборд никогда не отправлялся.
-    chat_id = os.environ.get("TELEGRAM_GROUP_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_GROUP_ID")
 
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN не задан в окружении")

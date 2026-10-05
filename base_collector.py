@@ -1,292 +1,203 @@
+#!/usr/bin/env python3
 """
-base_collector.py — Базовый класс для всех коллекторов (§19.4).
-Наследник переопределяет только fetch_events() и метаданные.
-Шаги 1, 3, 4, 5 — в базовом классе.
+base_collector.py — Базовый класс коллектора GatekeeperAI (§19.4).
+5-шаговый алгоритм: fetch → normalize → enrich → save → meta.
 
-v8.11-patched:
-  FIX-1: try-except в process_event — изоляция ошибок (§1.25)
-  FIX-2: clean_team_name вызывается до upsert (§19.4)
-  FIX-3: source_ids конструируется, а не берётся из event (§1.26)
-  FIX-4: last_run в save_meta (§1.27)
-  FIX-5: сортировка событий по дате (§1.32)
-  FIX-6: is_shutdown_requested в цикле (§23.3)
-  FIX-7: source ключ удаляется из event перед **extra (§1.14)
-  FIX-8: try-except в run() для save_meta при падении Redis
-  FIX-9: __version__, __all__
-  FIX-10: print() → logging (§1.23)
-  FIX-11: from gatekeeper_hub — try-except с logger.error
-  FIX-12: enrich_events(processed_events) вместо enrich_events(events)
-  FIX-13: COLLECTOR_NAME == "base" валидация
+Новые коллекторы наследуют BaseCollector и реализуют fetch() + normalize().
 """
 
+import os
+import sys
+import json
+import time
 import logging
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
 
 __version__ = "8.11-patched"
+__all__ = ["BaseCollector", "__version__"]
 
-__all__ = ["BaseCollector", "__version__", "register_module"]
+logger = logging.getLogger("base_collector")
+logger.addHandler(logging.NullHandler__)
 
-logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
-
-try:
-    from gatekeeper_hub import (
-        run_initialization,
-        upsert_match,
-        save_meta,
-        is_shutdown_requested,
-        now_msk,
-    )
-    # §20.7: module registry
-    try:
-        from gatekeeper_hub import register_module
-    except ImportError:
-        def register_module(name, role="collector", writes=None, reads=None):
-            """No-op fallback (§20.7)."""
-            def decorator(func):
-                return func
-            return decorator
-    # §20.6: structured logging
-    try:
-        from gatekeeper_hub import log_event
-    except ImportError:
-        def log_event(source, level, message, **kwargs):
-            pass
-except ImportError as e:
-    logger.error("Cannot import gatekeeper_hub: %s", e)
-    raise
-
-# normalize_date и is_future_match могут отсутствовать в хабе.
-# Локальный fallback, чтобы коллектор не падал при ImportError.
-try:
-    from gatekeeper_hub import normalize_date
-except ImportError:
-    from datetime import datetime, timezone, timedelta
-    _MSK = timezone(timedelta(hours=3))
-
-    def normalize_date(raw):
-        """Fallback: нормализация даты в ISO формат МСК."""
-        if not raw:
-            return ""
-        try:
-            if isinstance(raw, str) and "T" in raw:
-                return raw
-            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            return dt.astimezone(_MSK).strftime("%Y-%m-%dT%H:%M:%S+03:00")
-        except Exception:
-            return str(raw)
-
-try:
-    from gatekeeper_hub import is_future_match
-except ImportError:
-    from datetime import datetime, timezone, timedelta
-    _MSK = timezone(timedelta(hours=3))
-
-    def is_future_match(date_str):
-        """Fallback: проверка, что матч в будущем."""
-        if not date_str:
-            return False
-        try:
-            dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
-            return dt > datetime.now(_MSK)
-        except Exception:
-            return True  # лучше обработать, чем пропустить
-
-# team_registry может отсутствовать — fallback на простую нормализацию
-try:
-    from team_registry import clean_team_name
-except ImportError:
-    def clean_team_name(name):
-        """Fallback: простая нормализация имени команды."""
-        if not name:
-            return ""
-        return str(name).strip()
+MSK_TZ = timezone(timedelta(hours=3))
 
 
 class BaseCollector:
     """
-    Базовый класс коллектора GatekeeperAI.
-    Единый 5-шаговый алгоритм (правило 1.11).
-
-    Наследник переопределяет:
-        COLLECTOR_NAME — имя коллектора (для meta)
-        SOURCE_NAME — имя источника (для source_ids)
-        fetch_events() — получение событий из API
-
-    Опционально:
-        enrich_events() — enrichment после создания матчей
+    Базовый класс коллектора (§19.4).
+    
+    5-шаговый алгоритм:
+      1. fetch()      — получить данные из API
+      2. normalize()  — нормализовать имена команд, даты
+      3. enrich()     — добавить odds, upstream, sources
+      4. save()       — upsert_match через хаб
+      5. meta()       — save_meta через хаб
+    
+    Подклассы реализуют:
+      - fetch()        → raw API data
+      - normalize(raw) → list of match dicts
     """
 
-    COLLECTOR_NAME = "base"
-    SOURCE_NAME = "base"
-    TIMEOUT = 30  # секунд для внешних API
+    def __init__(self, name: str, base_url: str = ""):
+        self.name = name
+        self.base_url = base_url
+        self.matches_processed = 0
+        self.errors = 0
+        self.start_time = None
+        
+        # Lazy imports
+        self._hub = None
+        self._team_registry = None
 
-    def run(self):
-        """Единый 5-шаговый алгоритм."""
-        # FIX-13: валидация COLLECTOR_NAME
-        if self.COLLECTOR_NAME == "base":
-            logger.error("COLLECTOR_NAME not set in subclass, aborting")
-            return
-
-        # === ШАГ 1: Инициализация ===
-        log_event(self.COLLECTOR_NAME, "INFO", "collection_start",
-                  collector=self.COLLECTOR_NAME, source=self.SOURCE_NAME)
-        init = run_initialization(self.COLLECTOR_NAME)
-        if not init.get("redis_available"):
+    def _get_hub(self):
+        if self._hub is None:
             try:
-                save_meta(self.COLLECTOR_NAME,
-                          stored_matches=0, error_count=1,
-                          last_run=now_msk())
-            except Exception:
-                pass
-            return
+                import gatekeeper_hub as hub
+                self._hub = hub
+            except ImportError:
+                logger.error("gatekeeper_hub not found")
+                return None
+        return self._hub
 
-        # === ШАГ 2: Получение событий ===
+    def _get_team_registry(self):
+        if self._team_registry is None:
+            try:
+                import team_registry
+                self._team_registry = team_registry
+            except ImportError:
+                logger.warning("team_registry not found")
+                return None
+        return self._team_registry
+
+    # ── Steps to override ────────────────────────────────
+
+    def fetch(self, **kwargs) -> Any:
+        """Шаг 1: Получить данные из API. Переопределить в подклассе."""
+        raise NotImplementedError("fetch() must be implemented in subclass")
+
+    def normalize(self, raw_data: Any) -> List[Dict[str, Any]]:
+        """Шаг 2: Нормализовать raw данные в список матчей. Переопределить."""
+        raise NotImplementedError("normalize() must be implemented in subclass")
+
+    def enrich(self, match: Dict[str, Any]) -> Dict[str, Any]:
+        """Шаг 3: Добавить odds, upstream, sources. Можно переопределить."""
+        tr = self._get_team_registry()
+        if tr:
+            match["home_clean"] = tr.clean_team_name(match.get("home", ""))
+            match["away_clean"] = tr.clean_team_name(match.get("away", ""))
+            match["canonical_id"] = tr.build_canonical_id(
+                match.get("home", ""),
+                match.get("away", ""),
+                match.get("date_utc", "")
+            )
+        match.setdefault("source", self.name)
+        match.setdefault("sources", [self.name])
+        return match
+
+    def save(self, match: Dict[str, Any]) -> bool:
+        """Шаг 4: Сохранить матч через хаб (upsert_match)."""
+        hub = self._get_hub()
+        if not hub:
+            return False
         try:
-            events = self.fetch_events()
+            hub.upsert_match(match, source=self.name)
+            self.matches_processed += 1
+            return True
         except Exception as e:
-            logger.error("[%s] fetch_events error: %s", self.COLLECTOR_NAME, e, exc_info=True)
+            logger.error("save error: %s", e)
+            self.errors += 1
+            return False
+
+    def meta(self) -> Dict[str, Any]:
+        """Шаг 5: Сохранить метаданные коллектора."""
+        hub = self._get_hub()
+        meta_data = {
+            "collector": self.name,
+            "matches_processed": self.matches_processed,
+            "errors": self.errors,
+            "duration_seconds": 0,
+        }
+        if self.start_time:
+            meta_data["duration_seconds"] = round(time.time() - self.start_time, 2)
+        if hub:
             try:
-                save_meta(self.COLLECTOR_NAME,
-                          total_events=0, stored_matches=0,
-                          error_count=1, last_run=now_msk())
-            except Exception:
-                pass
-            return
-
-        if not events:
-            try:
-                save_meta(self.COLLECTOR_NAME,
-                          total_events=0, stored_matches=0,
-                          error_count=0, last_run=now_msk())
-            except Exception:
-                pass
-            return
-
-        # Сортировка по дате — ближайшие первыми (§1.32)
-        events = self._sort_by_date(events)
-
-        # === ШАГ 3: Создание матчей ===
-        created, updated, skipped, errors = 0, 0, 0, 0
-        processed_events = []  # FIX-12: только обработанные события
-        for event in events:
-            # Graceful shutdown (§23.3)
-            if is_shutdown_requested():
-                logger.info("[%s] Shutdown requested, stopping.", self.COLLECTOR_NAME)
-                break
-
-            try:
-                result = self.process_event(event)
+                hub.save_meta(self.name, meta_data)
             except Exception as e:
-                logger.error("[%s] process_event error: %s", self.COLLECTOR_NAME, e, exc_info=True)
-                errors += 1
-                continue
+                logger.error("save_meta error: %s", e)
+        return meta_data
 
-            if result == "created":
-                created += 1
-                processed_events.append(event)
-            elif result == "updated":
-                updated += 1
-                processed_events.append(event)
-            else:
-                skipped += 1
+    # ── HTTP helper (urllib.request only — §1.3) ────────
 
-        # === ШАГ 4: Enrichment (опционально) ===
-        # FIX-12: enrich только созданные/обновлённые, не все
-        if processed_events:
-            try:
-                self.enrich_events(processed_events)
-            except Exception as e:
-                logger.error("[%s] enrich_events error: %s", self.COLLECTOR_NAME, e, exc_info=True)
-
-        # === ШАГ 5: Сохранение мета (§1.27) ===
-        log_event(self.COLLECTOR_NAME, "INFO", "collection_complete",
-                  total_events=len(events), stored_matches=created + updated,
-                  created=created, updated=updated, errors=errors)
+    def _http_get(self, url: str, headers: dict = None, timeout: int = 30) -> Optional[dict]:
+        """HTTP GET через urllib.request (§1.3 — нулевая зависимость)."""
+        if headers is None:
+            headers = {}
         try:
-            save_meta(self.COLLECTOR_NAME,
-                      total_events=len(events),
-                      stored_matches=created + updated,
-                      error_count=errors,
-                      created=created,
-                      updated=updated,
-                      skipped_past=skipped,
-                      last_run=now_msk())
-        except Exception as e:
-            logger.error("[%s] save_meta error: %s", self.COLLECTOR_NAME, e, exc_info=True)
+            req = urllib.request.Request(url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            data = json.loads(resp.read().decode("utf-8"))
+            return data
+        except urllib.error.HTTPError as e:
+            logger.error("HTTP %d: %s", e.code, url)
+            return None
+        except urllib.error.URLError as e:
+            logger.error("URL error: %s", e)
+            return None
+        except json.JSONDecodeError as e:
+            logger.error("JSON decode error: %s", e)
+            return None
 
-    def process_event(self, event: dict) -> str:
-        """Создание матча. Не переопределять."""
-        if not isinstance(event, dict):
-            return "skipped"
+    # ── Graceful shutdown ────────────────────────────────
 
-        date = normalize_date(event.get("date_utc", ""))
+    def _is_shutdown(self) -> bool:
+        hub = self._get_hub()
+        if hub and hasattr(hub, "is_shutdown_requested"):
+            return hub.is_shutdown_requested()
+        return False
 
-        if not is_future_match(date):
-            return "skipped"
+    # ── Main run ─────────────────────────────────────────
 
-        # Нормализация команд (§19.4 — clean_team_name до upsert)
-        home_team = event.get("home_team", "")
-        away_team = event.get("away_team", "")
-        home_clean = clean_team_name(home_team)
-        away_clean = clean_team_name(away_team)
-
-        if not home_clean or not away_clean:
-            return "skipped"
-
-        # source_ids конструируется (§1.26 — обязательное поле)
-        source_ids = event.get("source_ids")
-        if not source_ids:
-            event_id = event.get("id", event.get("event_id", ""))
-            source_ids = {self.SOURCE_NAME: event_id} if event_id else {}
-
-        # extra-поля (§1.13 — **extra, не extra=extra)
-        extra = {"source_ids": source_ids}
-        if "odds" in event:
-            extra["odds"] = event["odds"]
-
-        # FIX-7: удаляем source из event (не из extra), чтобы не было конфликта
-        event.pop("source", None)
-
-        cid = upsert_match(
-            home_team=home_team,
-            away_team=away_team,
-            date_utc=date,
-            competition=event.get("competition", ""),
-            country=event.get("country", ""),
-            source=self.SOURCE_NAME,
-            status=event.get("status", "scheduled"),
-            **extra,
-        )
-        return "created" if cid else "skipped"
-
-    def _sort_by_date(self, events: list) -> list:
-        """Сортировка событий по дате — ближайшие первыми (§1.32)."""
-        try:
-            return sorted(events, key=lambda e: e.get("date_utc", ""))
-        except Exception:
-            return events
-
-    def fetch_events(self) -> list:
-        """Переопределить в наследнике. Возвращает список событий."""
-        raise NotImplementedError
-
-    def enrich_events(self, events: list):
-        """Переопределить при необходимости. Enrichment после создания."""
-        pass
-
-    # §20.7: class-level registration for subclasses
-    @classmethod
-    def register(cls, name=None, role="collector", writes=None, reads=None):
-        """Регистрация подкласса в MODULE_REGISTRY (§20.7).
-
-        Использование в наследнике:
-            class SharpapiCollector(BaseCollector):
-                COLLECTOR_NAME = "sharpapi"
-                ...
-            SharpapiCollector.register(writes=["upsert_match", "patch_match", "save_meta"],
-                                       reads=["{collector}:meta"])
+    def run(self, **kwargs) -> Dict[str, Any]:
         """
-        mod_name = name or cls.COLLECTOR_NAME
-        # Декорируем run() через register_module
-        cls.run = register_module(mod_name, role=role, writes=writes, reads=reads)(cls.run)
-        return cls
+        Полный 5-шаговый цикл коллектора (§19.4).
+        kwargs передаются в fetch().
+        """
+        self.start_time = time.time()
+        
+        # Initialization (§1.7a)
+        hub = self._get_hub()
+        if hub and hasattr(hub, "run_initialization"):
+            hub.run_initialization(collector=self.name)
+
+        # Step 1: Fetch
+        logger.info("[%s] Step 1: Fetching data...", self.name)
+        raw_data = self.fetch(**kwargs)
+        if not raw_data:
+            logger.warning("[%s] No data fetched", self.name)
+            return self.meta()
+
+        # Step 2: Normalize
+        logger.info("[%s] Step 2: Normalizing...", self.name)
+        matches = self.normalize(raw_data)
+        if not matches:
+            logger.warning("[%s] No matches after normalize", self.name)
+            return self.meta()
+
+        # Steps 3-4: Enrich + Save
+        logger.info("[%s] Step 3-4: Enriching and saving %d matches...", self.name, len(matches))
+        for match in matches:
+            if self._is_shutdown():
+                logger.info("[%s] Graceful shutdown requested", self.name)
+                break
+            match = self.enrich(match)
+            self.save(match)
+
+        # Step 5: Meta
+        logger.info("[%s] Step 5: Saving metadata", self.name)
+        result = self.meta()
+        logger.info("[%s] Done: %d matches, %d errors", 
+                     self.name, self.matches_processed, self.errors)
+        return result

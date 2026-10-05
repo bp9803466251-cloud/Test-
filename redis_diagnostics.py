@@ -775,35 +775,11 @@ def main():
     # ── --reset-breaker ──
     if args.reset_breaker:
         rdb = _get_redis_hub()
-        if not rdb:
-            print("❌ redis_hub недоступен")
-            return
-        # FIX-AUDIT: двойной fallback для сброса circuit breaker
-        if hasattr(rdb, "reset_circuit_breaker"):
-            try:
-                rdb.reset_circuit_breaker()
-                print("✅ Circuit breaker сброшен (reset_circuit_breaker)")
-                return
-            except Exception as e:
-                logger.warning("reset_circuit_breaker failed: %s", e)
-        # Fallback: прямая установка атрибутов CB
-        reset_done = False
-        for state_attr in ("_cb_state", "cb_state", "_circuit_state"):
-            if hasattr(rdb, state_attr):
-                setattr(rdb, state_attr, "closed")
-                reset_done = True
-        for fail_attr in ("_cb_failures", "cb_failures", "_circuit_failures"):
-            if hasattr(rdb, fail_attr):
-                setattr(rdb, fail_attr, 0)
-                reset_done = True
-        for opened_attr in ("_cb_opened_at", "cb_opened_at", "_circuit_opened_at"):
-            if hasattr(rdb, opened_attr):
-                setattr(rdb, opened_attr, None)
-                reset_done = True
-        if reset_done:
-            print("✅ Circuit breaker сброшен (через атрибуты)")
+        if rdb and hasattr(rdb, "reset_circuit_breaker"):
+            rdb.reset_circuit_breaker()
+            print("✅ Circuit breaker reset")
         else:
-            print("❌ Не удалось сбросить circuit breaker — атрибуты не найдены")
+            print("❌ redis_hub or reset_circuit_breaker unavailable")
         return
 
     # ── --flush ──

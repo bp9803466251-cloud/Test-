@@ -116,45 +116,29 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
     for attempt in range(max_retries + 1):
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status = resp.status
-                body = resp.read().decode("utf-8")
+            resp = urllib.request.urlopen(req, timeout=30)
 
-            if status == 404:
+            if resp.status == 404:
                 _cache_response(url, _NOT_FOUND)
                 return _NOT_FOUND
-            if status == 429:
+            if resp.status == 429:
                 wait = 2 ** (attempt + 2)
                 logger.warning(f"Rate limit. Waiting {wait}s")
                 time.sleep(wait)
                 continue
-            if status != 200:
+            if resp.status != 200:
                 if attempt < max_retries:
                     time.sleep(RATE_DELAY * 2)
                     continue
-                logger.error(f"HTTP {status}: {url}")
+                logger.error(f"HTTP {resp.status}: {url}")
                 return None
 
-            data = json.loads(body)
+            data = json.loads(resp.read().decode("utf-8"))
             _cache_response(url, data)
             time.sleep(RATE_DELAY)
             return data
 
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                _cache_response(url, _NOT_FOUND)
-                return _NOT_FOUND
-            if e.code == 429:
-                wait = 2 ** (attempt + 2)
-                logger.warning(f"Rate limit. Waiting {wait}s")
-                time.sleep(wait)
-                continue
-            if attempt < max_retries:
-                time.sleep(RATE_DELAY * 2)
-                continue
-            logger.error(f"HTTP {e.code}: {url}")
-            return None
-        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        except (urllib.error.URLError, json.JSONDecodeError) as e:
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue

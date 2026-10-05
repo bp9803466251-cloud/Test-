@@ -51,14 +51,18 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
-# §20.7: Module registry + §20.6: log_event
+# §20.7: Module registry
 try:
-    from gatekeeper_hub import register_module, log_event
+    from gatekeeper_hub import register_module
 except ImportError:
     def register_module(name, **kwargs):
         def deco(func):
             return func
         return deco
+
+try:
+    from gatekeeper_hub import log_event
+except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
@@ -136,6 +140,8 @@ def _fetch_odds(sport_key: str, markets: str = "h2h,spreads,totals",
 
 def collect_propline() -> Dict[str, Any]:
     """Главная функция коллектора Propline."""
+
+    log_event("propline", "INFO", "Collection started")
     dry_run = os.environ.get("DRY_RUN", "0") == "1"
 
     api_key = os.environ.get("PROPLINE_API_KEY")
@@ -154,7 +160,6 @@ def collect_propline() -> Dict[str, Any]:
         logger.error("Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
-    log_event("propline", "INFO", "Collection started", run_id=run_id, dry_run=dry_run)
     logger.info(f"Propline collector started (run_id={run_id}, dry_run={dry_run})")
 
     stored = 0
@@ -328,10 +333,11 @@ def collect_propline() -> Dict[str, Any]:
         "deduped": deduped,
         "run_id": run_id,
     }
-    log_event("propline", "INFO", "Collection complete",
-        total_events=total_events, stored=stored, errors=error_count)
     if not dry_run:
         save_meta(COLLECTOR_NAME, **meta)
+
+    log_event("propline", "INFO", "Collection complete")
+
 
     return meta
 

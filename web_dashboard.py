@@ -28,6 +28,7 @@ import json
 import time
 import argparse
 import logging
+import html as html_module
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -43,6 +44,13 @@ MSK_TZ = timezone(timedelta(hours=3))
 
 def _now_msk() -> str:
     return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+
+def _esc(value):
+    """HTML-escape динамических значений — защита от XSS."""
+    if value is None:
+        return ""
+    return html_module.escape(str(value))
+
 
 
 # ── Lazy-импорты ─────────────────────────────────────────────
@@ -75,8 +83,16 @@ def _get_config():
 
 # ── Сбор данных ──────────────────────────────────────────────
 
+_health_cache = None
+_health_cache_ts = 0
+_HEALTH_CACHE_TTL = 60  # seconds
+
 def _collect_health() -> dict:
-    """Сбор состояния системы — §12 формат."""
+    """Сбор состояния системы — §12 формат. Кеширование с TTL 60s."""
+    global _health_cache, _health_cache_ts
+    now = time.time()
+    if _health_cache is not None and (now - _health_cache_ts) < _HEALTH_CACHE_TTL:
+        return _health_cache
     hub = _get_hub()
     rdb = _get_redis_hub()
     cfg = _get_config()
@@ -174,6 +190,8 @@ def _collect_health() -> dict:
             "status": "+" if meta and meta.get("last_run") else "-",
         }
 
+    _health_cache = health
+    _health_cache_ts = now
     return health
 
 
@@ -369,9 +387,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 def _render_html(health: dict) -> str:
-    """Рендер HTML-дашборда из собранных данных.
-    FIX-AUDIT: html.escape() на всех динамических значениях (XSS protection).
-    """
+    """Рендер HTML-дашборда из собранных данных."""
     redis_ok = health.get("redis_available", False)
     cb = health.get("circuit_breaker", "unknown")
     cleanup = health.get("cleanup", {})
@@ -380,16 +396,12 @@ def _render_html(health: dict) -> str:
     for name, info in sorted(health.get("collectors", {}).items()):
         status = info.get("status", "-")
         badge_cls = "ok" if status == "+" else "err"
-        # FIX-AUDIT: экранирование динамических значений
-        safe_name = html_module.escape(str(name))
-        safe_role = html_module.escape(str(info.get('role', '')))
-        safe_last_run = html_module.escape(str(info.get('last_run', '—')))
         rows.append(
             f"<tr>"
-            f"<td>{safe_name}</td>"
-            f"<td>{safe_role}</td>"
-            f"<td><span class='badge {badge_cls}'>{status}</span></td>"
-            f"<td>{safe_last_run}</td>"
+            f"<td>{_esc(name)}</td>"
+            f"<td>{info.get('role', '')}</td>"
+            f"<td><span class='badge {badge_cls}'>{_esc(status)}</span></td>"
+            f"<td>{info.get('last_run', '—')}</td>"
             f"<td>{info.get('total_events', 0)}</td>"
             f"<td>{info.get('stored_matches', 0)}</td>"
             f"<td>{info.get('error_count', 0)}</td>"
@@ -399,16 +411,15 @@ def _render_html(health: dict) -> str:
     errors = health.get("errors", [])
     errors_html = ""
     if errors:
-        # FIX-AUDIT: экранирование сообщений об ошибках
-        items = "".join(f"<li>{html_module.escape(str(e))}</li>" for e in errors)
+        items = "".join(f"<li>{e}</li>" for e in errors)
         errors_html = f"<h2>Errors</h2><ul class='err-list'>{items}</ul>"
 
     return HTML_TEMPLATE.format(
         version=__version__,
-        timestamp=html_module.escape(health.get("timestamp", _now_msk())),
+        timestamp=health.get("timestamp", _now_msk()),
         redis_status="ONLINE" if redis_ok else "OFFLINE",
         redis_class="green" if redis_ok else "red",
-        cb_status=html_module.escape(str(cb)),
+        cb_status=cb,
         cb_class="green" if cb == "closed" else ("yellow" if cb == "half-open" else "red"),
         cleanup_count=cleanup.get("cleanup_count", 0),
         init_latency=cleanup.get("init_latency_ms", 0),

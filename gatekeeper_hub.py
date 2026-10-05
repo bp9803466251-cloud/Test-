@@ -413,7 +413,8 @@ __all__ = [
     "save_search_results",
     "save_analysis",
     "get_from_cache",
-    "set_key",              # FIX: прокси для metrics.py (system:health raw JSON, §9.1)
+    "set_key",
+    "get_all_fields",              # FIX: прокси для metrics.py (system:health raw JSON, §9.1)
     # FIX-AUDIT: schema + indexes
     "validate_schema",
     "update_history_indexes",
@@ -1923,3 +1924,16 @@ if __name__ == "__main__":
     print(f"Config errors: {init['config_errors']}")
     print(f"Init latency: {init['init_latency_ms']}ms")
     print(f"\nMetrics: {json.dumps(METRICS.report(), indent=2)}")
+
+
+def get_all_fields(canonical_id=None):
+    """Прокси к redis_hub.get_all_fields — §1.4: единый шлюз."""
+    rh = _get_redis()
+    if not rh:
+        return {} if canonical_id else {}
+    try:
+        return rh.get_all_fields(canonical_id) if canonical_id else rh.get_all_fields()
+    except Exception as e:
+        logger.error("get_all_fields error: %s", e)
+        return {}
+

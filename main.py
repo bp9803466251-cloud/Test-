@@ -29,8 +29,8 @@ Value engine + Telegram-дашборд по стандарту §12.
 v8.11-patched:
   FIX-11: batch_evaluate → run_pipeline — API mismatch (batch_evaluate возвращал
           {cid: float}, а main.py ожидал {hot, warm, stats}).
-  FIX-12: Meta keys confirmed: "{collector}:meta" format is correct.
-          gatekeeper_hub.save_meta() uses f"{collector}:meta" — no change needed.
+  FIX-12: Meta keys "sharpapi:meta" → "sharpapi:meta" — confirmed: "{collector}:meta" format is correct
+          ключей с redis_hub и redis_diagnostics (оба используют "meta:{collector}").
   FIX-13: _split_message → делегирование в telegram_transport.split_html_safe.
   FIX-14: TG_MAX_CHARS → TELEGRAM_CHUNK_LIMIT из telegram_transport.
 """

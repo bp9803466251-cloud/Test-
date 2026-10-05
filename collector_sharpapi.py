@@ -28,14 +28,18 @@ from gatekeeper_hub import (
 )
 # Direct redis_hub import removed — §1.4: hub is the only gateway
 
-# §20.7: Module registry + §20.6: log_event
+# §20.7: Module registry
 try:
-    from gatekeeper_hub import register_module, log_event
+    from gatekeeper_hub import register_module
 except ImportError:
     def register_module(name, **kwargs):
         def deco(func):
             return func
         return deco
+
+try:
+    from gatekeeper_hub import log_event
+except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
@@ -294,6 +298,11 @@ def collect_sharpapi():
         _flush_old_matches()
 
     logger.info(f"[SHARPAPI] Сбор матчей из /odds?sport=soccer&market=moneyline ...")
+    try:
+        from gatekeeper_hub import log_event
+    except ImportError:
+        def log_event(source, level, message, **kwargs):
+            pass
     log_event("sharpapi", "INFO", "Collection started", run_id=run_id, max_pages=max_pages)
     odds_rows, pages = _fetch_odds_pages(headers, max_pages, limit, rate_delay)
     logger.info(f"[SHARPAPI] Получено строк odds: {len(odds_rows)} (страниц: {pages})")
@@ -463,8 +472,6 @@ def collect_sharpapi():
         "deduped": deduped,
         "run_id": run_id,
     }
-    log_event("sharpapi", "INFO", "Collection complete",
-        total_events=total_events, stored=stored, pages=pages)
     save_meta(COLLECTOR_NAME, **meta)
 
     return meta

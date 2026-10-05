@@ -49,14 +49,12 @@ except ImportError:
 
 # §20.7: Module registry
 try:
-    from gatekeeper_hub import register_module, log_event
+    from gatekeeper_hub import register_module
 except ImportError:
     def register_module(name, **kwargs):
         def deco(func):
             return func
         return deco
-    def log_event(source, level, message, **kwargs):
-        pass
 
 try:
     from team_registry import normalize_team_name, build_canonical_id, clean_team_name
@@ -148,6 +146,11 @@ def collect_odds_api() -> Dict[str, Any]:
     sports = sports_data.get("data", [])
     football_sports = [s for s in sports if s.get("group") == "Soccer" and s.get("active", True)]
     logger.info(f"Активных футбольных лиг: {len(football_sports)}")
+    try:
+        from gatekeeper_hub import log_event
+    except ImportError:
+        def log_event(source, level, message, **kwargs):
+            pass
     log_event("odds_api", "INFO", "Collection started", run_id=run_id, active_leagues=len(football_sports))
 
     stored = 0
@@ -316,8 +319,6 @@ def collect_odds_api() -> Dict[str, Any]:
         "quota_used": quota_used,
         "run_id": run_id,
     }
-    log_event("odds_api", "INFO", "Collection complete",
-        total_events=total_events, stored=stored, errors=error_count)
     save_meta(COLLECTOR_NAME, **meta)
 
     return meta

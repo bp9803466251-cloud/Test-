@@ -58,6 +58,16 @@ except ImportError:
     _HUB_AVAILABLE = False
     UPSTREAM_MAP = {}
 
+try:
+    from gatekeeper_hub import register_module, log_event
+except ImportError:
+    def register_module(name, **kwargs):
+        def deco(func):
+            return func
+        return deco
+    def log_event(source, level, message, **kwargs):
+        pass
+
     def upsert_match(payload, source=None, idempotency_key=None, dry_run=False):
         """Fallback: прямой SET через redis_hub PipelineBatch."""
         from redis_hub import PipelineBatch

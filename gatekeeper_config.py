@@ -35,16 +35,7 @@ __all__ = [
 
 MSK_TZ = timezone(timedelta(hours=3))
 
-# §20.3: путь к YAML — env override или auto-detect
-_CONFIG_FILE = os.environ.get("GATEKEEPER_CONFIG_FILE", "")
-if not _CONFIG_FILE:
-    import os as _os
-    for _candidate in ("gatekeeper_config.yaml", "config/gatekeeper_config.yaml", "/etc/gatekeeper/gatekeeper_config.yaml"):
-        if _os.path.exists(_candidate):
-            _CONFIG_FILE = _candidate
-            break
-    if not _CONFIG_FILE:
-        _CONFIG_FILE = "gatekeeper_config.yaml"  # fallback
+_CONFIG_FILE = os.environ.get("GATEKEEPER_CONFIG_FILE", "gatekeeper_config.yaml")
 
 # Default feature flags (overridden by YAML if present)
 _DEFAULT_FEATURES = {
