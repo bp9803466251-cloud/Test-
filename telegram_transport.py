@@ -28,6 +28,7 @@ __all__ = [
     "split_html_safe",
     "send_telegram_dashboard",
     "normalize_dashboard_text",
+    "TELEGRAM_CHUNK_LIMIT",
     "__version__",
 ]
 
