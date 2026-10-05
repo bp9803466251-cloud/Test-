@@ -1,9 +1,6 @@
 name: Sports Pipeline
 
 on:
-  schedule:
-    # Каждые 30 минут
-    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -14,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.12'
+  PYTHON_VERSION: '3.11'
   GK_CONFIG_FILE: 'gatekeeper_config.yaml'
   PYTHONUNBUFFERED: "1"
 
@@ -34,11 +31,12 @@ jobs:
           pip install -r requirements.txt
       - run: python collector_sharpapi.py
         env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY || secrets.SHARP_API_KEY || '' }}
+          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
           SHARPAPI_RATE_LIMIT_DELAY: '1.0'
           SHARPAPI_MAX_PAGES: '5'
           SHARPAPI_LIMIT: '100'
@@ -59,10 +57,10 @@ jobs:
           pip install -r requirements.txt
       - run: python collector_odds_api.py
         env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           ODDS_API_RATE_DELAY: '1.0'
           ODDS_API_MAX_RETRIES: '3'
@@ -86,10 +84,10 @@ jobs:
           pip install -r requirements.txt
       - run: python collector_bzzoiro.py
         env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
           BZZOIRO_RATE_DELAY: '1.5'
           BZZOIRO_ENRICH_DELAY: '0.5'
@@ -111,10 +109,10 @@ jobs:
           pip install -r requirements.txt
       - run: python collector_propline.py
         env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
           PROPLINE_RATE_DELAY: '1.0'
           PROPLINE_MAX_RETRIES: '3'
@@ -138,10 +136,10 @@ jobs:
           pip install -r requirements.txt
       - run: python test_contracts.py
         env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
 
   # ── Stage 3: Pipeline (main.py) — only if collectors succeeded ──
@@ -161,12 +159,12 @@ jobs:
           pip install -r requirements.txt
       - run: python main.py
         env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
           VALUE_THRESHOLD: '0.03'
 
@@ -193,7 +191,7 @@ jobs:
         if: needs.sharpapi.result == 'failure' || needs.odds_api.result == 'failure' || needs.bzzoiro.result == 'failure' || needs.propline.result == 'failure' || needs.pipeline.result == 'failure'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
         run: |
           MSG="❌ Sports Pipeline FAILED%0A%0ASharpAPI: ${{ needs.sharpapi.result }}%0AOddsAPI: ${{ needs.odds_api.result }}%0ABzzoiro: ${{ needs.bzzoiro.result }}%0APropline: ${{ needs.propline.result }}%0APipeline: ${{ needs.pipeline.result }}%0A%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
