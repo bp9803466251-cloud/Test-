@@ -843,6 +843,25 @@ def main():
         _do_validate()
         return
 
+    # ── --migrate-schema (§20.2) ──
+    if args.migrate_schema:
+        hub = _get_hub()
+        if not hub:
+            print("❌ gatekeeper_hub unavailable")
+            return
+        if not hasattr(hub, "migrate_schema"):
+            print("❌ hub.migrate_schema not available (need hub v8.11+)")
+            return
+        target = args.migrate_schema
+        dry = args.dry_run
+        print(f"Migrating to schema {target} {'(DRY-RUN)' if dry else ''}...")
+        try:
+            result = hub.migrate_schema(target, dry_run=dry)
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        except Exception as e:
+            print(f"❌ migrate_schema: {e}")
+        return
+
     # ── --diff (§22.6) ──
     if args.diff:
         _do_diff(args.diff)
@@ -944,9 +963,37 @@ def main():
         data = _step2_get_all_fields()
         matches = data.get("matches", {})
         total = len(matches)
+
+        # Базовая статистика
         with_odds = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("odds"))
         with_clean = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("home_clean") and m.get("away_clean"))
         with_date = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("date_utc"))
+
+        # §20.4: Используем hub.validate_match_quality() если доступен
+        hub = _get_hub()
+        quality_results = []
+        scores = []
+        issues_count = 0
+        warnings_count = 0
+
+        if hub and hasattr(hub, "validate_match_quality"):
+            for key, match in matches.items():
+                if not isinstance(match, dict):
+                    continue
+                try:
+                    qr = hub.validate_match_quality(match)
+                    qr["key"] = key
+                    quality_results.append(qr)
+                    scores.append(qr.get("score", 0))
+                    issues_count += len(qr.get("issues", []))
+                    warnings_count += len(qr.get("warnings", []))
+                except Exception as e:
+                    logger.warning(f"validate_match_quality {key}: {e}")
+
+        avg_score = round(sum(scores) / len(scores), 1) if scores else 0
+        valid_count = sum(1 for q in quality_results if q.get("is_valid"))
+        invalid_count = len(quality_results) - valid_count
+
         quality = {
             "total": total,
             "with_odds": with_odds,
@@ -955,8 +1002,31 @@ def main():
             "odds_pct": round(with_odds / total * 100, 1) if total else 0,
             "clean_pct": round(with_clean / total * 100, 1) if total else 0,
             "date_pct": round(with_date / total * 100, 1) if total else 0,
+            # §20.4: Quality scoring
+            "quality_scored": len(quality_results),
+            "quality_avg_score": avg_score,
+            "quality_valid": valid_count,
+            "quality_invalid": invalid_count,
+            "total_issues": issues_count,
+            "total_warnings": warnings_count,
         }
-        print(json.dumps(quality, indent=2, ensure_ascii=False))
+
+        # Показать worst matches (score < 70)
+        worst = sorted(quality_results, key=lambda x: x.get("score", 100))[:10]
+        if worst:
+            quality["worst_matches"] = [
+                {
+                    "key": w.get("key", ""),
+                    "canonical_id": w.get("canonical_id", ""),
+                    "score": w.get("score", 0),
+                    "is_valid": w.get("is_valid", False),
+                    "issues": w.get("issues", [])[:3],
+                    "warnings": w.get("warnings", [])[:3],
+                }
+                for w in worst if w.get("score", 100) < 70
+            ]
+
+        print(json.dumps(quality, indent=2, ensure_ascii=False, default=str))
         return
 
     # ── --dashboard (§23.6) ──
