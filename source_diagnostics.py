@@ -190,6 +190,40 @@ def diagnose_sources() -> dict:
         sources["odds_api"] = {"key": oddsapi_key, "last_run": "нет данных"}
         print(f"   🎲 OddsAPI: ключ {oddsapi_key}, мета отсутствует")
 
+    # Propline
+    try:
+        propline_meta = get_from_cache("propline:meta")
+    except Exception as e:
+        logger.warning("diagnose_sources: propline:meta read error: %s", e)
+        propline_meta = None
+    propline_key = "✅" if os.getenv("PROPLINE_API_KEY") else "❌"
+    if propline_meta and isinstance(propline_meta, dict):
+        events = propline_meta.get("total_events", propline_meta.get("events_count", 0))
+        stored = propline_meta.get("stored_matches", 0)
+        created = propline_meta.get("created", 0)
+        updated = propline_meta.get("updated", 0)
+        last_run = propline_meta.get("last_run", propline_meta.get("last_run_at", "неизвестно"))
+        error_count = propline_meta.get("error_count", propline_meta.get("errors", 0))
+        deduped = propline_meta.get("deduped", 0)
+        sources["propline"] = {
+            "key": propline_key,
+            "events": events,
+            "stored": stored,
+            "created": created,
+            "updated": updated,
+            "deduped": deduped,
+            "errors": error_count,
+            "last_run": last_run,
+        }
+        print(f"   🎯 Propline: ключ {propline_key}, "
+              f"событий {events}, записано {stored} "
+              f"(создано {created}, обновлено {updated}, "
+              f"дедупликатов {deduped}), ошибок {error_count}")
+        print(f"           last_run: {last_run}")
+    else:
+        sources["propline"] = {"key": propline_key, "last_run": "нет данных"}
+        print(f"   🎯 Propline: ключ {propline_key}, мета отсутствует")
+
     # API-Football
     football_key = "✅" if os.getenv("FOOTBALL_DATA_API_KEY") else "❌"  # FIX-2
     sources["football_data"] = {"key": football_key}
@@ -444,6 +478,17 @@ def diagnose_errors() -> dict:
         if err_count > 0:
             errors.append({"source": "odds_api", "count": err_count})
             print(f"   🎲 OddsAPI: {err_count} ошибок")
+
+    try:
+        propline_meta = get_from_cache("propline:meta")
+    except Exception as e:
+        logger.warning("diagnose_errors: propline:meta error: %s", e)
+        propline_meta = None
+    if propline_meta and isinstance(propline_meta, dict):
+        err_count = propline_meta.get("error_count", propline_meta.get("errors", 0))
+        if err_count > 0:
+            errors.append({"source": "propline", "count": err_count})
+            print(f"   🎯 Propline: {err_count} ошибок")
 
     try:
         health = get_from_cache("system:health")
