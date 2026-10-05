@@ -953,28 +953,44 @@ class FootballDataCollector:
 
     def _flush_meta(self):
         """Write accumulated meta. v7.0: вызывается после каждой лиги (crash-safe).
-        Использует save_meta из хаба (§1.27), не upsert_match (meta — не матч)."""
+        FIX §1.27: merge с существующей meta — не перезаписывать предыдущие запуски."""
         if not self._meta_entries:
             return
         key = "football_data:meta"
-        data = json.dumps(self._meta_entries, ensure_ascii=False)
+
         if _HUB_AVAILABLE:
             try:
                 from gatekeeper_hub import save_to_cache as _hub_save_cache
-                _hub_save_cache("football_data:meta", self._meta_entries)
+                from gatekeeper_hub import get_from_cache as _hub_get_cache
+                # §1.27 FIX: читаем существующую meta, мерджим новые записи
+                existing = _hub_get_cache(key) or {}
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing.update(self._meta_entries)
+                _hub_save_cache(key, existing)
             except Exception:
                 # Fallback на прямой SET через redis_hub
                 try:
-                    from redis_hub import set_key
+                    from redis_hub import get_key, set_key
+                    existing_raw = get_key(key) if not self.dry_run else None
+                    existing = json.loads(existing_raw) if existing_raw else {}
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    existing.update(self._meta_entries)
                     if not self.dry_run:
-                        set_key(key, data)
+                        set_key(key, json.dumps(existing, ensure_ascii=False))
                 except Exception as e:
                     logger.error(f"flush_meta fallback failed: {e}")
         else:
             try:
-                from redis_hub import set_key
+                from redis_hub import get_key, set_key
+                existing_raw = get_key(key) if not self.dry_run else None
+                existing = json.loads(existing_raw) if existing_raw else {}
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing.update(self._meta_entries)
                 if not self.dry_run:
-                    set_key(key, data)
+                    set_key(key, json.dumps(existing, ensure_ascii=False))
             except Exception as e:
                 logger.error(f"flush_meta failed: {e}")
 
