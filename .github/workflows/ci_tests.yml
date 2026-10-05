@@ -47,6 +47,39 @@ jobs:
         run: |
           python test_contracts.py
 
+      - name: Validate test fixtures (§20.8)
+        run: |
+          python -c "
+          from test_fixtures import (
+              CANONICAL_LIVE_MATCH,
+              CANONICAL_HISTORY_MATCH,
+              CANONICAL_COMPLETED_MATCH,
+              CANONICAL_MINIMAL_MATCH,
+              validate_fixtures,
+          )
+          from gatekeeper_hub import validate_schema
+
+          # Validate each fixture against schema v710
+          for name, fixture in [
+              ('CANONICAL_LIVE_MATCH', CANONICAL_LIVE_MATCH),
+              ('CANONICAL_HISTORY_MATCH', CANONICAL_HISTORY_MATCH),
+              ('CANONICAL_COMPLETED_MATCH', CANONICAL_COMPLETED_MATCH),
+              ('CANONICAL_MINIMAL_MATCH', CANONICAL_MINIMAL_MATCH),
+          ]:
+              ok, msg = validate_schema(fixture)
+              assert ok, f'{name} failed schema validation: {msg}'
+              print(f'  {name}: OK')
+
+          # Run built-in fixture validation
+          result = validate_fixtures()
+          if isinstance(result, tuple):
+              ok, errors = result
+              assert ok, f'validate_fixtures failed: {errors}'
+          else:
+              assert result, 'validate_fixtures failed'
+          print('All fixture validations passed')
+          "
+
       - name: Syntax check all Python files
         run: |
           find . -name "*.py" -not -path "./.venv/*" -not -path "./venv/*" | xargs -r -I{} python -m py_compile {}
@@ -64,4 +97,3 @@ jobs:
             -d "chat_id=${TELEGRAM_GROUP_ID}" \
             -d "text=${MESSAGE}" \
             -d "parse_mode=HTML" || true
-            
