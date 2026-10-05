@@ -554,15 +554,15 @@ def main():
         mode = "errors"
 
     # Инициализация Redis (health-check + миграция + очистка)
-    if mode in ("full", "redis"):
-        print("[DIAG] Инициализация Redis...")
-        try:  # FIX-8: error isolation
-            init = run_initialization(collector="source_diagnostics")  # FIX-6: §1.7a
-            if not init.get("redis_available"):
-                print("[DIAG] ❌ Redis недоступен — диагностика ограничена")
-        except Exception as e:
-            logger.error("main: run_initialization failed: %s", e, exc_info=True)
-            print(f"[DIAG] ❌ Ошибка инициализации: {e}")
+    # FIX-AUDIT: run_initialization для ВСЕХ режимов (§1.7a), не только full/redis
+    print("[DIAG] Инициализация Redis...")
+    try:
+        init = run_initialization(collector="source_diagnostics")
+        if not init.get("redis_available"):
+            print("[DIAG] ❌ Redis недоступен — диагностика ограничена")
+    except Exception as e:
+        logger.error("main: run_initialization failed: %s", e, exc_info=True)
+        print(f"[DIAG] ❌ Ошибка инициализации: {e}")
 
     src_data, redis_data, matches_data, errors_data = {}, {}, {}, {}
 

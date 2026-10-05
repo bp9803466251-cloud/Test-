@@ -369,7 +369,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 def _render_html(health: dict) -> str:
-    """Рендер HTML-дашборда из собранных данных."""
+    """Рендер HTML-дашборда из собранных данных.
+    FIX-AUDIT: html.escape() на всех динамических значениях (XSS protection).
+    """
     redis_ok = health.get("redis_available", False)
     cb = health.get("circuit_breaker", "unknown")
     cleanup = health.get("cleanup", {})
@@ -378,12 +380,16 @@ def _render_html(health: dict) -> str:
     for name, info in sorted(health.get("collectors", {}).items()):
         status = info.get("status", "-")
         badge_cls = "ok" if status == "+" else "err"
+        # FIX-AUDIT: экранирование динамических значений
+        safe_name = html_module.escape(str(name))
+        safe_role = html_module.escape(str(info.get('role', '')))
+        safe_last_run = html_module.escape(str(info.get('last_run', '—')))
         rows.append(
             f"<tr>"
-            f"<td>{name}</td>"
-            f"<td>{info.get('role', '')}</td>"
+            f"<td>{safe_name}</td>"
+            f"<td>{safe_role}</td>"
             f"<td><span class='badge {badge_cls}'>{status}</span></td>"
-            f"<td>{info.get('last_run', '—')}</td>"
+            f"<td>{safe_last_run}</td>"
             f"<td>{info.get('total_events', 0)}</td>"
             f"<td>{info.get('stored_matches', 0)}</td>"
             f"<td>{info.get('error_count', 0)}</td>"
@@ -393,15 +399,16 @@ def _render_html(health: dict) -> str:
     errors = health.get("errors", [])
     errors_html = ""
     if errors:
-        items = "".join(f"<li>{e}</li>" for e in errors)
+        # FIX-AUDIT: экранирование сообщений об ошибках
+        items = "".join(f"<li>{html_module.escape(str(e))}</li>" for e in errors)
         errors_html = f"<h2>Errors</h2><ul class='err-list'>{items}</ul>"
 
     return HTML_TEMPLATE.format(
         version=__version__,
-        timestamp=health.get("timestamp", _now_msk()),
+        timestamp=html_module.escape(health.get("timestamp", _now_msk())),
         redis_status="ONLINE" if redis_ok else "OFFLINE",
         redis_class="green" if redis_ok else "red",
-        cb_status=cb,
+        cb_status=html_module.escape(str(cb)),
         cb_class="green" if cb == "closed" else ("yellow" if cb == "half-open" else "red"),
         cleanup_count=cleanup.get("cleanup_count", 0),
         init_latency=cleanup.get("init_latency_ms", 0),
