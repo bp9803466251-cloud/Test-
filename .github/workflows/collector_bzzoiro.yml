@@ -1,8 +1,6 @@
 name: Collector Bzzoiro
 
 on:
-  schedule:
-    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       events_only:
@@ -15,7 +13,7 @@ on:
         default: false
 
 env:
-  PYTHON_VERSION: "3.12"
+  PYTHON_VERSION: "3.11"
   PYTHONUNBUFFERED: "1"
   GK_CONFIG_FILE: "gatekeeper_config.yaml"
 
@@ -46,10 +44,10 @@ jobs:
 
       - name: Run collector
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
           BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || '0.3' }}
           BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || '0.2' }}
@@ -70,7 +68,7 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
         run: |
           MSG="🔴 <b>Collector Bzzoiro FAILED</b>%0ARepo: ${{ github.repository }}%0ARun: ${{ github.run_id }}%0A%0A👉 https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
