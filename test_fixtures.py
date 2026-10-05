@@ -2,7 +2,7 @@
 test_fixtures.py — Эталонные объекты для тестов (§20.8).
 Канонические объекты матчей для валидации схемы.
 
-v8.10-patched:
+v8.11-patched:
   FIX-1: __all__ перенесён в начало файла (до эталонов)
   FIX-2: CANONICAL_COMPLETED_MATCH — добавлен section_history
   FIX-3: CANONICAL_HISTORY_MATCH — добавлен section_history
@@ -11,12 +11,15 @@ v8.10-patched:
   FIX-6: validate_fixtures — детальный отчёт ошибок (bool или (bool, errors))
   FIX-7: if __name__ — sys.exit с кодом
   FIX-8: __version__ в __all__
+  AUDIT-1: __version__ 8.10 → 8.11-patched
+  AUDIT-2: NullHandler добавлен
+  AUDIT-3: section_history entries — добавлен upstream (schema v710 required)
 """
 
 import sys
 import logging
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 
 __all__ = [
     "CANONICAL_LIVE_MATCH",
@@ -28,6 +31,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # validate_schema импортируется лениво внутри validate_fixtures(),
 # чтобы избежать SyntaxError и циклического импорта.
@@ -73,8 +77,8 @@ CANONICAL_LIVE_MATCH = {
     "created_at": "2026-09-30T14:00:00+03:00",
     "updated_at": "2026-09-30T14:09:29+03:00",
     "section_history": [
-        {"section": "base", "source": "sharpapi", "updated_at": "2026-09-30T14:00:00+03:00"},
-        {"section": "odds", "source": "sharpapi", "updated_at": "2026-09-30T14:09:29+03:00"}
+        {"section": "base", "source": "sharpapi", "updated_at": "2026-09-30T14:00:00+03:00", "upstream": "betradar"},
+        {"section": "odds", "source": "sharpapi", "updated_at": "2026-09-30T14:09:29+03:00", "upstream": "betradar"}
     ]
 }
 
@@ -127,8 +131,8 @@ CANONICAL_HISTORY_MATCH = {
     "created_at": "2026-01-15T15:00:00+03:00",
     "updated_at": "2026-01-15T19:30:00+03:00",
     "section_history": [
-        {"section": "base", "source": "football_data", "updated_at": "2026-01-15T15:00:00+03:00"},
-        {"section": "odds", "source": "football_data", "updated_at": "2026-01-15T15:30:00+03:00"}
+        {"section": "base", "source": "football_data", "updated_at": "2026-01-15T15:00:00+03:00", "upstream": "bet365"},
+        {"section": "odds", "source": "football_data", "updated_at": "2026-01-15T15:30:00+03:00", "upstream": "bet365"}
     ]
 }
 
@@ -192,10 +196,10 @@ CANONICAL_COMPLETED_MATCH = {
     "created_at": "2026-10-01T18:00:00+03:00",
     "updated_at": "2026-10-01T21:00:00+03:00",
     "section_history": [
-        {"section": "base", "source": "sharpapi", "updated_at": "2026-10-01T18:00:00+03:00"},
-        {"section": "odds", "source": "sharpapi", "updated_at": "2026-10-01T18:55:00+03:00"},
-        {"section": "odds", "source": "odds_api", "updated_at": "2026-10-01T19:00:00+03:00"},
-        {"section": "predictions", "source": "bzzoiro", "updated_at": "2026-10-01T20:00:00+03:00"}
+        {"section": "base", "source": "sharpapi", "updated_at": "2026-10-01T18:00:00+03:00", "upstream": "betradar"},
+        {"section": "odds", "source": "sharpapi", "updated_at": "2026-10-01T18:55:00+03:00", "upstream": "betradar"},
+        {"section": "odds", "source": "odds_api", "updated_at": "2026-10-01T19:00:00+03:00", "upstream": "draftkings"},
+        {"section": "predictions", "source": "bzzoiro", "updated_at": "2026-10-01T20:00:00+03:00", "upstream": "bzzoiro"}
     ]
 }
 
@@ -224,7 +228,7 @@ CANONICAL_MINIMAL_MATCH = {
     "created_at": "2026-11-30T12:00:00+03:00",
     "updated_at": "2026-11-30T12:00:00+03:00",
     "section_history": [
-        {"section": "base", "source": "sharpapi", "updated_at": "2026-11-30T12:00:00+03:00"}
+        {"section": "base", "source": "sharpapi", "updated_at": "2026-11-30T12:00:00+03:00", "upstream": "betradar"}
     ]
 }
 
