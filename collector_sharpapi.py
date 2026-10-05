@@ -28,6 +28,15 @@ from gatekeeper_hub import (
 )
 # Direct redis_hub import removed — §1.4: hub is the only gateway
 
+# §20.7: Module registry
+try:
+    from gatekeeper_hub import register_module
+except ImportError:
+    def register_module(name, **kwargs):
+        def deco(func):
+            return func
+        return deco
+
 # Graceful shutdown — аудит §2.3
 try:
     from gatekeeper_hub import is_shutdown_requested
@@ -283,6 +292,11 @@ def collect_sharpapi():
         _flush_old_matches()
 
     logger.info(f"[SHARPAPI] Сбор матчей из /odds?sport=soccer&market=moneyline ...")
+    try:
+        from gatekeeper_hub import log_event
+        log_event("sharpapi", "collection_start", run_id=run_id, max_pages=max_pages)
+    except ImportError:
+        pass
     odds_rows, pages = _fetch_odds_pages(headers, max_pages, limit, rate_delay)
     logger.info(f"[SHARPAPI] Получено строк odds: {len(odds_rows)} (страниц: {pages})")
 
@@ -456,6 +470,9 @@ def collect_sharpapi():
     return meta
 
 
+@register_module("sharpapi", role="collector",
+              writes=["upsert_match", "patch_match", "save_meta"],
+              reads=["{collector}:meta"])
 def collect_and_process():
     """Единая точка входа для CI/CD."""
     return collect_sharpapi()

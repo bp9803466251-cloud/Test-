@@ -47,6 +47,15 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
+# §20.7: Module registry
+try:
+    from gatekeeper_hub import register_module
+except ImportError:
+    def register_module(name, **kwargs):
+        def deco(func):
+            return func
+        return deco
+
 try:
     from team_registry import normalize_team_name, build_canonical_id, clean_team_name
 except ImportError:
@@ -137,6 +146,11 @@ def collect_odds_api() -> Dict[str, Any]:
     sports = sports_data.get("data", [])
     football_sports = [s for s in sports if s.get("group") == "Soccer" and s.get("active", True)]
     logger.info(f"Активных футбольных лиг: {len(football_sports)}")
+    try:
+        from gatekeeper_hub import log_event
+        log_event("odds_api", "collection_start", run_id=run_id, active_leagues=len(football_sports))
+    except ImportError:
+        pass
 
     stored = 0
     created = 0
@@ -175,111 +189,116 @@ def collect_odds_api() -> Dict[str, Any]:
                 logger.info("Graceful shutdown — прерываем цикл матчей")
                 break
 
-            home_team_raw = ev.get("home_team", "")
-            away_team_raw = ev.get("away_team", "")
-            if not home_team_raw or not away_team_raw:
-                continue
-
-            # §2.4: Нормализация через team_registry
-            home_team = clean_team_name(home_team_raw)
-            away_team = clean_team_name(away_team_raw)
-
-            raw_date = ev.get("commence_time", "") or ev.get("start_time", "")
-            date_utc = normalize_date(raw_date)
-
-            if date_utc and not is_future_match(date_utc):
-                skipped_past += 1
-                continue
-
-            # Upper bound: отбрасываем матчи дальше DAYS_AHEAD
-            if date_utc:
-                try:
-                    match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
-                    if match_dt > datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD):
-                        skipped_future += 1
-                        continue
-                except (ValueError, TypeError):
-                    pass
-
-            sport_title = ev.get("sport_title", sport.get("title", ""))
-            event_id = str(ev.get("id", ""))
-
-            # Извлекаем коэффициенты из bookmakers — как float
-            odds_home: Optional[float] = None
-            odds_draw: Optional[float] = None
-            odds_away: Optional[float] = None
-            bookmakers = ev.get("bookmakers", [])
-            for bm in bookmakers:
-                markets_list = bm.get("markets", [])
-                for market in markets_list:
-                    if market.get("key") != "h2h":
-                        continue
-                    outcomes = market.get("outcomes", [])
-                    for o in outcomes:
-                        name = o.get("name", "")
-                        price = o.get("price")
-                        price_float = _normalize_odds_value(price)
-                        if price_float is None:
-                            continue
-                        # Сравниваем с нормализованным именем
-                        name_norm = clean_team_name(name)
-                        if name_norm == home_team or home_team in name_norm or name_norm in home_team:
-                            if odds_home is None or price_float > odds_home:
-                                odds_home = price_float
-                        elif name in ("Draw", "draw", "Ничья"):
-                            if odds_draw is None or price_float > odds_draw:
-                                odds_draw = price_float
-                        elif name_norm == away_team or away_team in name_norm or name_norm in away_team:
-                            if odds_away is None or price_float > odds_away:
-                                odds_away = price_float
-
-            total_events += 1
-
-            # 1. Создать матч (с sources)
-            if dry_run:
-                stored += 1
-                created += 1
-                continue
-
             try:
-                cid = upsert_match(
-                    home_team=home_team,
-                    away_team=away_team,
-                    date_utc=date_utc,
-                    competition=sport_title,
-                    country="",
-                    status="scheduled",
-                    source=COLLECTOR_NAME,
-                    sources=[COLLECTOR_NAME],
-                    source_ids={COLLECTOR_NAME: event_id},
-                )
-            except Exception as e:
-                logger.error(f"[ODDS_API] upsert error: {e}")
-                cid = None
+                home_team_raw = ev.get("home_team", "")
+                away_team_raw = ev.get("away_team", "")
+                if not home_team_raw or not away_team_raw:
+                    continue
 
-            if cid:
-                stored += 1
-                existing = get_match_any(cid)
-                if existing:
-                    updated += 1
-                else:
+                # §2.4: Нормализация через team_registry
+                home_team = clean_team_name(home_team_raw)
+                away_team = clean_team_name(away_team_raw)
+
+                raw_date = ev.get("commence_time", "") or ev.get("start_time", "")
+                date_utc = normalize_date(raw_date)
+
+                if date_utc and not is_future_match(date_utc):
+                    skipped_past += 1
+                    continue
+
+                # Upper bound: отбрасываем матчи дальше DAYS_AHEAD
+                if date_utc:
+                    try:
+                        match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+                        if match_dt > datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD):
+                            skipped_future += 1
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                sport_title = ev.get("sport_title", sport.get("title", ""))
+                event_id = str(ev.get("id", ""))
+
+                # Извлекаем коэффициенты из bookmakers — как float
+                odds_home: Optional[float] = None
+                odds_draw: Optional[float] = None
+                odds_away: Optional[float] = None
+                bookmakers = ev.get("bookmakers", [])
+                for bm in bookmakers:
+                    markets_list = bm.get("markets", [])
+                    for market in markets_list:
+                        if market.get("key") != "h2h":
+                            continue
+                        outcomes = market.get("outcomes", [])
+                        for o in outcomes:
+                            name = o.get("name", "")
+                            price = o.get("price")
+                            price_float = _normalize_odds_value(price)
+                            if price_float is None:
+                                continue
+                            # Сравниваем с нормализованным именем
+                            name_norm = clean_team_name(name)
+                            if name_norm == home_team or home_team in name_norm or name_norm in home_team:
+                                if odds_home is None or price_float > odds_home:
+                                    odds_home = price_float
+                            elif name in ("Draw", "draw", "Ничья"):
+                                if odds_draw is None or price_float > odds_draw:
+                                    odds_draw = price_float
+                            elif name_norm == away_team or away_team in name_norm or name_norm in away_team:
+                                if odds_away is None or price_float > odds_away:
+                                    odds_away = price_float
+
+                total_events += 1
+
+                # 1. Создать матч (с sources)
+                if dry_run:
+                    stored += 1
                     created += 1
+                    continue
 
-                # 2. Patch odds как float — только не-None значения
-                odds_current = {}
-                if odds_home is not None:
-                    odds_current["home"] = float(odds_home)
-                if odds_draw is not None:
-                    odds_current["draw"] = float(odds_draw)
-                if odds_away is not None:
-                    odds_current["away"] = float(odds_away)
-                idempotency_key = f"{run_id}:{cid}:odds"
                 try:
-                    patch_match(cid, "odds", {"current": odds_current},
-                               source=COLLECTOR_NAME, upstream="betradar",
-                               idempotency_key=idempotency_key)
+                    cid = upsert_match(
+                        home_team=home_team,
+                        away_team=away_team,
+                        date_utc=date_utc,
+                        competition=sport_title,
+                        country="",
+                        status="scheduled",
+                        source=COLLECTOR_NAME,
+                        sources=[COLLECTOR_NAME],
+                        source_ids={COLLECTOR_NAME: event_id},
+                    )
                 except Exception as e:
-                    logger.error(f"[ODDS_API] patch error for cid={cid}: {e}")
+                    logger.error(f"[ODDS_API] upsert error: {e}")
+                    cid = None
+
+                if cid:
+                    stored += 1
+                    existing = get_match_any(cid)
+                    if existing:
+                        updated += 1
+                    else:
+                        created += 1
+
+                    # 2. Patch odds как float — только не-None значения
+                    odds_current = {}
+                    if odds_home is not None:
+                        odds_current["home"] = float(odds_home)
+                    if odds_draw is not None:
+                        odds_current["draw"] = float(odds_draw)
+                    if odds_away is not None:
+                        odds_current["away"] = float(odds_away)
+                    idempotency_key = f"{run_id}:{cid}:odds"
+                    try:
+                        patch_match(cid, "odds", {"current": odds_current},
+                                   source=COLLECTOR_NAME, upstream="betradar",
+                                   idempotency_key=idempotency_key)
+                    except Exception as e:
+                        logger.error(f"[ODDS_API] patch error for cid={cid}: {e}")
+
+            except Exception as e:
+                logger.error(f"[ODDS_API] Event error: {e}")
+                error_count += 1
 
         time.sleep(rate_delay)
 
@@ -304,6 +323,9 @@ def collect_odds_api() -> Dict[str, Any]:
     return meta
 
 
+@register_module("odds_api", role="collector",
+              writes=["upsert_match", "patch_match", "save_meta"],
+              reads=["{collector}:meta"])
 def collect_and_process():
     """Точка входа для импорта."""
     return collect_odds_api()

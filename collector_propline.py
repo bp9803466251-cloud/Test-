@@ -51,6 +51,15 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
+# §20.7: Module registry
+try:
+    from gatekeeper_hub import register_module
+except ImportError:
+    def register_module(name, **kwargs):
+        def deco(func):
+            return func
+        return deco
+
 # team_registry — §2.4
 try:
     from team_registry import clean_team_name
@@ -175,123 +184,128 @@ def collect_propline() -> Dict[str, Any]:
                 logger.info("Shutdown — остановка цикла матчей")
                 break
 
-            event_id = str(ev.get("id", ""))
-            if not event_id:
-                continue
-
-            home_raw = ev.get("home_team", "")
-            away_raw = ev.get("away_team", "")
-            if not home_raw or not away_raw:
-                continue
-
-            # §2.4: нормализация команд
-            home_team = clean_team_name(home_raw)
-            away_team = clean_team_name(away_raw)
-
-            raw_date = ev.get("commence_time", "") or ev.get("start_time", "")
-            date_utc = normalize_date(raw_date)
-
-            if date_utc and not is_future_match(date_utc):
-                skipped_past += 1
-                continue
-
-            # Upper bound
-            if date_utc:
-                try:
-                    match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
-                    if match_dt > datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD):
-                        skipped_future += 1
-                        continue
-                except (ValueError, TypeError):
-                    pass
-
-            # Dedup
-            dedup_key = f"{home_team}|{away_team}|{date_utc}"
-            if dedup_key in seen:
-                deduped += 1
-                continue
-            seen.add(dedup_key)
-
-            total_events += 1
-
-            # Извлечение odds
-            odds_home = None
-            odds_draw = None
-            odds_away = None
-            odds_data = ev.get("odds", ev)
-
-            # h2h может быть list [{name, price}] или dict {home, draw, away}
-            h2h = odds_data.get("h2h")
-            if h2h is not None:
-                if isinstance(h2h, list):
-                    for item in h2h:
-                        name = item.get("name", "")
-                        price = item.get("price")
-                        decimal = _american_to_decimal(price)
-                        if decimal is None:
-                            continue
-                        name_norm = clean_team_name(name)
-                        if name_norm == home_team or home_team in name_norm:
-                            if odds_home is None or decimal > odds_home:
-                                odds_home = decimal
-                        elif name in ("Draw", "draw"):
-                            if odds_draw is None or decimal > odds_draw:
-                                odds_draw = decimal
-                        elif name_norm == away_team or away_team in name_norm:
-                            if odds_away is None or decimal > odds_away:
-                                odds_away = decimal
-                elif isinstance(h2h, dict):
-                    odds_home = _american_to_decimal(h2h.get("home"))
-                    odds_draw = _american_to_decimal(h2h.get("draw"))
-                    odds_away = _american_to_decimal(h2h.get("away"))
-
-            # sport_title для competition
-            sport_title = ev.get("sport_title", sport_key)
-
-            if dry_run:
-                logger.info(f"[DRY] Would upsert: {home_team} vs {away_team} ({date_utc})")
-                stored += 1
-                created += 1
-                continue
-
-            # §1.4: upsert через хаб
             try:
-                cid = upsert_match(
-                    home_team=home_team,
-                    away_team=away_team,
-                    date_utc=date_utc,
-                    competition=sport_title,
-                    country="",
-                    status="scheduled",
-                    source=COLLECTOR_NAME,
-                    sources=[COLLECTOR_NAME],
-                    source_ids={COLLECTOR_NAME: event_id},
-                )
-            except Exception as e:
-                logger.error(f"[PROPLINE] upsert error for {home_team} vs {away_team}: {e}")
-                cid = None
+                event_id = str(ev.get("id", ""))
+                if not event_id:
+                    continue
 
-            if cid:
-                stored += 1
-                created += 1
+                home_raw = ev.get("home_team", "")
+                away_raw = ev.get("away_team", "")
+                if not home_raw or not away_raw:
+                    continue
 
-                # Patch odds
-                odds_current = {}
-                if odds_home is not None:
-                    odds_current["home"] = float(odds_home)
-                if odds_draw is not None:
-                    odds_current["draw"] = float(odds_draw)
-                if odds_away is not None:
-                    odds_current["away"] = float(odds_away)
+                # §2.4: нормализация команд
+                home_team = clean_team_name(home_raw)
+                away_team = clean_team_name(away_raw)
 
-                if odds_current:
-                    idempotency_key = f"{run_id}:{cid}:odds"
+                raw_date = ev.get("commence_time", "") or ev.get("start_time", "")
+                date_utc = normalize_date(raw_date)
+
+                if date_utc and not is_future_match(date_utc):
+                    skipped_past += 1
+                    continue
+
+                # Upper bound
+                if date_utc:
                     try:
-                        patch_match(cid, "odds", {"current": odds_current},
-                                   source=COLLECTOR_NAME, upstream="propline",
-                                   idempotency_key=idempotency_key)
-                    except Exception as e:
-                        logger.error(f"[PROPLINE] patch error for cid={cid}: {e}")
+                        match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+                        if match_dt > datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD):
+                            skipped_future += 1
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                # Dedup
+                dedup_key = f"{home_team}|{away_team}|{date_utc}"
+                if dedup_key in seen:
+                    deduped += 1
+                    continue
+                seen.add(dedup_key)
+
+                total_events += 1
+
+                # Извлечение odds
+                odds_home = None
+                odds_draw = None
+                odds_away = None
+                odds_data = ev.get("odds", ev)
+
+                # h2h может быть list [{name, price}] или dict {home, draw, away}
+                h2h = odds_data.get("h2h")
+                if h2h is not None:
+                    if isinstance(h2h, list):
+                        for item in h2h:
+                            name = item.get("name", "")
+                            price = item.get("price")
+                            decimal = _american_to_decimal(price)
+                            if decimal is None:
+                                continue
+                            name_norm = clean_team_name(name)
+                            if name_norm == home_team or home_team in name_norm:
+                                if odds_home is None or decimal > odds_home:
+                                    odds_home = decimal
+                            elif name in ("Draw", "draw"):
+                                if odds_draw is None or decimal > odds_draw:
+                                    odds_draw = decimal
+                            elif name_norm == away_team or away_team in name_norm:
+                                if odds_away is None or decimal > odds_away:
+                                    odds_away = decimal
+                    elif isinstance(h2h, dict):
+                        odds_home = _american_to_decimal(h2h.get("home"))
+                        odds_draw = _american_to_decimal(h2h.get("draw"))
+                        odds_away = _american_to_decimal(h2h.get("away"))
+
+                # sport_title для competition
+                sport_title = ev.get("sport_title", sport_key)
+
+                if dry_run:
+                    logger.info(f"[DRY] Would upsert: {home_team} vs {away_team} ({date_utc})")
+                    stored += 1
+                    created += 1
+                    continue
+
+                # §1.4: upsert через хаб
+                try:
+                    cid = upsert_match(
+                        home_team=home_team,
+                        away_team=away_team,
+                        date_utc=date_utc,
+                        competition=sport_title,
+                        country="",
+                        status="scheduled",
+                        source=COLLECTOR_NAME,
+                        sources=[COLLECTOR_NAME],
+                        source_ids={COLLECTOR_NAME: event_id},
+                    )
+                except Exception as e:
+                    logger.error(f"[PROPLINE] upsert error for {home_team} vs {away_team}: {e}")
+                    cid = None
+
+                if cid:
+                    stored += 1
+                    created += 1
+
+                    # Patch odds
+                    odds_current = {}
+                    if odds_home is not None:
+                        odds_current["home"] = float(odds_home)
+                    if odds_draw is not None:
+                        odds_current["draw"] = float(odds_draw)
+                    if odds_away is not None:
+                        odds_current["away"] = float(odds_away)
+
+                    if odds_current:
+                        idempotency_key = f"{run_id}:{cid}:odds"
+                        try:
+                            patch_match(cid, "odds", {"current": odds_current},
+                                       source=COLLECTOR_NAME, upstream="pinnacle",
+                                       idempotency_key=idempotency_key)
+                        except Exception as e:
+                            logger.error(f"[PROPLINE] patch error for cid={cid}: {e}")
+
+            except Exception as e:
+                logger.error(f"[PROPLINE] Event error: {e}")
+                error_count += 1
 
             time.sleep(rate_delay)
 
@@ -317,6 +331,9 @@ def collect_propline() -> Dict[str, Any]:
     return meta
 
 
+@register_module("propline", role="collector",
+              writes=["upsert_match", "patch_match", "save_meta"],
+              reads=["{collector}:meta"])
 def collect_and_process() -> Dict[str, Any]:
     """Единая точка входа для CI/CD."""
     return collect_propline()

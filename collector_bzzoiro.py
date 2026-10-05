@@ -54,6 +54,17 @@ except ImportError:
     def _is_shutdown():
         return False
 
+
+# §20.7: register_module + §20.6: log_event
+try:
+    from gatekeeper_hub import register_module, log_event
+except ImportError:
+    def register_module(name, role="collector", writes=None, reads=None):
+        def decorator(func):
+            return func
+        return decorator
+    def log_event(module, event, **kwargs):
+        pass
 try:
     from team_registry import normalize_team_name, build_canonical_id, clean_team_name
 except ImportError:
@@ -284,6 +295,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
     # --- Шаг 1: Загрузка событий ---
     logger.info("[BZZOIRO] Шаг 1: Загрузка событий...")
+    log_event("bzzoiro", "collection_start", days_ahead=DAYS_AHEAD, dry_run=dry_run)
     now = dt.datetime.now(dt.timezone.utc)
     date_from = now.strftime("%Y-%m-%d")
     date_to = (now + dt.timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
@@ -658,6 +670,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         "shutdown_triggered": shutdown_triggered,
     }
     logger.info(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
+    log_event("bzzoiro", "collection_complete",
+              total_events=len(all_events), created=created, updated=updated,
+              odds_enriched=odds_enriched, predictions=pred_enriched,
+              errors=enrichment_errors)
 
     save_meta(COLLECTOR_NAME,
               last_run=now_msk(),
@@ -683,6 +699,9 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     return result
 
 
+@register_module("bzzoiro", role="collector",
+              writes=["upsert_match", "patch_match", "save_meta"],
+              reads=["{collector}:meta"])
 def collect_and_process() -> dict:
     """FIX-7: Единая точка входа для CI/CD."""
     return collect_bzzoiro()
