@@ -3,7 +3,7 @@ test_contracts.py — Тесты контрактов API GatekeeperAI.
 Проверяет соответствие модулей архитектурному гиду v8.11.
 Все тесты работают без подключения к Redis — проверяют только API-контракты.
 
-v8.10-patched:
+v8.11-patched:
   FIX-1: test_gatekeeper_hub_api — HUB_API_VERSION как опциональный импорт
   FIX-2: test_telegram_transport_api — TELEGRAM_CHUNK_LIMIT гибкая проверка
   FIX-3: test_fixtures — проверка "opening" ключа (schema v710 primary)
