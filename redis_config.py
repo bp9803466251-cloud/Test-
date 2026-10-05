@@ -8,6 +8,7 @@ redis_config.py — Конфигурация подключения к Upstash R
 v8.11-patched:
   FIX-1: get_redis_info() — safe split() с try/except (IndexError на malformed URL)
   FIX-2: reload_config() — перечитывание env без перезагрузки модуля
+  FIX-3: NullHandler добавлен (§20.5 — консистентность с другими модулями)
 
 Переменные окружения (GitHub Actions secrets):
   SHARED_UPSTASH_REDIS_REST_URL    — Base URL Upstash REST API
@@ -44,6 +45,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def _get_int_env(name: str, default: int) -> int:
