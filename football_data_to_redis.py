@@ -98,7 +98,6 @@ except ImportError:
 try:
     from team_registry import clean_team_name as _registry_normalize
     from team_registry import build_canonical_id as _registry_build_cid
-    from team_registry import TEAM_ALIASES as _REGISTRY_ALIASES
     _REGISTRY_AVAILABLE = True
 except ImportError:
     _REGISTRY_AVAILABLE = False
@@ -961,10 +960,8 @@ class FootballDataCollector:
         data = json.dumps(self._meta_entries, ensure_ascii=False)
         if _HUB_AVAILABLE:
             try:
-                from gatekeeper_hub import save_meta as _hub_save_meta
-                _hub_save_meta(SOURCE_NAME, **self._meta_entries.get(
-                    list(self._meta_entries.keys())[-1], {}
-                ))
+                from gatekeeper_hub import save_to_cache as _hub_save_cache
+                _hub_save_cache("football_data:meta", self._meta_entries)
             except Exception:
                 # Fallback на прямой SET через redis_hub
                 try:
