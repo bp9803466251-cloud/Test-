@@ -105,6 +105,268 @@ def validate_schema(match_obj, schema_version=SCHEMA_VERSION):
 
 
 
+# ═══════════════════════════════════════════════════════════
+# §20.4: validate_match_quality — 10 проверок качества
+# ═══════════════════════════════════════════════════════════
+
+def validate_match_quality(match):
+    """Проверка качества матча (§20.4). Возвращает dict с score 0-100,
+    issues (critical) и warnings."""
+    if not match or not isinstance(match, dict):
+        return {"score": 0, "valid": False, "issues": ["not a dict"], "warnings": []}
+
+    score = 100
+    issues = []
+    warnings = []
+
+    # 1. canonical_id format: home__away__YYYYMMDD
+    cid = match.get("canonical_id", "")
+    if cid and "__" in cid:
+        parts = cid.split("__")
+        if len(parts) == 3 and len(parts[2]) == 8:
+            pass  # OK
+        else:
+            score -= 5
+            warnings.append("canonical_id format unexpected")
+    elif not cid:
+        score -= 10
+        issues.append("canonical_id missing")
+
+    # 2. Odds range [1.01, 1000]
+    odds = match.get("odds", {})
+    if odds and isinstance(odds, dict):
+        odds_1x2 = odds.get("1x2", {})
+        for section in ("current", "opening", "best", "closing"):
+            sec = odds_1x2.get(section, {})
+            if not sec:
+                continue
+            for key in ("home", "draw", "away"):
+                val = sec.get(key)
+                if val is not None:
+                    try:
+                        v = float(val)
+                        if v < 1.01 or v > 1000:
+                            score -= 2
+                            warnings.append(f"odds.{section}.{key}={v} out of range")
+                    except (TypeError, ValueError):
+                        pass
+
+    # 3. Score >= 0
+    sc = match.get("score", {})
+    if sc and isinstance(sc, dict):
+        for side in ("home", "away"):
+            val = sc.get(side)
+            if val is not None:
+                try:
+                    if float(val) < 0:
+                        score -= 5
+                        issues.append(f"score.{side} is negative")
+                except (TypeError, ValueError):
+                    pass
+
+    # 4. home_clean not empty
+    if not match.get("home_clean"):
+        score -= 10
+        issues.append("home_clean is empty")
+
+    # 5. away_clean not empty
+    if not match.get("away_clean"):
+        score -= 10
+        issues.append("away_clean is empty")
+
+    # 6. date_utc valid (2000-2100)
+    date_utc = match.get("date_utc", "")
+    if date_utc:
+        try:
+            year = int(date_utc[:4])
+            if year < 2000 or year > 2100:
+                score -= 5
+                warnings.append(f"date_utc year {year} out of range")
+        except (ValueError, TypeError):
+            score -= 5
+            warnings.append("date_utc unparseable")
+    else:
+        score -= 5
+        warnings.append("date_utc missing")
+
+    # 7. sources not empty list
+    sources = match.get("sources", [])
+    if not sources:
+        score -= 5
+        warnings.append("sources is empty")
+
+    # 8. source_ids not empty dict
+    source_ids = match.get("source_ids", {})
+    if not source_ids:
+        score -= 5
+        warnings.append("source_ids is empty")
+
+    # 9. section_history has upstream
+    sh = match.get("section_history", [])
+    if sh and isinstance(sh, list):
+        has_upstream = any(e.get("upstream") for e in sh if isinstance(e, dict))
+        if not has_upstream:
+            score -= 5
+            warnings.append("section_history entries missing upstream")
+    elif not sh:
+        warnings.append("section_history is empty")
+
+    # 10. schema_version
+    sv = match.get("schema_version", "")
+    if not sv:
+        score -= 10
+        issues.append("schema_version is empty")
+    elif sv != SCHEMA_VERSION:
+        score -= 5
+        warnings.append(f"schema_version {sv} != {SCHEMA_VERSION}")
+
+    score = max(0, score)
+    return {
+        "score": score,
+        "valid": score >= 70 and not issues,
+        "issues": issues,
+        "warnings": warnings,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# §20.2: migrate_schema — миграция между версиями схемы
+# ═══════════════════════════════════════════════════════════
+
+def migrate_schema(from_version=None, to_version=SCHEMA_VERSION, dry_run=True):
+    """Миграция всех match:* и history:match:* ключей (§20.2).
+    dry_run=True по умолчанию. Возвращает отчёт."""
+    METRICS.inc("migrate_schema")
+    rh = _get_redis()
+    if not rh:
+        return {"error": "no_redis", "migrated": 0, "dry_run": dry_run}
+
+    log_event("hub", "INFO", "migrate_schema starting",
+              from_version=from_version, to_version=to_version, dry_run=dry_run)
+
+    all_fields = rh.get_all_fields()
+    if not all_fields or not isinstance(all_fields, dict):
+        return {"error": "no_data", "migrated": 0, "dry_run": dry_run}
+
+    migrated_live = 0
+    migrated_history = 0
+    skipped = 0
+    errors = 0
+
+    for key, raw in all_fields.items():
+        if not key.startswith("match:") and not key.startswith("history:match:"):
+            continue
+        if ":meta" in key or "idem" in key:
+            continue
+
+        match = deserialize_match(raw) if isinstance(raw, str) else raw
+        if not match or not isinstance(match, dict):
+            continue
+
+        current_sv = match.get("schema_version", "")
+        if from_version and current_sv != from_version:
+            skipped += 1
+            continue
+
+        if current_sv == to_version:
+            skipped += 1
+            continue
+
+        match["schema_version"] = to_version
+
+        if "section_history" not in match:
+            match["section_history"] = []
+        match["section_history"].append({
+            "section": "schema_migration",
+            "source": "system",
+            "upstream": "",
+            "from_version": current_sv,
+            "to_version": to_version,
+            "updated_at": now_msk(),
+        })
+        if len(match["section_history"]) > 50:
+            match["section_history"] = match["section_history"][-50:]
+
+        match["version"] = match.get("version", 1) + 1
+        match["updated_at"] = now_msk()
+
+        # Validate after migration
+        ok, msg = validate_schema(match, to_version)
+        if not ok:
+            log_event("hub", "WARN", "migrate_schema: validation failed after migration",
+                      key=key, error=msg)
+            errors += 1
+            continue
+
+        if not dry_run:
+            rh.save_to_cache(key, match)
+
+        if key.startswith("history:"):
+            migrated_history += 1
+        else:
+            migrated_live += 1
+
+    log_event("hub", "INFO", "migrate_schema done",
+              migrated_live=migrated_live, migrated_history=migrated_history,
+              skipped=skipped, errors=errors, dry_run=dry_run)
+
+    return {
+        "migrated_live": migrated_live,
+        "migrated_history": migrated_history,
+        "skipped": skipped,
+        "errors": errors,
+        "dry_run": dry_run,
+        "to_version": to_version,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# §20.7: Module Registry + @register_module
+# ═══════════════════════════════════════════════════════════
+
+MODULE_REGISTRY = {}
+
+
+def register_module(name, role="unknown", writes=None, reads=None):
+    """Декоратор регистрации модуля в реестре (§20.7)."""
+    def decorator(func):
+        MODULE_REGISTRY[name] = {
+            "name": name,
+            "role": role,
+            "writes": writes or [],
+            "reads": reads or [],
+            "entry_point": func.__name__,
+        }
+        return func
+    return decorator
+
+
+def get_module_registry():
+    """Возвращает реестр модулей (§20.7)."""
+    return dict(MODULE_REGISTRY)
+
+
+def get_module_status(name):
+    """Возвращает live-статус модуля из {name}:meta (§20.7)."""
+    rh = _get_redis()
+    if not rh:
+        return {"name": name, "available": False}
+    try:
+        meta = rh.get_from_cache(f"{name}:meta")
+        if meta and isinstance(meta, dict):
+            return {
+                "name": name,
+                "available": True,
+                "last_run": meta.get("last_run", ""),
+                "error_count": meta.get("error_count", 0),
+                "events_collected": meta.get("events_collected", 0),
+            }
+    except Exception:
+        pass
+    return {"name": name, "available": False}
+
+
+
 
 __all__ = [
     # Version
@@ -150,10 +412,17 @@ __all__ = [
     # FIX-AUDIT: schema + indexes
     "validate_schema",
     "update_history_indexes",
-    # §20.2 / §20.4 — новые функции этапа 3
-    "validate_match_quality",
-    "migrate_schema",
+    # §20.1: Serialization
     "_json_default",
+    # §20.2: Schema migration
+    "migrate_schema",
+    # §20.4: Quality
+    "validate_match_quality",
+    # §20.7: Module Registry
+    "MODULE_REGISTRY",
+    "register_module",
+    "get_module_registry",
+    "get_module_status",
 ]
 
 
@@ -428,14 +697,18 @@ def should_overwrite(new_source, new_upstream,
 # ═══════════════════════════════════════════════════════════
 
 def log_event(source, level, message, **kwargs):
+    """Структурный логинг (§20.6). Машиночитаемый JSON-контекст для CI-парсинга."""
     ts = now_msk_short()
     parts = [f"[{ts}]", f"[{source}]", f"[{level}]", message]
     if kwargs:
-        extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
-        parts.append(f"({extra})")
+        try:
+            ctx = json.dumps(kwargs, default=_json_default, ensure_ascii=False)
+            parts.append(f"| {ctx}")
+        except (TypeError, ValueError):
+            extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
+            parts.append(f"({extra})")
     line = " ".join(parts)
     print(line, flush=True)
-    # Also log via logging for GitHub Actions
     if level == "ERROR":
         logger.error(line)
     elif level == "WARN":
@@ -450,18 +723,22 @@ def log_event(source, level, message, **kwargs):
 # Serialization (§20.1)
 # ═══════════════════════════════════════════════════════════
 
-def _json_default(o):
-    """Единый fallback для json.dumps — datetime -> ISO, set -> list. §20.1"""
-    if hasattr(o, "isoformat"):
-        return o.isoformat()
-    if isinstance(o, (set, frozenset)):
-        return list(o)
-    return str(o)
+def _json_default(obj):
+    """Единый fallback для json.dumps (§20.1).
+    datetime → ISO, set → sorted list, произвольные объекты → str."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, set):
+        return sorted(obj)
+    if isinstance(obj, frozenset):
+        return sorted(obj)
+    return str(obj)
 
 
 def serialize_match(match_obj):
-    """Единый сериализатор. §20.1 — использует _json_default вместо str."""
-    return json.dumps(match_obj, ensure_ascii=False, separators=(",", ":"), default=_json_default)
+    """Сериализация матча в JSON (§20.1). Использует _json_default для datetime."""
+    return json.dumps(match_obj, ensure_ascii=False, separators=(",", ":"),
+                      default=_json_default)
 
 
 def deserialize_match(raw):
@@ -1227,33 +1504,28 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
             continue
 
         if auto_migrate:
-            # §20.5: Идемпотентная миграция — не перезаписываем существующий history
+            # §20.5: Идемпотентная миграция — проверяем существующий history
             existing_history = rh.get_from_cache(history_key)
             if existing_history and isinstance(existing_history, dict):
-                # History уже существует (из CSV) — merge live-enrichment
-                # «Золотой» объект: CSV-статистика + live-enrichment
+                # Merge live-enrichment в существующий «золотой» объект (из CSV)
                 for enrich_key in ("predictions", "h2h", "stats", "odds"):
-                    live_val = match.get(enrich_key)
-                    if live_val and not existing_history.get(enrich_key):
-                        existing_history[enrich_key] = live_val
-                # Обновляем sources
+                    if match.get(enrich_key) and not existing_history.get(enrich_key):
+                        existing_history[enrich_key] = match[enrich_key]
+                # Merge sources
                 live_sources = match.get("sources", [])
                 hist_sources = existing_history.get("sources", [])
                 for src in live_sources:
                     if src not in hist_sources:
                         hist_sources.append(src)
                 existing_history["sources"] = hist_sources
+                # Mark migration
                 existing_history["migrated_at"] = now_msk()
                 existing_history["version"] = existing_history.get("version", 1) + 1
                 rh.save_to_cache(history_key, existing_history)
-                log_event("hub", "INFO", "cleanup: merged live enrichment into history",
-                          cid=canonical_id)
             else:
-                # History не существует — полная миграция
+                # Full migration — нет существующего history
                 match["migrated_at"] = now_msk()
                 rh.save_to_cache(history_key, match)
-                log_event("hub", "INFO", "cleanup: migrated to history",
-                          cid=canonical_id)
 
         # FIX-AUDIT-3: Удаляем из индексов
         _remove_from_index(canonical_id)
@@ -1628,248 +1900,6 @@ def get_from_cache(key):
     if not rh:
         return None
     return rh.get_from_cache(key)
-
-
-
-
-# ═══════════════════════════════════════════════════════════
-# §20.4 — Качество данных (validate_match_quality)
-# ═══════════════════════════════════════════════════════════
-
-def validate_match_quality(match_obj):
-    """
-    Проверка качества данных матча. §20.4.
-    Не блокирует запись, но помечает проблемы.
-
-    Возвращает: {
-        "score": int (0-100),
-        "issues": list[str],    # критические проблемы (score < 70 → invalid)
-        "warnings": list[str],  # некритические
-    }
-    """
-    issues = []
-    warnings = []
-    score = 100
-
-    if not isinstance(match_obj, dict):
-        return {"score": 0, "issues": ["not a dict"], "warnings": []}
-
-    cid = match_obj.get("canonical_id", "")
-
-    # 1. canonical_id формат
-    if not cid or "__" not in cid or len(cid.split("__")) != 3:
-        warnings.append("canonical_id format invalid")
-        score -= 5
-
-    # 2. Odds sanity — range [1.01, 1000]
-    odds_1x2 = match_obj.get("odds", {}).get("1x2", {}) if isinstance(match_obj.get("odds"), dict) else {}
-    for section in ("current", "opening", "best", "closing"):
-        section_odds = odds_1x2.get(section, {})
-        if not isinstance(section_odds, dict):
-            continue
-        for key in ("home", "draw", "away"):
-            val = section_odds.get(key)
-            if val is not None:
-                try:
-                    fval = float(val)
-                    if fval < 1.01:
-                        warnings.append(f"odds.1x2.{section}.{key}={fval} — аномалия (<1.01)")
-                        score -= 2
-                    elif fval > 1000:
-                        warnings.append(f"odds.1x2.{section}.{key}={fval} — аномалия (>1000)")
-                        score -= 2
-                except (ValueError, TypeError):
-                    warnings.append(f"odds.1x2.{section}.{key}={val} — не число")
-                    score -= 2
-
-    # 3. Score sanity
-    score_obj = match_obj.get("score")
-    if score_obj and isinstance(score_obj, dict):
-        if score_obj.get("home", 0) < 0 or score_obj.get("away", 0) < 0:
-            issues.append("score negative")
-            score -= 5
-
-    # 4. home_clean / away_clean не пустые
-    if not match_obj.get("home_clean"):
-        issues.append("home_clean empty")
-        score -= 10
-    if not match_obj.get("away_clean"):
-        issues.append("away_clean empty")
-        score -= 10
-
-    # 5. date_utc валидная (2000-2100)
-    date_utc = match_obj.get("date_utc", "")
-    if date_utc:
-        try:
-            year = int(date_utc[:4])
-            if year < 2000 or year > 2100:
-                warnings.append(f"date_utc year {year} — вне диапазона")
-                score -= 5
-        except (ValueError, TypeError):
-            warnings.append("date_utc format invalid")
-            score -= 5
-    else:
-        warnings.append("date_utc missing")
-        score -= 5
-
-    # 6. sources не пустой
-    sources = match_obj.get("sources", [])
-    if not sources:
-        warnings.append("sources empty")
-        score -= 5
-
-    # 7. source_ids не пустой
-    source_ids = match_obj.get("source_ids", {})
-    if not source_ids:
-        warnings.append("source_ids empty")
-        score -= 5
-
-    # 8. section_history содержит upstream
-    section_history = match_obj.get("section_history", [])
-    if section_history:
-        has_upstream = any(
-            isinstance(entry, dict) and entry.get("upstream")
-            for entry in section_history
-        )
-        if not has_upstream:
-            warnings.append("section_history entries missing upstream")
-            score -= 5
-
-    # 9. schema_version
-    sv = match_obj.get("schema_version", "")
-    if not sv:
-        issues.append("schema_version missing")
-        score -= 10
-    elif sv != SCHEMA_VERSION:
-        warnings.append(f"schema_version {sv} != {SCHEMA_VERSION}")
-        score -= 5
-
-    score = max(0, min(100, score))
-    return {"score": score, "issues": issues, "warnings": warnings}
-
-
-# ═══════════════════════════════════════════════════════════
-# §20.2 — Схемная миграция (migrate_schema)
-# ═══════════════════════════════════════════════════════════
-
-def migrate_schema(from_version="v700", to_version="v710", dry_run=True):
-    """
-    Миграция всех match:* и history:match:* ключей между версиями схемы. §20.2.
-    dry_run=True — только отчёт, без записи.
-
-    Возвращает: {
-        "scanned": int,
-        "migrated": int,
-        "skipped": int,
-        "errors": int,
-        "dry_run": bool,
-        "by_namespace": {"live": int, "history": int},
-    }
-    """
-    METRICS.inc("migrate_schema")
-    rh = _get_redis()
-    if not rh:
-        return {"scanned": 0, "migrated": 0, "skipped": 0, "errors": 1,
-                "dry_run": dry_run, "by_namespace": {"live": 0, "history": 0},
-                "reason": "no_redis"}
-
-    log_event("hub", "INFO", "migrate_schema starting",
-              from_version=from_version, to_version=to_version, dry_run=dry_run)
-
-    scanned = 0
-    migrated = 0
-    skipped = 0
-    errors = 0
-    ns_live = 0
-    ns_history = 0
-
-    all_fields = rh.get_all_fields()
-    if not all_fields or not isinstance(all_fields, dict):
-        return {"scanned": 0, "migrated": 0, "skipped": 0, "errors": 0,
-                "dry_run": dry_run, "by_namespace": {"live": 0, "history": 0}}
-
-    for field_id, raw in all_fields.items():
-        if is_shutdown_requested():
-            log_event("hub", "WARN", "migrate_schema: shutdown requested, stopping")
-            break
-
-        # Только match:* и history:match:*
-        is_live = field_id.startswith("match:") and ":meta" not in field_id and "idem" not in field_id
-        is_history = field_id.startswith("history:match:")
-        if not is_live and not is_history:
-            continue
-        if "canary" in field_id:
-            continue
-
-        scanned += 1
-        match = deserialize_match(raw) if isinstance(raw, str) else raw
-        if not match or not isinstance(match, dict):
-            errors += 1
-            continue
-
-        current_sv = match.get("schema_version", "")
-
-        # Пропускаем если уже на целевой версии
-        if current_sv == to_version:
-            skipped += 1
-            continue
-
-        # Пропускаем если не на исходной версии (не наша миграция)
-        if current_sv != from_version:
-            skipped += 1
-            continue
-
-        if dry_run:
-            log_event("hub", "INFO", "migrate_schema dry-run: would migrate",
-                      key=field_id, from_sv=current_sv, to_sv=to_version)
-            migrated += 1
-            if is_live:
-                ns_live += 1
-            else:
-                ns_history += 1
-            continue
-
-        # Миграция
-        try:
-            match["schema_version"] = to_version
-            match["version"] = match.get("version", 1) + 1
-            match["updated_at"] = now_msk()
-
-            # Если нет section_history — добавляем пустой
-            if "section_history" not in match:
-                match["section_history"] = []
-
-            # Валидация после миграции
-            ok, msg = validate_schema(match, to_version)
-            if not ok:
-                log_event("hub", "WARN", "migrate_schema: validation failed after migration",
-                          key=field_id, error=msg)
-                errors += 1
-                continue
-
-            rh.save_to_cache(field_id, match)
-            migrated += 1
-            if is_live:
-                ns_live += 1
-            else:
-                ns_history += 1
-            log_event("hub", "INFO", "migrate_schema: migrated",
-                      key=field_id, from_sv=from_version, to_sv=to_version)
-        except Exception as e:
-            log_event("hub", "ERROR", "migrate_schema: error",
-                      key=field_id, error=str(e))
-            errors += 1
-
-    result = {
-        "scanned": scanned,
-        "migrated": migrated,
-        "skipped": skipped,
-        "errors": errors,
-        "dry_run": dry_run,
-        "by_namespace": {"live": ns_live, "history": ns_history},
-    }
-    log_event("hub", "INFO", "migrate_schema done", **result)
-    return result
 
 
 

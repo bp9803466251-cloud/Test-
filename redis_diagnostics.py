@@ -717,7 +717,6 @@ def main():
     p.add_argument("--yes", action="store_true", help="Подтверждение для --purge (§18.5)")
     p.add_argument("--dry-run", action="store_true", help="Режим без записи (§18.5)")
     p.add_argument("--json", action="store_true", help="JSON-вывод отчёта (§18.5)")
-    p.add_argument("--cleanup", action="store_true", help="Очистка завершённых матчей (§20.5)")
     p.add_argument("--reset-breaker", action="store_true", help="Сброс circuit breaker (§18.5)")
 
     # ── Диагностические флаги ──
@@ -732,6 +731,8 @@ def main():
     p.add_argument("--dlq-replay", action="store_true", help="Переобработка DLQ (§22.4)")
     p.add_argument("--batch-stats", action="store_true", help="Статистика батчинга (§22.6)")
     p.add_argument("--diff", metavar="CID", help="История изменений матча (§22.6)")
+    p.add_argument("--cleanup", action="store_true", help="Очистка + авто-миграция (§20.5)")
+    p.add_argument("--registry", action="store_true", help="Реестр модулей (§20.7)")
     p.add_argument("--retention", action="store_true", help="Статус retention (§22.7)")
     p.add_argument("--hub-version", action="store_true", help="Версия API хаба (§22.8)")
 
@@ -779,27 +780,6 @@ def main():
             print("✅ Circuit breaker reset")
         else:
             print("❌ redis_hub or reset_circuit_breaker unavailable")
-        return
-
-    # ── --cleanup (§20.5) ──
-    if args.cleanup:
-        hub = _get_hub()
-        if not hub:
-            print("❌ gatekeeper_hub unavailable")
-            return
-        if not hasattr(hub, "cleanup_expired"):
-            print("❌ hub.cleanup_expired not available")
-            return
-
-        dry = args.dry_run
-        auto_migrate = not args.flush  # --flush disables auto_migrate
-        print(f"Cleanup {'(DRY-RUN)' if dry else ''} (auto_migrate={auto_migrate})...")
-
-        try:
-            result = hub.cleanup_expired(dry_run=dry, auto_migrate=auto_migrate)
-            print(json.dumps(result, indent=2, ensure_ascii=False))
-        except Exception as e:
-            print(f"❌ cleanup_expired: {e}")
         return
 
     # ── --flush ──
@@ -858,6 +838,22 @@ def main():
         ok = _do_purge(confirm=args.yes, dry_run=args.dry_run)
         if not ok and not args.dry_run:
             return
+        return
+
+    # ── --cleanup (§20.5) ──
+    if args.cleanup:
+        hub = _get_hub()
+        if not hub:
+            print("❌ gatekeeper_hub unavailable")
+            return
+        if not hasattr(hub, "cleanup_expired"):
+            print("❌ hub.cleanup_expired not available")
+            return
+        dry = args.dry_run
+        auto_migrate = not args.flush  # --flush disables auto_migrate
+        print(f"Cleanup {'(DRY-RUN)' if dry else ''} (auto_migrate={auto_migrate})...")
+        result = hub.cleanup_expired(dry_run=dry, auto_migrate=auto_migrate)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
         return
 
     # ── --validate (§19.4) ──
@@ -961,63 +957,54 @@ def main():
         print(json.dumps(health, indent=2, ensure_ascii=False))
         return
 
-    # ── --quality (§20.4) — расширенная проверка через hub.validate_match_quality ──
+    # ── --quality (§20.4) — full validate_match_quality ──
     if args.quality:
         hub = _get_hub()
         if not hub:
             print("❌ gatekeeper_hub unavailable")
             return
         if not hasattr(hub, "validate_match_quality"):
-            print("❌ hub.validate_match_quality not available (hub version too old)")
+            print("❌ hub.validate_match_quality not available (update gatekeeper_hub.py)")
             return
-
         data = _step2_get_all_fields()
         matches = data.get("matches", {})
         total = len(matches)
-        if not total:
-            print("No matches found")
-            return
-
         scores = []
-        issues_count = 0
-        warnings_count = 0
+        valid_count = 0
+        invalid_count = 0
         worst_matches = []
-
         for key, match in matches.items():
             if not isinstance(match, dict):
                 continue
             try:
                 result = hub.validate_match_quality(match)
-                scores.append(result["score"])
-                if result["issues"]:
-                    issues_count += 1
-                if result["warnings"]:
-                    warnings_count += 1
-                if result["score"] < 70:
-                    cid = match.get("canonical_id", key)
-                    worst_matches.append({
-                        "cid": cid,
-                        "score": result["score"],
-                        "issues": result["issues"],
-                        "warnings": result["warnings"],
-                    })
             except Exception as e:
-                logger.error(f"validate_match_quality error for {key}: {e}")
-
-        avg_score = round(sum(scores) / len(scores), 1) if scores else 0
-        valid_count = sum(1 for s in scores if s >= 70)
-        invalid_count = total - valid_count
-
-        quality_report = {
+                logger.warning(f"validate_match_quality {key}: {e}")
+                continue
+            scores.append(result["score"])
+            if result["valid"]:
+                valid_count += 1
+            else:
+                invalid_count += 1
+            if result["score"] < 70:
+                worst_matches.append({
+                    "key": key,
+                    "cid": match.get("canonical_id", "?"),
+                    "score": result["score"],
+                    "issues": result.get("issues", []),
+                    "warnings": result.get("warnings", []),
+                })
+        worst_matches.sort(key=lambda x: x["score"])
+        quality = {
             "total": total,
-            "avg_score": avg_score,
             "valid": valid_count,
             "invalid": invalid_count,
-            "with_issues": issues_count,
-            "with_warnings": warnings_count,
-            "worst_matches": sorted(worst_matches, key=lambda x: x["score"])[:10],
+            "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
+            "min_score": min(scores) if scores else 0,
+            "max_score": max(scores) if scores else 0,
+            "worst_matches": worst_matches[:10],
         }
-        print(json.dumps(quality_report, indent=2, ensure_ascii=False))
+        print(json.dumps(quality, indent=2, ensure_ascii=False))
         return
 
     # ── --dashboard (§23.6) ──
@@ -1066,6 +1053,30 @@ def main():
             "drift_detected": bool(extra_fields or missing_fields),
         }
         print(json.dumps(report, indent=2, ensure_ascii=False))
+        return
+
+    # ── --registry (§20.7) ──
+    if args.registry:
+        hub = _get_hub()
+        if not hub:
+            print("❌ gatekeeper_hub unavailable")
+            return
+        if not hasattr(hub, "get_module_registry"):
+            print("❌ hub.get_module_registry not available (update gatekeeper_hub.py)")
+            return
+        registry = hub.get_module_registry()
+        print(f"Module Registry ({len(registry)} modules):")
+        for name, info in sorted(registry.items()):
+            print(f"  {name:15s}  role={info.get('role', '?'):15s}  writes={info.get('writes', [])}")
+        print()
+        print("Live status:")
+        for name in sorted(registry.keys()):
+            status = hub.get_module_status(name)
+            marker = "+" if status.get("available") else "-"
+            last_run = status.get("last_run", "never")
+            errors = status.get("error_count", 0)
+            err_flag = f"  errors={errors}" if errors else ""
+            print(f"  {marker} {name:15s}  last_run={last_run}{err_flag}")
         return
 
     # ── --reconcile (§21.5) ──
@@ -1136,32 +1147,25 @@ def main():
         print(json.dumps({"active": active, "expired": expired, "total": active + expired}, indent=2))
         return
 
+    # ── --migrate-schema (§20.2) ──
     if args.migrate_schema:
         hub = _get_hub()
         if not hub:
             print("❌ gatekeeper_hub unavailable")
             return
         if not hasattr(hub, "migrate_schema"):
-            print("❌ hub.migrate_schema not available (hub version too old)")
+            print("❌ hub.migrate_schema not available (update gatekeeper_hub.py)")
             return
-
         target = args.migrate_schema
+        current = getattr(hub, "SCHEMA_VERSION", "v710")
         dry = args.dry_run
-        print(f"Schema migration -> {target} {'(DRY-RUN)' if dry else ''}...")
-
-        # Определяем исходную версию из текущей схемы хаба
-        current_sv = getattr(hub, "SCHEMA_VERSION", "v710")
-        from_ver = "v700" if target == "v710" else current_sv
-
-        try:
-            result = hub.migrate_schema(
-                from_version=from_ver,
-                to_version=target,
-                dry_run=dry,
-            )
-            print(json.dumps(result, indent=2, ensure_ascii=False))
-        except Exception as e:
-            print(f"❌ migrate_schema: {e}")
+        print(f"Migrating schema: {current} → {target} {'(DRY-RUN)' if dry else ''}...")
+        result = hub.migrate_schema(
+            from_version=None,
+            to_version=target,
+            dry_run=dry,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
         return
 
     if args.canary:
