@@ -108,6 +108,14 @@ def validate_schema(match_obj, schema_version=SCHEMA_VERSION):
     return True, "ok"
 
 
+def validate_schema_bool(match_obj, schema_version=SCHEMA_VERSION):
+    """FIX-AUDIT-v9.3: bool-only wrapper for validate_schema.
+    Use this when you need a simple bool (e.g. `if not validate_schema_bool(obj):`).
+    validate_schema() returns (bool, str) tuple — always truthy."""
+    ok, _msg = validate_schema(match_obj, schema_version)
+    return ok
+
+
 
 # ═══════════════════════════════════════════════════════════
 # §20.4: validate_match_quality — 10 проверок качества
@@ -417,6 +425,7 @@ __all__ = [
     "get_all_fields",              # FIX: прокси для metrics.py (system:health raw JSON, §9.1)
     # FIX-AUDIT: schema + indexes
     "validate_schema",
+    "validate_schema_bool",  # FIX-AUDIT-v9.3: bool wrapper
     "update_history_indexes",
     # §20.1: Serialization
     "_json_default",
@@ -1008,6 +1017,12 @@ def upsert_match(home_team="", away_team="", date_utc="",
             # FIX-3: Python-объект, не serialize_match()
             rh.save_to_cache(key, existing)
         else:
+            # FIX-AUDIT-v9.3: validate_schema before save (§19.6)
+            ok, msg = validate_schema(match_obj)
+            if not ok:
+                log_event(source, "WARN", "upsert_match: schema validation failed",
+                          cid=canonical_id, error=msg)
+                METRICS.inc("upsert_match_schema_error")
             # FIX-3: Python-объект, не serialize_match()
             rh.save_to_cache(key, match_obj)
 
@@ -1804,8 +1819,10 @@ def run_initialization(collector="unknown"):
 
     # 4. Cleanup (§24.7)
     # FIX-7: should_run_cleanup принимает 1 аргумент
+    # FIX-AUDIT-v9.3: capture cleanup_count and migration_count for return dict
+    cleanup_result = {"count": 0, "migrated": 0}
     if should_run_cleanup(collector):
-        cleanup_expired(auto_migrate=is_feature_enabled("auto_migrate"))
+        cleanup_result = cleanup_expired(auto_migrate=is_feature_enabled("auto_migrate"))
     else:
         log_event(collector, "DEBUG",
                   "Cleanup skipped — not cleanup owner (§24.7)")
@@ -1824,6 +1841,9 @@ def run_initialization(collector="unknown"):
         "hub_version": __version__,
         "config_errors": len(errors),
         "init_latency_ms": elapsed_ms,
+        # FIX-AUDIT-v9.3: cleanup_count and migration_count (§14 API contract)
+        "cleanup_count": cleanup_result.get("count", 0) if isinstance(cleanup_result, dict) else 0,
+        "migration_count": cleanup_result.get("migrated", 0) if isinstance(cleanup_result, dict) else 0,
     }
 
 
@@ -1859,20 +1879,24 @@ def get_all_matches():
 
 
 def get_matches_by_date_range(date_from="", date_to=""):
-    """Возвращает матчи в диапазоне дат. Для main.py."""
+    """Возвращает матчи в диапазоне дат как dict {canonical_id: match}.
+    FIX-AUDIT-v9.3: return dict instead of list — main.py, value_engine,
+    web_dashboard, source_diagnostics all expect .items() / .values()."""
     all_matches = get_all_matches()
     if not all_matches:
-        return []
-    if not date_from and not date_to:
-        return all_matches
-    result = []
+        return {}
+    # Always return dict, even without date filter
+    result = {}
     for m in all_matches:
+        cid = m.get("canonical_id", "")
+        if not cid:
+            continue
         mdate = m.get("date_utc", "")[:10]
         if date_from and mdate < date_from:
             continue
         if date_to and mdate > date_to:
             continue
-        result.append(m)
+        result[cid] = m
     return result
 
 
