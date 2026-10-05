@@ -7,6 +7,7 @@ TEAM_ALIASES и clean_team_name в одном модуле (§19.2).
 import logging
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 __all__ = ["TEAM_ALIASES", "clean_team_name", "normalize_team_name", "build_canonical_id", "__version__"]
 
