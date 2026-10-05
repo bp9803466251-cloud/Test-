@@ -3,7 +3,7 @@ country_code_map.py — Маппинг кодов стран и лиг.
 Используется коллекторами для нормализации country и competition.
 """
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 
 __all__ = [
     "COUNTRY_CODE_MAP", "LEAGUE_NAME_MAP",
