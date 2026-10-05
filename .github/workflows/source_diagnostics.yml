@@ -1,9 +1,6 @@
 name: Source Diagnostics
 
 on:
-  schedule:
-    # Каждые 6 часов
-    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -31,13 +28,13 @@ jobs:
     timeout-minutes: 10
 
     env:
-      PYTHON_VERSION: "3.12"
+      PYTHON_VERSION: "3.11"
       PYTHONUNBUFFERED: "1"
       GK_CONFIG_FILE: gatekeeper_config.yaml
-      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
-      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
-      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
       SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -94,3 +91,4 @@ jobs:
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d text="❌ Source Diagnostics FAILED at $(date '+%Y-%m-%d %H:%M:%S UTC')" \
             -d parse_mode="HTML"
+            
