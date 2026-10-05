@@ -717,6 +717,7 @@ def main():
     p.add_argument("--yes", action="store_true", help="Подтверждение для --purge (§18.5)")
     p.add_argument("--dry-run", action="store_true", help="Режим без записи (§18.5)")
     p.add_argument("--json", action="store_true", help="JSON-вывод отчёта (§18.5)")
+    p.add_argument("--cleanup", action="store_true", help="Очистка завершённых матчей (§20.5)")
     p.add_argument("--reset-breaker", action="store_true", help="Сброс circuit breaker (§18.5)")
 
     # ── Диагностические флаги ──
@@ -780,6 +781,27 @@ def main():
             print("❌ redis_hub or reset_circuit_breaker unavailable")
         return
 
+    # ── --cleanup (§20.5) ──
+    if args.cleanup:
+        hub = _get_hub()
+        if not hub:
+            print("❌ gatekeeper_hub unavailable")
+            return
+        if not hasattr(hub, "cleanup_expired"):
+            print("❌ hub.cleanup_expired not available")
+            return
+
+        dry = args.dry_run
+        auto_migrate = not args.flush  # --flush disables auto_migrate
+        print(f"Cleanup {'(DRY-RUN)' if dry else ''} (auto_migrate={auto_migrate})...")
+
+        try:
+            result = hub.cleanup_expired(dry_run=dry, auto_migrate=auto_migrate)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except Exception as e:
+            print(f"❌ cleanup_expired: {e}")
+        return
+
     # ── --flush ──
     if args.flush:
         info = _step1_init()
@@ -841,25 +863,6 @@ def main():
     # ── --validate (§19.4) ──
     if args.validate:
         _do_validate()
-        return
-
-    # ── --migrate-schema (§20.2) ──
-    if args.migrate_schema:
-        hub = _get_hub()
-        if not hub:
-            print("❌ gatekeeper_hub unavailable")
-            return
-        if not hasattr(hub, "migrate_schema"):
-            print("❌ hub.migrate_schema not available (need hub v8.11+)")
-            return
-        target = args.migrate_schema
-        dry = args.dry_run
-        print(f"Migrating to schema {target} {'(DRY-RUN)' if dry else ''}...")
-        try:
-            result = hub.migrate_schema(target, dry_run=dry)
-            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
-        except Exception as e:
-            print(f"❌ migrate_schema: {e}")
         return
 
     # ── --diff (§22.6) ──
@@ -958,75 +961,63 @@ def main():
         print(json.dumps(health, indent=2, ensure_ascii=False))
         return
 
-    # ── --quality (§20.4) ──
+    # ── --quality (§20.4) — расширенная проверка через hub.validate_match_quality ──
     if args.quality:
+        hub = _get_hub()
+        if not hub:
+            print("❌ gatekeeper_hub unavailable")
+            return
+        if not hasattr(hub, "validate_match_quality"):
+            print("❌ hub.validate_match_quality not available (hub version too old)")
+            return
+
         data = _step2_get_all_fields()
         matches = data.get("matches", {})
         total = len(matches)
+        if not total:
+            print("No matches found")
+            return
 
-        # Базовая статистика
-        with_odds = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("odds"))
-        with_clean = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("home_clean") and m.get("away_clean"))
-        with_date = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("date_utc"))
-
-        # §20.4: Используем hub.validate_match_quality() если доступен
-        hub = _get_hub()
-        quality_results = []
         scores = []
         issues_count = 0
         warnings_count = 0
+        worst_matches = []
 
-        if hub and hasattr(hub, "validate_match_quality"):
-            for key, match in matches.items():
-                if not isinstance(match, dict):
-                    continue
-                try:
-                    qr = hub.validate_match_quality(match)
-                    qr["key"] = key
-                    quality_results.append(qr)
-                    scores.append(qr.get("score", 0))
-                    issues_count += len(qr.get("issues", []))
-                    warnings_count += len(qr.get("warnings", []))
-                except Exception as e:
-                    logger.warning(f"validate_match_quality {key}: {e}")
+        for key, match in matches.items():
+            if not isinstance(match, dict):
+                continue
+            try:
+                result = hub.validate_match_quality(match)
+                scores.append(result["score"])
+                if result["issues"]:
+                    issues_count += 1
+                if result["warnings"]:
+                    warnings_count += 1
+                if result["score"] < 70:
+                    cid = match.get("canonical_id", key)
+                    worst_matches.append({
+                        "cid": cid,
+                        "score": result["score"],
+                        "issues": result["issues"],
+                        "warnings": result["warnings"],
+                    })
+            except Exception as e:
+                logger.error(f"validate_match_quality error for {key}: {e}")
 
         avg_score = round(sum(scores) / len(scores), 1) if scores else 0
-        valid_count = sum(1 for q in quality_results if q.get("is_valid"))
-        invalid_count = len(quality_results) - valid_count
+        valid_count = sum(1 for s in scores if s >= 70)
+        invalid_count = total - valid_count
 
-        quality = {
+        quality_report = {
             "total": total,
-            "with_odds": with_odds,
-            "with_clean_teams": with_clean,
-            "with_date": with_date,
-            "odds_pct": round(with_odds / total * 100, 1) if total else 0,
-            "clean_pct": round(with_clean / total * 100, 1) if total else 0,
-            "date_pct": round(with_date / total * 100, 1) if total else 0,
-            # §20.4: Quality scoring
-            "quality_scored": len(quality_results),
-            "quality_avg_score": avg_score,
-            "quality_valid": valid_count,
-            "quality_invalid": invalid_count,
-            "total_issues": issues_count,
-            "total_warnings": warnings_count,
+            "avg_score": avg_score,
+            "valid": valid_count,
+            "invalid": invalid_count,
+            "with_issues": issues_count,
+            "with_warnings": warnings_count,
+            "worst_matches": sorted(worst_matches, key=lambda x: x["score"])[:10],
         }
-
-        # Показать worst matches (score < 70)
-        worst = sorted(quality_results, key=lambda x: x.get("score", 100))[:10]
-        if worst:
-            quality["worst_matches"] = [
-                {
-                    "key": w.get("key", ""),
-                    "canonical_id": w.get("canonical_id", ""),
-                    "score": w.get("score", 0),
-                    "is_valid": w.get("is_valid", False),
-                    "issues": w.get("issues", [])[:3],
-                    "warnings": w.get("warnings", [])[:3],
-                }
-                for w in worst if w.get("score", 100) < 70
-            ]
-
-        print(json.dumps(quality, indent=2, ensure_ascii=False, default=str))
+        print(json.dumps(quality_report, indent=2, ensure_ascii=False))
         return
 
     # ── --dashboard (§23.6) ──
@@ -1146,7 +1137,31 @@ def main():
         return
 
     if args.migrate_schema:
-        print(f"--migrate-schema {args.migrate_schema}: требует реализации миграции в хабе (§20.2)")
+        hub = _get_hub()
+        if not hub:
+            print("❌ gatekeeper_hub unavailable")
+            return
+        if not hasattr(hub, "migrate_schema"):
+            print("❌ hub.migrate_schema not available (hub version too old)")
+            return
+
+        target = args.migrate_schema
+        dry = args.dry_run
+        print(f"Schema migration -> {target} {'(DRY-RUN)' if dry else ''}...")
+
+        # Определяем исходную версию из текущей схемы хаба
+        current_sv = getattr(hub, "SCHEMA_VERSION", "v710")
+        from_ver = "v700" if target == "v710" else current_sv
+
+        try:
+            result = hub.migrate_schema(
+                from_version=from_ver,
+                to_version=target,
+                dry_run=dry,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except Exception as e:
+            print(f"❌ migrate_schema: {e}")
         return
 
     if args.canary:
