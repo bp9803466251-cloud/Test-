@@ -71,6 +71,10 @@ __version__ = "8.11-patched"
 HUB_API_VERSION = "8.9"
 SCHEMA_VERSION = "v710"
 
+# §19.1: FIFO-буферы (schema v710: maxItems)
+MAX_HISTORY_ENTRIES = 20       # section_history (schema maxItems: 20)
+MAX_ODDS_SNAPSHOTS = 10        # odds.1x2.sources[]
+
 # ═══════════════════════════════════════════════════════════
 # FIX-AUDIT: validate_schema — валидация матча против schema v710
 # ═══════════════════════════════════════════════════════════
@@ -284,8 +288,8 @@ def migrate_schema(from_version=None, to_version=SCHEMA_VERSION, dry_run=True):
             "to_version": to_version,
             "updated_at": now_msk(),
         })
-        if len(match["section_history"]) > 50:
-            match["section_history"] = match["section_history"][-50:]
+        if len(match["section_history"]) > MAX_HISTORY_ENTRIES:
+            match["section_history"] = match["section_history"][-MAX_HISTORY_ENTRIES:]
 
         match["version"] = match.get("version", 1) + 1
         match["updated_at"] = now_msk()
@@ -409,6 +413,7 @@ __all__ = [
     "save_search_results",
     "save_analysis",
     "get_from_cache",
+    "set_key",              # FIX: прокси для metrics.py (system:health raw JSON, §9.1)
     # FIX-AUDIT: schema + indexes
     "validate_schema",
     "update_history_indexes",
@@ -995,8 +1000,8 @@ def upsert_match(home_team="", away_team="", date_utc="",
                 "source": source,
                 "updated_at": now_msk(),
             })
-            if len(existing["section_history"]) > 50:
-                existing["section_history"] = existing["section_history"][-50:]
+            if len(existing["section_history"]) > MAX_HISTORY_ENTRIES:
+                existing["section_history"] = existing["section_history"][-MAX_HISTORY_ENTRIES:]
             existing["version"] = existing.get("version", 1) + 1
             existing["updated_at"] = now_msk()
             # FIX-3: Python-объект, не serialize_match()
@@ -1173,8 +1178,8 @@ def _merge_odds(existing_odds, new_odds, source, upstream=None):
                 existing_1x2["sources"] = []
             for src in new_1x2.get("sources", []):
                 existing_1x2["sources"].append(src)
-            if len(existing_1x2["sources"]) > 50:
-                existing_1x2["sources"] = existing_1x2["sources"][-50:]
+            if len(existing_1x2["sources"]) > MAX_ODDS_SNAPSHOTS:
+                existing_1x2["sources"] = existing_1x2["sources"][-MAX_ODDS_SNAPSHOTS:]
 
             result["1x2"] = existing_1x2
         else:
@@ -1190,8 +1195,8 @@ def _merge_odds(existing_odds, new_odds, source, upstream=None):
             "upstream": upstream or "",
             "updated_at": now_msk(),
         })
-        if len(history) > 50:
-            sec_1x2["section_history"] = history[-50:]
+        if len(history) > MAX_HISTORY_ENTRIES:
+            sec_1x2["section_history"] = history[-MAX_HISTORY_ENTRIES:]
 
     return result
 
@@ -1267,8 +1272,8 @@ def patch_match(canonical_id, section, data, source="unknown",
         "upstream": upstream or "",
         "updated_at": now_msk(),
     })
-    if len(match_obj["section_history"]) > 50:
-        match_obj["section_history"] = match_obj["section_history"][-50:]
+    if len(match_obj["section_history"]) > MAX_HISTORY_ENTRIES:
+        match_obj["section_history"] = match_obj["section_history"][-MAX_HISTORY_ENTRIES:]
 
     # FIX-AUDIT-6: CAS retry — optimistic locking с retry до 3 раз (§24.2)
     max_cas_retries = 3
@@ -1393,13 +1398,10 @@ def _remove_from_index(canonical_id):
         except Exception:
             pass
 
-    # FIX-AUDIT-4: Очистка search:results:* — оставляем только latest
-    try:
-        rh._execute_upstash_cmd(["DEL", "search:results:latest"])
-        # Пересохраняем только если есть актуальные данные
-        # (latest останется пустым до следующего поиска)
-    except Exception:
-        pass
+    # §1.7: search:results:latest НЕ удаляется — содержит актуальные данные.
+    # Timestamped ключи search:results:{ts} не создаются (save_search_results
+    # пишет только в search:results:latest). Удаление не требуется.
+    pass
 
 
 
@@ -1900,6 +1902,15 @@ def get_from_cache(key):
     if not rh:
         return None
     return rh.get_from_cache(key)
+
+
+def set_key(key, value):
+    """Прокси к redis_hub.set_key. Raw JSON без конверта (§9.1).
+    Используется metrics.py для system:health."""
+    rh = _get_redis()
+    if not rh:
+        return
+    rh.set_key(key, value)
 
 
 

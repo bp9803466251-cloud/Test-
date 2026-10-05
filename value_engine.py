@@ -24,7 +24,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "3.3-patched"
+__version__ = "8.11-patched"
 
 # FIX-1: Убран logging.basicConfig — он влияет на все модули-импортёры.
 # Каждый модуль должен настраивать logging самостоятельно.
@@ -48,15 +48,16 @@ _PRIORITY_MAP = {
 }
 
 # ---- Единый порог value (из gatekeeper_config -> ENV -> default) ----
+# FIX-AUDIT: stale import заменён на динамический вызов get_value_threshold()
 try:
-    from gatekeeper_config import VALUE_THRESHOLD as _CFG_THRESHOLD
+    from gatekeeper_config import get_value_threshold as _get_threshold
+    _DEFAULT_THRESHOLD = _get_threshold()
 except ImportError:
-    _CFG_THRESHOLD = None
-
-_DEFAULT_THRESHOLD = _CFG_THRESHOLD or float(
-    os.environ.get("VALUE_THRESHOLD", "")
-    or os.environ.get("VALUE_BET_THRESHOLD", "0.03")
-)
+    _get_threshold = None
+    _DEFAULT_THRESHOLD = float(
+        os.environ.get("VALUE_THRESHOLD", "")
+        or os.environ.get("VALUE_BET_THRESHOLD", "0.03")
+    )
 
 
 # ============================================================================
@@ -431,7 +432,7 @@ def batch_evaluate_full(
 
 # Пороги для категоризации (env-configurable)
 _HOT_THRESHOLD = float(os.environ.get("VALUE_HOT_THRESHOLD", "0.08"))
-_WARM_THRESHOLD = float(os.environ.get("VALUE_WARM_THRESHOLD", "0.03"))
+_WARM_THRESHOLD = float(os.environ.get("VALUE_WARM_THRESHOLD", "0.03"))  # Используется в run_pipeline для warm-категории
 _FIRE_THRESHOLD = float(os.environ.get("VALUE_FIRE_THRESHOLD", "0.12"))
 
 
