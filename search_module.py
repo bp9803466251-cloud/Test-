@@ -9,6 +9,7 @@ v8.11-patched:
   FIX-3: search_teams — fuzzy fallback при 0 точных + 0 partial совпадений
   FIX-4: find_match_candidates — reverse (home↔away) fallback
   FIX-5: __version__ в __all__ исправлен (был строкой, не переменной)
+  FIX-6: NullHandler добавлен (§20.5)
 """
 
 import logging
@@ -18,6 +19,7 @@ from team_registry import clean_team_name, TEAM_ALIASES
 __version__ = "8.11-patched"
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # build_canonical_id — реэкспорт из team_registry (с локальным fallback)
 try:
