@@ -1,6 +1,6 @@
 """
 test_contracts.py — Тесты контрактов API GatekeeperAI.
-Проверяет соответствие модулей архитектурному гиду v8.10.
+Проверяет соответствие модулей архитектурному гиду v8.11.
 Все тесты работают без подключения к Redis — проверяют только API-контракты.
 
 v8.10-patched:
@@ -20,7 +20,7 @@ import json
 import sys
 import os
 
-__version__ = "8.10-patched"
+__version__ = "8.11-patched"
 
 __all__ = [
     "test_team_registry",
