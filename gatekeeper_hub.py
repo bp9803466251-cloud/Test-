@@ -32,6 +32,7 @@ from functools import wraps
 import logging
 
 logger = logging.getLogger("gatekeeper_hub")
+logger.addHandler(logging.NullHandler())
 
 # ── Конфигурация ───────────────────────────────────────────
 try:
@@ -446,7 +447,7 @@ def log_event(source, level, message, **kwargs):
 # ═══════════════════════════════════════════════════════════
 
 def serialize_match(match_obj):
-    return json.dumps(match_obj, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(match_obj, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def deserialize_match(raw):
@@ -1062,7 +1063,7 @@ def save_meta(collector, **kwargs):
     if not rh:
         return
 
-    key = f"meta:{collector}"  # FIX-17: meta key format "meta:{collector}"
+    key = f"{collector}:meta"  # FIX-17: meta key format "{collector}:meta" (§10 INDEX_REGISTRY)
 
     meta = {
         "last_run": now_msk(),

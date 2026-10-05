@@ -24,11 +24,8 @@ import logging
 import argparse
 from datetime import datetime, timezone, timedelta
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - [DIAG] %(message)s",
-)
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 __version__ = "8.11-patched"
 __all__ = ["main", "diagnose_redis", "diagnose_matches", "diagnose_indexes",
@@ -258,7 +255,7 @@ def diagnose_sources(data):
     if rdb and hasattr(rdb, "get_key"):
         for collector in ["sharpapi", "propline", "odds_api", "bzzoiro", "main"]:
             try:
-                raw = rdb.get_key(f"meta:{collector}")
+                raw = rdb.get_key(f"{collector}:meta")
                 if raw:
                     meta = json.loads(raw) if isinstance(raw, str) else raw
                     collector_meta[collector] = {
@@ -581,7 +578,7 @@ def _do_purge(confirm=False, dry_run=False):
             return True
         elif hasattr(rdb, "delete_keys_by_pattern"):
             # Fallback: delete all known patterns
-            for pattern in ["match:*", "history:*", "meta:*", "idx:*", "index:*"]:
+            for pattern in ["match:*", "history:*", "meta:*", "*:meta", "idx:*", "index:*"]:
                 try:
                     rdb.delete_keys_by_pattern(pattern)
                 except Exception:

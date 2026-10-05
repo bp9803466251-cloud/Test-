@@ -58,11 +58,8 @@ RETRY_BASE_DELAY = 0.5
 
 MSK_TZ = timezone(timedelta(hours=3))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - [REDIS_HUB] %(message)s",
-)
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # ── Circuit Breaker ─────────────────────────────────────────
 _cb_state = "closed"
