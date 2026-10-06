@@ -4,7 +4,6 @@ name: CI Tests
 on:
   workflow_dispatch:
 
-# FIX-AUDIT-v9.3: PYTHON_VERSION in workflow-level env (consistency)
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: "1"
@@ -12,7 +11,6 @@ env:
 permissions:
   contents: read
 
-# FIX-AUDIT-v9.3: concurrency.group → gatekeeper-redis, cancel-in-progress → false (§13)
 concurrency:
   group: gatekeeper-redis
   cancel-in-progress: false
@@ -38,7 +36,6 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          # FIX-AUDIT-v9.3: use env.PYTHON_VERSION instead of hardcoded '3.11'
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
@@ -63,7 +60,6 @@ jobs:
           )
           from gatekeeper_hub import validate_schema
 
-          # Validate each fixture against schema v710
           for name, fixture in [
               ('CANONICAL_LIVE_MATCH', CANONICAL_LIVE_MATCH),
               ('CANONICAL_HISTORY_MATCH', CANONICAL_HISTORY_MATCH),
@@ -74,7 +70,6 @@ jobs:
               assert ok, f'{name} failed schema validation: {msg}'
               print(f'  {name}: OK')
 
-          # Run built-in fixture validation
           result = validate_fixtures()
           if isinstance(result, tuple):
               ok, errors = result
@@ -93,13 +88,11 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          # FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID instead of TELEGRAM_GROUP_ID (§13)
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
           MESSAGE="🔴 CI Tests FAILED in ${{ github.repository }}"
           curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "chat_id=${TELEGRAM_GROUP_ID}" \
             -d "text=${MESSAGE}" \
             -d "parse_mode=HTML" || true
-            

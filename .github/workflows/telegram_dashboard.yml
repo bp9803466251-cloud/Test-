@@ -7,10 +7,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis  # FIX-AUDIT-v9.3: единая группа для предотвращения race condition
+  group: gatekeeper-redis
   cancel-in-progress: false
 
-env:  # FIX-AUDIT-v9.3: workflow-level env
+env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
   GK_CONFIG_FILE: 'gatekeeper_config.yaml'
@@ -38,15 +38,13 @@ jobs:
       - name: Send Telegram dashboard
         run: |
           python -c "
-          from redis_hub import is_redis_available, get_from_cache
-          from gatekeeper_hub import METRICS, get_all_matches
-          from metrics import collect_system_metrics, format_dashboard
+          from redis_hub import is_redis_configured, get_from_cache
+          from gatekeeper_hub import get_all_matches
+          from metrics import collect_metrics, save_metrics
           from telegram_transport import send_telegram_dashboard
 
-          redis_ok = is_redis_available()
-          report = METRICS.report() if redis_ok else {}
+          redis_ok = is_redis_configured()
 
-          # Подсчёт live-матчей
           live_count = 0
           if redis_ok:
               try:
@@ -55,21 +53,21 @@ jobs:
               except Exception:
                   live_count = 0
 
-          metrics = collect_system_metrics(report)
+          metrics = collect_metrics()
 
           stats = {
               'redis_available': redis_ok,
               'total_input': live_count,
-              'odds_enriched': report.get('counters', {}).get('odds_enriched', 0),
-              'value_count': report.get('counters', {}).get('value_found', 0),
-              'pred_count': report.get('counters', {}).get('predictions_added', 0),
-              'h2h_count': report.get('counters', {}).get('h2h_added', 0),
-              'stats_count': report.get('counters', {}).get('stats_added', 0),
               'time': metrics.get('timestamp', ''),
               'last_module': 'dashboard'
           }
 
-          dashboard = format_dashboard(stats)
+          try:
+              save_metrics(stats)
+          except Exception:
+              pass
+
+          dashboard = str(stats)
           send_telegram_dashboard(dashboard)
           "
         env:
@@ -78,7 +76,7 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}  # FIX-AUDIT-v9.3: прямой маппинг (Вариант B)
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           GATEKEEPER_ENV: prod
           GK_CONFIG_FILE: gatekeeper_config.yaml
           PYTHONUNBUFFERED: "1"
@@ -87,10 +85,9 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}  # FIX-AUDIT-v9.3: прямой маппинг (Вариант B)
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
           MSG="❌ Telegram Dashboard FAILED%0ARun: ${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" || true
-            

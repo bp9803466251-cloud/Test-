@@ -30,7 +30,6 @@ on:
         required: false
         default: false
 
-# FIX-AUDIT-v9.3: PYTHON_VERSION in workflow-level env (consistency)
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: "1"
@@ -38,7 +37,6 @@ env:
 permissions:
   contents: read
 
-# FIX-AUDIT-v9.3: concurrency.group → gatekeeper-redis (§13)
 concurrency:
   group: gatekeeper-redis
   cancel-in-progress: false
@@ -60,8 +58,7 @@ jobs:
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      # FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID instead of TELEGRAM_GROUP_ID (§13)
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       GK_CONFIG_FILE: gatekeeper_config.yaml
       FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
 
@@ -104,7 +101,6 @@ jobs:
               )
               with urllib.request.urlopen(req, timeout=30) as r:
                   return json.loads(r.read()).get('result')
-          # FIX-AUDIT-v9.3: only flush football_data:* — NOT history:match:* or history:league:* (§1.7d)
           patterns = ['football_data:*']
           total_deleted = 0
           for pattern in patterns:
@@ -174,46 +170,6 @@ jobs:
               print('FATAL: Redis unavailable')
               sys.exit(1)
 
-          leagues_raw = os.environ.get('LEAGUES_INPUT', '')
-          leagues = leagues_raw.split(',') if leagues_raw else []
-          if not leagues:
-              leagues = ['E0','E1','E2','E3','EC','SC0','SC1','SC2','SC3',
-                         'D1','D2','I1','I2','SP1','SP2','F1','F2',
-                         'N1','B1','P1','T1','G1']
-
-          seasons_raw = os.environ.get('SEASONS_INPUT', '')
-          seasons = seasons_raw.split(',') if seasons_raw else []
-          if not seasons:
-              now = datetime.now(timezone.utc)
-              seasons = [f'{now.year % 100:02d}{(now.year + 1) % 100:02d}']
-
-          print(f'Seasons: {seasons}')
-          print(f'Leagues: {len(leagues)}')
-
-          total = 0
-          for lg in leagues:
-              cnt = cmd('ZCARD', f'history:league:{lg}')
-              if cnt and int(cnt) > 0:
-                  print(f'  history:league:{lg}: {cnt} matches')
-                  total += int(cnt)
-          print(f'Total matches across leagues: {total}')
-
-          # FIX-AUDIT-v9.3: football_data:meta instead of meta:football_data (§5)
-          meta_raw = cmd('GET', 'football_data:meta')
-          if meta_raw:
-              try:
-                  meta_all = json.loads(meta_raw)
-                  for field, m in meta_all.items():
-                      if isinstance(m, dict):
-                          print(f'  meta {field}: stored={m.get("stored_matches", m.get("matches"))}, '
-                                f'errors={m.get("error_count", m.get("errors"))}, '
-                                f'last={str(m.get("last_run_at", m.get("last_run", "")))[:19]}')
-              except (json.JSONDecodeError, TypeError) as e:
-                  print(f'  meta: parse error: {e}')
-          else:
-              print('  meta: not found')
-
-          print()
           print('=== Verify Done ===')
           "
 
@@ -236,6 +192,5 @@ jobs:
         run: |
           MSG="❌ Football Data Loader FAILED%0A%0ARun: ${{ github.run_id }}%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" || true
-            

@@ -31,7 +31,6 @@ on:
 permissions:
   contents: read
 
-# FIX-AUDIT-v9.3: concurrency.group → gatekeeper-redis (§13)
 concurrency:
   group: gatekeeper-redis
   cancel-in-progress: false
@@ -49,8 +48,7 @@ jobs:
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      # FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID instead of TELEGRAM_GROUP_ID (§13)
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -67,8 +65,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      # FIX-AUDIT-v9.3: removed dead "Set mode for scheduled run" step (§1.2 — no cron)
 
       - name: Set mode for manual run
         if: github.event_name == 'workflow_dispatch'
@@ -92,11 +88,8 @@ jobs:
           MODE="${FLUSH_MODE}"
           echo "=== Redis Flush — Dry Run ==="
           echo "Mode: $MODE"
-          echo ""
-
           case "$MODE" in
             history-only)
-              # FIX-AUDIT-v9.3: HISTORY_FLUSH_CONFIRM=1 for history-only (§1.7d level 3)
               HISTORY_FLUSH_CONFIRM=1 python redis_diagnostics.py --dry-run --history-only --yes
               ;;
             soft)
@@ -130,11 +123,8 @@ jobs:
           MODE="${FLUSH_MODE}"
           echo "=== Redis Flush — Execute ==="
           echo "Mode: $MODE"
-          echo ""
-
           case "$MODE" in
             history-only)
-              # FIX-AUDIT-v9.3: HISTORY_FLUSH_CONFIRM=1 for history-only (§1.7d level 3)
               HISTORY_FLUSH_CONFIRM=1 python redis_diagnostics.py --history-only --yes
               ;;
             soft)
@@ -178,6 +168,5 @@ jobs:
         run: |
           MSG="❌ Redis Flush FAILED%0AMode: ${FLUSH_MODE}%0ARun: ${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" || true
-            
