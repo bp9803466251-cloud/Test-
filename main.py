@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper-AI v9.3-audited — Main Pipeline (Dashboard + Telegram)
+Gatekeeper-AI v811-patched — Main Pipeline (Dashboard + Telegram)
 Value engine + Telegram-дашборд по стандарту §12.
 
 Патчи v8.10:
@@ -214,7 +214,7 @@ def _ecosystem_line() -> str:
     if not _redis_available:
         markers.extend(["Bzzoiro-", "Sharp-", "PropLine-", "OddsAPI-", "FootballData-"])
         return " | ".join(markers)
-    # v9.3-audited: FIX dead code — early return убран, цикл выполняется
+    # v9.3-audited: FIX dead code — early return only when Redis down
     # FIX-12: {collector}:meta format
     for name, meta_key in [
         ("Bzzoiro", "bzzoiro:meta"),
@@ -232,7 +232,6 @@ def _ecosystem_line() -> str:
         except Exception:
             markers.append(f"{name}-")
     return " | ".join(markers)
-
 
 # ---------------------------------------------------------------------------
 # Last module (§12)
@@ -270,6 +269,84 @@ def _last_module() -> str:
 
 # ---------------------------------------------------------------------------
 # Форматирование (§12 — HTML bold tags)
+
+# ---------------------------------------------------------------------------
+# Transform analysis -> dashboard info (§12)
+# ---------------------------------------------------------------------------
+def _transform_for_dashboard(analysis: dict) -> dict:
+    """Convert value_engine analysis dict to _fmt_bet info dict."""
+    match = analysis.get("_match", {})
+    odds_dict = analysis.get("odds", {}) or {}
+    model_probs = analysis.get("model_probs", [0, 0, 0]) or [0, 0, 0]
+
+    # Odds tuple
+    if isinstance(odds_dict, dict):
+        odds_tuple = (
+            odds_dict.get("home", 0),
+            odds_dict.get("draw", 0),
+            odds_dict.get("away", 0),
+        )
+    else:
+        odds_tuple = (0, 0, 0)
+
+    # Probs tuple
+    probs_tuple = tuple(model_probs[:3]) if len(model_probs) >= 3 else (0, 0, 0)
+
+    # Value side odds
+    v_side = analysis.get("value_side", "")
+    side_idx = {"home": 0, "draw": 1, "away": 2}.get(v_side, 0)
+    v_odds = odds_tuple[side_idx] if side_idx < len(odds_tuple) else 0
+    v_prob = probs_tuple[side_idx] if side_idx < len(probs_tuple) else 0
+
+    # Date/time from match
+    date_utc = match.get("date_utc", "")
+    if date_utc:
+        try:
+            dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+            dt_msk = dt.astimezone(MSK_TZ)
+            date_str = dt_msk.strftime("%d.%m")
+            time_str = dt_msk.strftime("%H:%M")
+        except Exception:
+            date_str = date_utc[:10] if len(date_utc) >= 10 else "?"
+            time_str = "?"
+    else:
+        date_str = "?"
+        time_str = "?"
+
+    # Competition code
+    comp = match.get("competition", "") or match.get("league", "") or "?"
+    comp_code = comp[:20] if comp else "?"
+
+    # Source
+    source = ""
+    conflicts = analysis.get("conflicts", {})
+    if isinstance(conflicts, dict):
+        source = conflicts.get("resolved_source", "")
+
+    # is_fire: HOT with high value
+    value_pct = analysis.get("value_pct", 0)
+    is_fire = value_pct >= VALUE_THRESHOLD * 2
+
+    return {
+        "comp_code": comp_code,
+        "date": date_str,
+        "time": time_str,
+        "home_team": match.get("home_team", "?"),
+        "away_team": match.get("away_team", "?"),
+        "odds": odds_tuple,
+        "probs": probs_tuple,
+        "v_odds": v_odds,
+        "v_prob": v_prob,
+        "v_side": v_side,
+        "value_ev": value_pct,
+        "is_fire": is_fire,
+        "source": source,
+        "canonical_id": analysis.get("canonical_id", ""),
+        "odds_verification": analysis.get("snapshot", {}).get("verification", {}),
+    }
+
+
+
 # ---------------------------------------------------------------------------
 def _fmt_odds(o) -> str:
     """Форматирование коэффициента. FIX-AUDIT: защита от str/None."""
@@ -394,12 +471,12 @@ def _format_dashboard(result: dict) -> str:
     module = _last_module()
     status_parts = [
         "\U0001f310 Redis+",
-        f"\U0001f4e6{stats['total']}",
-        f"\U0001f4caOdds:{stats['with_odds']}",
-        f"\U0001f525Value:{stats['value_bets']}",
-        f"Pred:{stats['with_pred']}",
-        f"📚Hist:{stats['with_h2h']}",
-        f"🎯An:{stats['with_stats']}",
+        f"\U0001f4e6{stats.get('total', 0)}",
+        f"\U0001f4caOdds:{stats.get('with_odds', 0)}",
+        f"\U0001f525Value:{stats.get('value_bets', 0)}",
+        f"Pred:{stats.get('with_pred', 0)}",
+        f"📚Hist:{stats.get('with_h2h', 0)}",
+        f"🎯An:{stats.get('with_stats', 0)}",
         f"\U0001f552{now_str}",
         f"\u2b50{module}",
     ]
@@ -415,7 +492,7 @@ def main():
     global _redis_available
 
     logger.info("=" * 60)
-    logger.info("Gatekeeper-AI Pipeline v9.3-audited")
+    logger.info("Gatekeeper-AI Pipeline v8.11-patched")
     logger.info(f"Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
     logger.info("=" * 60)
 
@@ -482,11 +559,11 @@ def main():
         return
 
     logger.info(f"HOT: {len(result['hot'])}, WARM: {len(result['warm'])}, "
-                 f"Value: {result['stats']['value_bets']}")
-    logger.info(f"Odds: {result['stats']['with_odds']}, "
-                 f"Pred: {result['stats']['with_pred']}, "
-                 f"H2H: {result['stats']['with_h2h']}, "
-                 f"Stats: {result['stats']['with_stats']}")
+                 f"Value: {result['stats'].get('value_bets', 0)}")
+    logger.info(f"Odds: {result['stats'].get('with_odds', 0)}, "
+                 f"Pred: {result['stats'].get('with_pred', 0)}, "
+                 f"H2H: {result['stats'].get('with_h2h', 0)}, "
+                 f"Stats: {result['stats'].get('with_stats', 0)}")
 
     # === ШАГ 4: Сохранение analysis для HOT матчей ===
     saved_analysis = 0
@@ -509,6 +586,9 @@ def main():
             logger.warning(f"save_analysis failed for {cid}: {e}")
 
     # === ШАГ 5: Формирование и отправка дашборда ===
+    # Transform analysis dicts to dashboard info format
+    result["hot"] = [_transform_for_dashboard(a) for a in result["hot"]]
+    result["warm"] = [_transform_for_dashboard(a) for a in result["warm"]]
     dashboard = _format_dashboard(result)
     logger.info("\n" + dashboard)
 
@@ -516,12 +596,12 @@ def main():
         save_search_results({
             "hot": len(result["hot"]),
             "warm": len(result["warm"]),
-            "value_bets": result["stats"]["value_bets"],
-            "total_matches": result["stats"]["total"],
-            "with_odds": result["stats"]["with_odds"],
-            "with_pred": result["stats"]["with_pred"],
-            "with_h2h": result["stats"]["with_h2h"],
-            "with_stats": result["stats"]["with_stats"],
+            "value_bets": result["stats"].get("value_bets", 0),
+            "total_matches": result["stats"].get("total", 0),
+            "with_odds": result["stats"].get("with_odds", 0),
+            "with_pred": result["stats"].get("with_pred", 0),
+            "with_h2h": result["stats"].get("with_h2h", 0),
+            "with_stats": result["stats"].get("with_stats", 0),
             "saved_analysis": saved_analysis,
             "timestamp": datetime.now(MSK_TZ).isoformat(),
         })
@@ -539,7 +619,7 @@ def main():
               error_count=0,
               hot_bets=len(result["hot"]),
               warm_bets=len(result["warm"]),
-              value_bets=result["stats"]["value_bets"])
+              value_bets=result["stats"].get("value_bets", 0))
     logger.info("Готово")
 
 

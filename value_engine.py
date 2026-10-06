@@ -1545,6 +1545,17 @@ def run_pipeline(matches: List[Dict[str, Any]],
     results = []
     errors = 0
 
+    # FIX: dict→list normalization — main.py passes dict from get_matches_by_date_range()
+    if isinstance(matches, dict):
+        matches = list(matches.values())
+
+    # Stats counters (main.py expects these keys)
+    value_bets = 0
+    with_odds = 0
+    with_pred = 0
+    with_h2h = 0
+    with_stats = 0
+
     for match in matches:
         if is_shutdown_requested():
             logger.info("Shutdown requested — остановка run_pipeline")
@@ -1556,7 +1567,20 @@ def run_pipeline(matches: List[Dict[str, Any]],
             if analysis.get("error"):
                 errors += 1
                 continue
+            # Attach original match for dashboard transform in main.py
+            analysis["_match"] = match
             results.append(analysis)
+            # Count stats
+            if analysis.get("odds"):
+                with_odds += 1
+            if analysis.get("value_pct", 0) >= value_threshold:
+                value_bets += 1
+            if analysis.get("consensus", {}).get("probs"):
+                with_pred += 1
+            if match.get("h2h"):
+                with_h2h += 1
+            if match.get("stats"):
+                with_stats += 1
             cls = analysis.get("classification", "SKIP")
             if cls == "HOT":
                 hot.append(analysis)
@@ -1577,6 +1601,12 @@ def run_pipeline(matches: List[Dict[str, Any]],
         "warm": len(warm),
         "errors": errors,
         "value_threshold": value_threshold,
+        # Keys expected by main.py (§28)
+        "value_bets": value_bets,
+        "with_odds": with_odds,
+        "with_pred": with_pred,
+        "with_h2h": with_h2h,
+        "with_stats": with_stats,
     }
 
     return {"hot": hot, "warm": warm, "stats": stats, "results": results}
