@@ -972,21 +972,16 @@ def clean_team_name(name: str) -> str:
 
     try:
         # FIX-AUDIT: Нормализация диакритиков (Köln -> koln, Malmö -> malmo)
-        # FIX-AUDIT-v9.3: Manual mapping for chars that NFD doesn't decompose
-        # ø, æ, ð, þ, ß are single codepoints, not composable — NFD leaves them as-is
-        _SPECIAL_CHARS = str.maketrans({
-            "ø": "o", "Ø": "o",
-            "æ": "ae", "Æ": "ae",
-            "ð": "d", "Ð": "d",
-            "þ": "th", "Þ": "th",
-            "ß": "ss",
-            "ł": "l", "Ł": "l",
-            "đ": "d", "Đ": "d",
-            "ı": "i", "İ": "i",
-        })
-        name = name.translate(_SPECIAL_CHARS)
+        # FIX: ø, æ, ð, þ, ß не декомпозируются через NFD — ручной маппинг
         import unicodedata
-        normalized = unicodedata.normalize("NFD", name)
+        _special = {"ø": "o", "æ": "ae", "ð": "d", "þ": "th", "ß": "ss",
+                    "Ö": "O", "Ü": "U", "Ä": "A", "É": "E", "È": "E",
+                    "Ñ": "N", "Ç": "C", "Á": "A", "Ó": "O", "Í": "I",
+                    "Ú": "U", "Ñ": "N"}
+        name_fixed = name
+        for k, v in _special.items():
+            name_fixed = name_fixed.replace(k, v)
+        normalized = unicodedata.normalize("NFD", name_fixed)
         key = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
         key = key.strip().lower()
 

@@ -167,7 +167,7 @@ def normalize_dashboard_text(dashboard_text: str) -> str:
     )
 
     # Добавление пробелов: после маркера перед номером и вокруг всех |
-    dashboard_text = re.sub(r"\u2794(\d)", r"\u2794 \1", dashboard_text)
+    dashboard_text = re.sub(r"\u2794(\d)", "\u2794 \\1", dashboard_text)
     dashboard_text = re.sub(r"\s*\|\s*", " | ", dashboard_text)
 
     # FIX: [^|\n<] — не заходим внутрь HTML-тегов.
