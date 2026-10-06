@@ -1,0 +1,163 @@
+name: Backtest
+
+# §25.4: Симуляция на history:match:* с temporal cutoff
+# §13: workflow_dispatch only, no cron (§1.2)
+on:
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: 'Сезоны через запятую (пусто = все в Redis)'
+        required: false
+        default: ''
+      leagues:
+        description: 'Лиги через запятую (пусто = все 22)'
+        required: false
+        default: ''
+      window_size:
+        description: 'Размер скользящего окна для drift detection (по умолчанию 50)'
+        required: false
+        default: '50'
+      value_threshold:
+        description: 'Порог value для HOT/WARM классификации (по умолчанию 0.05)'
+        required: false
+        default: '0.05'
+      limit:
+        description: 'Лимит матчей (0 = все)'
+        required: false
+        default: '0'
+      dry_run:
+        description: 'Только отчёт, без сохранения в Redis'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# §13: единая группа для предотвращения race condition
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  GK_CONFIG_FILE: 'gatekeeper_config.yaml'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+      VALUE_THRESHOLD: ${{ github.event.inputs.value_threshold || '0.05' }}
+      GATEKEEPER_ENV: backtest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run backtest
+        run: |
+          ARGS=""
+          SEASONS="${{ github.event.inputs.seasons || '' }}"
+          LEAGUES="${{ github.event.inputs.leagues || '' }}"
+          WINDOW="${{ github.event.inputs.window_size || '50' }}"
+          LIMIT="${{ github.event.inputs.limit || '0' }}"
+
+          if [ -n "$SEASONS" ]; then ARGS="$ARGS --seasons $SEASONS"; fi
+          if [ -n "$LEAGUES" ]; then ARGS="$ARGS --leagues $LEAGUES"; fi
+          ARGS="$ARGS --window $WINDOW --limit $LIMIT"
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          echo "=== Backtest arguments: $ARGS ==="
+          python backtest_runner.py $ARGS
+
+      - name: Upload backtest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-report
+          path: backtest_report.json
+          retention-days: 30
+
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+        run: |
+          MSG="🔴 <b>Backtest FAILED</b>\nRepo: ${{ github.repository }}\nRun: ${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
+            -d parse_mode="HTML" \
+            -d text="$MSG" || true
+
+      - name: Telegram summary on success
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+        run: |
+          # Читаем отчёт и отправляем краткую сводку
+          python -c "
+          import json, urllib.request, urllib.parse, os
+
+          try:
+              with open('backtest_report.json') as f:
+                  report = json.load(f)
+          except Exception:
+              report = {}
+
+          total = report.get('total_matches', 0)
+          hot = report.get('hot_count', 0)
+          warm = report.get('warm_count', 0)
+          brier = report.get('avg_brier', 0)
+          rps = report.get('avg_rps', 0)
+          drift = report.get('drift_flags', 0)
+          calibrated = report.get('calibration_status', 'unknown')
+
+          msg = (
+              '📊 <b>Backtest Complete</b>\n'
+              f'Matches: {total}\n'
+              f'HOT: {hot} | WARM: {warm}\n'
+              f'Brier: {brier:.4f} | RPS: {rps:.4f}\n'
+              f'Drift flags: {drift}\n'
+              f'Calibration: {calibrated}'
+          )
+
+          token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+          chat_id = os.environ.get('TELEGRAM_GROUP_ID', '')
+          if token and chat_id:
+              data = urllib.parse.urlencode({
+                  'chat_id': chat_id,
+                  'parse_mode': 'HTML',
+                  'text': msg
+              }).encode()
+              req = urllib.request.Request(
+                  f'https://api.telegram.org/bot{token}/sendMessage',
+                  data=data
+              )
+              try:
+                  urllib.request.urlopen(req, timeout=10)
+              except Exception:
+                  pass
+          "
