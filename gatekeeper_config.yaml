@@ -1,14 +1,8 @@
-# GatekeeperAI v9.3-audited — Configuration (§20.3)
-# FIX-AUDIT-v9.3: collector_upstream → upstream_map, value_threshold → value_engine.threshold
-# FIX-AUDIT-v9.3: убраны мёртвые секции (redis, circuit_breaker — читаются из env)
-# FIX-AUDIT-v9.3: добавлена секция collectors (get_collector_config)
-# FIX-AUDIT-v9.3: index.lookahead_days исправлен с 3 на 7 (рассинхрон с hub)
-version: "v9.3"
+# gatekeeper_config.yaml — Конфигурация GatekeeperAI (§20.3)
+# v9.3-audited
+# Env-переменные — только для секретов (API-ключи, Redis URL).
 
-# Pipeline settings (информационные — hub использует хардкоды)
-index:
-  lookback_days: 2
-  lookahead_days: 7
+version: "9.3-audited"
 
 # Feature flags
 features:
@@ -18,59 +12,61 @@ features:
   value_bets: true
   safe_mode: true
 
-# FIX-AUDIT-v9.3: upstream_map (was collector_upstream) — соответствует гайду §20.3
+# Value Engine
+value_engine:
+  value_threshold: 0.03
+  hot_threshold: 0.05
+  warm_threshold: 0.03
+  min_history_matches: 5
+  max_history_matches: 50
+
+# Upstream map (§1.20)
 upstream_map:
   sharpapi: betradar
   odds_api: betradar
   bzzoiro: opta
   propline: pinnacle
-  football_data: bet365
+  football_data: multi_bookmaker
 
-# FIX-AUDIT-v9.3: value_threshold перемещён в value_engine — соответствует гайду §20.3
-value_engine:
-  threshold: 0.03
-
-# Cleanup settings
-cleanup:
-  enabled: true
-  dry_run: false
-  auto_migrate: true
-  expire_seconds: 86400
-  owner: main
-
-# Per-collector settings (§20.3 — get_collector_config)
+# Collectors
 collectors:
   sharpapi:
-    rate_delay: 0.5
-    max_retries: 2
-    timeout: 30
+    rate_limit_delay: 6
+    max_pages: 60
+    limit: 200
     days_ahead: 3
+    max_retries: 3
   odds_api:
     rate_delay: 1.0
+    regions: "eu,uk"
+    markets: "h2h"
+    odds_format: "decimal"
     max_retries: 1
-    timeout: 30
-    days_ahead: 3
   bzzoiro:
-    rate_delay: 0.3
-    max_retries: 1
-    timeout: 30
-    days_ahead: 7
+    rate_delay: 2.0
+    enrich_delay: 1.0
+    max_retries: 5
   propline:
-    rate_delay: 0.5
-    max_retries: 3
-    timeout: 15
-    days_ahead: 3
+    rate_delay: 1.5
   football_data:
-    rate_delay: 1.0
-    max_retries: 3
-    timeout: 30
+    history_days: 0
 
-# Redis settings — читаются из env (redis_config.py), не из YAML.
-# Оставлено как документация:
-#   SHARED_UPSTASH_REDIS_REST_URL    — Base URL
-#   SHARED_UPSTASH_REDIS_REST_TOKEN  — Bearer token
-#   REDIS_TIMEOUT=30                 — таймаут (сек)
-#   CB_FAILURE_THRESHOLD=10          — порог circuit breaker
-#   CB_RECOVERY_TIMEOUT=60           — восстановление CB (сек)
-#   REDIS_HASH_NAME=GatekeeperAI     — имя хэша
-#   REDIS_MAX_PIPELINE=50            — размер батча
+# Cleanup
+cleanup:
+  enabled: true
+  max_age_hours: 48
+  dry_run_default: true
+
+# Redis
+redis:
+  timeout: 30
+  circuit_breaker:
+    failure_threshold: 10
+    recovery_timeout: 60
+  hash_name: GatekeeperAI
+  max_pipeline: 10
+
+# Telegram
+telegram:
+  dashboard_enabled: true
+  alert_on_failure: true

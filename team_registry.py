@@ -972,6 +972,19 @@ def clean_team_name(name: str) -> str:
 
     try:
         # FIX-AUDIT: Нормализация диакритиков (Köln -> koln, Malmö -> malmo)
+        # FIX-AUDIT-v9.3: Manual mapping for chars that NFD doesn't decompose
+        # ø, æ, ð, þ, ß are single codepoints, not composable — NFD leaves them as-is
+        _SPECIAL_CHARS = str.maketrans({
+            "ø": "o", "Ø": "o",
+            "æ": "ae", "Æ": "ae",
+            "ð": "d", "Ð": "d",
+            "þ": "th", "Þ": "th",
+            "ß": "ss",
+            "ł": "l", "Ł": "l",
+            "đ": "d", "Đ": "d",
+            "ı": "i", "İ": "i",
+        })
+        name = name.translate(_SPECIAL_CHARS)
         import unicodedata
         normalized = unicodedata.normalize("NFD", name)
         key = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
@@ -1047,6 +1060,6 @@ def normalize_team_name(name: str) -> str:
     """
     return clean_team_name(name)
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 
 # __all__ moved to top

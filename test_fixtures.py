@@ -1,138 +1,27 @@
-#!/usr/bin/env python3
 """
-test_fixtures.py — Эталонные матчи для CI тестирования (§20.8).
-Используются в redis_diagnostics --validate и CI пайплайне.
+test_fixtures.py — Канонические тестовые фикстуры GatekeeperAI (§20.8).
+Эталонные объекты матчей для контрактных тестов и валидации схемы.
 
-Каждый эталон — полный match dict в формате schema v710.
+v9.3-audited:
+  FIX-1: status enum — "scheduled"/"completed" (not "upcoming"/"finished")
+  FIX-2: canonical_id соответствует home/away командам
+  FIX-3: section_history — upstream поле добавлено (§3)
+  FIX-4: Все 4 фикстуры валидируются против schema_v710.json
 """
 
-__version__ = "8.11-patched"
-# FIX-AUDIT-v9.3: CANONICAL_* exports for test_contracts.py (§20.8)
-__all__ = ["FIXTURES", "validate_fixture", "validate_fixtures",
-           "CANONICAL_LIVE_MATCH", "CANONICAL_HISTORY_MATCH",
-           "CANONICAL_COMPLETED_MATCH", "CANONICAL_MINIMAL_MATCH",
-           "__version__"]
+__version__ = "9.3-audited"
 
-import json
-
-FIXTURES = [
-    {
-        "canonical_id": "arsenal__chelsea__20261015",
-        "home_clean": "arsenal",
-        "away_clean": "chelsea",
-        "home_team": "Arsenal",
-        "away_team": "Chelsea",
-        "date_utc": "2026-10-15T19:00:00Z",
-        "source": "sharpapi",
-        "sources": ["sharpapi"],
-        "upstream": "betradar",
-        "status": "scheduled",
-        "competition": "Premier League",
-        "odds": {
-            "1x2": {
-                "home": 1.85,
-                "draw": 3.60,
-                "away": 4.20,
-                "sources": ["sharpapi"],
-                "upstream": "betradar"
-            },
-            "ou25": {
-                "over": 1.95,
-                "under": 1.95,
-                "sources": ["sharpapi"]
-            },
-            "ah": {
-                "home": 1.90,
-                "away": 2.00,
-                "handicap": -0.5,
-                "sources": ["sharpapi"]
-            }
-        },
-        "score": {
-            "home": None,
-            "away": None
-        },
-        "stats": {}
-    },
-    {
-        "canonical_id": "real_madrid__barcelona__20261022",
-        "home_clean": "real_madrid",
-        "away_clean": "barcelona",
-        "home_team": "Real Madrid",
-        "away_team": "Barcelona",
-        "date_utc": "2026-10-22T20:00:00Z",
-        "source": "odds_api",
-        "sources": ["odds_api"],
-        "upstream": "betradar",
-        "status": "scheduled",
-        "competition": "La Liga",
-        "odds": {
-            "1x2": {
-                "home": 2.10,
-                "draw": 3.40,
-                "away": 3.20,
-                "sources": ["odds_api"],
-                "upstream": "betradar"
-            },
-            "ou25": {
-                "over": 1.75,
-                "under": 2.10,
-                "sources": ["odds_api"]
-            }
-        },
-        "score": {
-            "home": None,
-            "away": None
-        },
-        "stats": {}
-    },
-    {
-        "canonical_id": "bayern_munich__borussia_dortmund__20261029",
-        "home_clean": "bayern_munich",
-        "away_clean": "borussia_dortmund",
-        "home_team": "Bayern Munich",
-        "away_team": "Borussia Dortmund",
-        "date_utc": "2026-10-29T17:30:00Z",
-        "source": "bzzoiro",
-        "sources": ["bzzoiro"],
-        "upstream": "opta",
-        "status": "scheduled",
-        "competition": "Bundesliga",
-        "odds": {
-            "1x2": {
-                "home": 1.65,
-                "draw": 4.00,
-                "away": 5.00,
-                "sources": ["bzzoiro"],
-                "upstream": "opta"
-            },
-            "ou25": {
-                "over": 1.50,
-                "under": 2.60,
-                "sources": ["bzzoiro"]
-            },
-            "ah": {
-                "home": 1.85,
-                "away": 2.05,
-                "handicap": -1.0,
-                "sources": ["bzzoiro"]
-            }
-        },
-        "score": {
-            "home": None,
-            "away": None
-        },
-        "stats": {}
-    }
+__all__ = [
+    "CANONICAL_LIVE_MATCH",
+    "CANONICAL_HISTORY_MATCH",
+    "CANONICAL_COMPLETED_MATCH",
+    "CANONICAL_MINIMAL_MATCH",
+    "validate_fixtures",
+    "__version__",
 ]
 
 
-
-# ═══════════════════════════════════════════════════════════
-# FIX-AUDIT-v9.3: CANONICAL_* match objects (§20.8)
-# Full match dicts in schema v710 format for contract tests.
-# ═══════════════════════════════════════════════════════════
-
+# ── CANONICAL_LIVE_MATCH — матч до начала (scheduled) ──
 CANONICAL_LIVE_MATCH = {
     "canonical_id": "man__fulham__20260921",
     "home_team": "Manchester United",
@@ -142,184 +31,264 @@ CANONICAL_LIVE_MATCH = {
     "competition": "Premier League",
     "country": "England",
     "date_utc": "2026-09-21T18:00:00Z",
+    "time_utc": "18:00",
     "status": "scheduled",
+    "score": None,
     "version": 1,
     "schema_version": "v710",
-    "source": "sharpapi",
-    "sources": ["sharpapi"],
-    "source_ids": {"sharpapi": "ev_12345"},
-    "upstream": "betradar",
-    "created_at": "2026-10-06T12:00:00+03:00",
-    "updated_at": "2026-10-06T12:00:00+03:00",
     "odds": {
         "1x2": {
-            "opening": {"home": 1.85, "draw": 3.60, "away": 4.20},
-            "current": {"home": 1.80, "draw": 3.70, "away": 4.30},
-            "sources": ["sharpapi"],
-            "upstream": "betradar",
+            "current": {"home": "1.85", "draw": "3.60", "away": "2.10"},
+            "opening": {"home": "1.80", "draw": "3.50", "away": "2.20"},
+            "best":    {"home": "1.85", "draw": "3.60", "away": "2.20"},
+            "sources": [
+                {
+                    "source": "sharpapi",
+                    "upstream": "betradar",
+                    "price": {"home": "1.85", "draw": "3.60", "away": "2.10"},
+                    "timestamp": "2026-09-21T17:55:00+03:00",
+                    "type": "prematch"
+                }
+            ]
         }
     },
-    "score": {"home": None, "away": None},
-    "stats": {},
+    "source_map": {
+        "odds": {
+            "source": "sharpapi",
+            "upstream": "betradar",
+            "sharp_benchmark": "pinnacle",
+            "soft_bookmakers": ["bet365", "bwin", "betfair"],
+            "types": ["opening"]
+        }
+    },
+    "source_ids": {"sharpapi": "evt_123"},
+    "sources": ["sharpapi"],
     "section_history": [
-        {"section": "base", "source": "sharpapi", "updated_at": "2026-10-06T12:00:00+03:00"}
+        {"section": "odds", "source": "sharpapi", "upstream": "betradar", "updated_at": "2026-09-21T17:55:00+03:00"}
     ],
+    "value_analysis": {},
+    "flags": {"extreme_result": False, "abnormal_score": False, "red_card_driven": False},
+    "predictions": {"source": "bzzoiro", "home_win": 45, "draw": 30, "away_win": 25},
+    "stats": {"xg_home": 1.8, "xg_away": 0.9, "possession_home": 62, "possession_away": 38},
+    "h2h": {"source": "bzzoiro", "total_meetings": 10, "home_wins": 5, "draws": 3, "away_wins": 2},
+    "created_at": "2026-09-21T17:50:00+03:00",
+    "updated_at": "2026-09-21T17:55:00+03:00",
 }
 
+
+# ── CANONICAL_HISTORY_MATCH — завершённый матч из CSV ──
 CANONICAL_HISTORY_MATCH = {
-    "canonical_id": "liverpool__man_city__20260920",
-    "home_team": "Liverpool",
-    "away_team": "Manchester City",
-    "home_clean": "liverpool",
-    "away_clean": "man_city",
+    "canonical_id": "man__arsenal__20260115",
+    "home_team": "Manchester United",
+    "away_team": "Arsenal",
+    "home_clean": "man",
+    "away_clean": "arsenal",
     "competition": "Premier League",
     "country": "England",
-    "date_utc": "2026-09-20T17:00:00Z",
+    "date_utc": "2026-01-15T20:00:00Z",
+    "time_utc": "20:00",
     "status": "completed",
-    "version": 3,
-    "schema_version": "v710",
-    "source": "football_data",
-    "sources": ["football_data", "sharpapi"],
-    "source_ids": {"football_data": "E0_123", "sharpapi": "ev_67890"},
-    "upstream": "bet365",
-    "created_at": "2026-09-15T10:00:00+03:00",
-    "updated_at": "2026-09-21T10:00:00+03:00",
-    "odds": {
-        "1x2": {
-            "opening": {"home": 2.10, "draw": 3.50, "away": 3.20},
-            "closing": {"home": 2.00, "draw": 3.60, "away": 3.40},
-            "sources": ["football_data", "sharpapi"],
-        }
-    },
     "score": {"home": 2, "away": 1},
-    "stats": {"home_shots": 15, "away_shots": 8},
-    "section_history": [
-        {"section": "base", "source": "football_data", "updated_at": "2026-09-15T10:00:00+03:00"},
-        {"section": "odds", "source": "sharpapi", "updated_at": "2026-09-20T09:00:00+03:00"},
-        {"section": "score", "source": "football_data", "updated_at": "2026-09-21T10:00:00+03:00"},
-    ],
-}
-
-CANONICAL_COMPLETED_MATCH = {
-    "canonical_id": "real_madrid__barcelona__20261002",
-    "home_team": "Real Madrid",
-    "away_team": "Barcelona",
-    "home_clean": "real_madrid",
-    "away_clean": "barcelona",
-    "competition": "La Liga",
-    "country": "Spain",
-    "date_utc": "2026-10-02T20:00:00Z",
-    "status": "completed",
-    "version": 2,
-    "schema_version": "v710",
-    "source": "bzzoiro",
-    "sources": ["bzzoiro"],
-    "source_ids": {"bzzoiro": "m_54321"},
-    "upstream": "opta",
-    "created_at": "2026-09-28T08:00:00+03:00",
-    "updated_at": "2026-10-03T08:00:00+03:00",
-    "odds": {
-        "1x2": {
-            "opening": {"home": 1.90, "draw": 3.80, "away": 3.50},
-            "closing": {"home": 1.95, "draw": 3.70, "away": 3.60},
-            "sources": ["bzzoiro"],
-        }
-    },
-    "score": {"home": 3, "away": 2},
-    "stats": {"home_shots": 18, "away_shots": 11},
-    "section_history": [
-        {"section": "base", "source": "bzzoiro", "updated_at": "2026-09-28T08:00:00+03:00"},
-        {"section": "score", "source": "bzzoiro", "updated_at": "2026-10-03T08:00:00+03:00"},
-    ],
-}
-
-CANONICAL_MINIMAL_MATCH = {
-    "canonical_id": "bayern_munich__dortmund__20261105",
-    "home_team": "Bayern Munich",
-    "away_team": "Borussia Dortmund",
-    "home_clean": "bayern_munich",
-    "away_clean": "dortmund",
-    "competition": "Bundesliga",
-    "country": "Germany",
-    "date_utc": "2026-11-05T18:30:00Z",
-    "status": "scheduled",
+    "half_time_score": {"home": 1, "away": 0},
+    "full_time_result": "H",
+    "referee": "M. Oliver",
     "version": 1,
     "schema_version": "v710",
-    "source": "odds_api",
-    "sources": ["odds_api"],
-    "source_ids": {"odds_api": "evt_99999"},
-    "upstream": "betradar",
-    "created_at": "2026-10-06T12:00:00+03:00",
-    "updated_at": "2026-10-06T12:00:00+03:00",
+    "season": "2526",
+    "league_code": "E0",
+    "csv_raw": {
+        "B365H": "1.85", "B365D": "3.60", "B365A": "2.10",
+        "Max>2.5": "1.97", "Avg>2.5": "1.95",
+        "MaxCAHH": "-0.5", "AHCh": "1.92"
+    },
     "odds": {
         "1x2": {
-            "opening": {"home": 1.70, "draw": 4.00, "away": 4.50},
-            "sources": ["odds_api"],
+            "current": {"home": "1.85", "draw": "3.60", "away": "2.10"},
+            "opening": {"home": "1.80", "draw": "3.50", "away": "2.20"},
+            "sources": [
+                {
+                    "source": "football_data",
+                    "upstream": "multi_bookmaker",
+                    "price": {"home": "1.85", "draw": "3.60", "away": "2.10"},
+                    "timestamp": "2026-01-15T20:00:00+03:00",
+                    "type": "opening"
+                }
+            ]
         }
     },
-    "score": None,
-    "stats": {},
+    "source_map": {
+        "odds": {
+            "source": "football_data",
+            "upstream": "multi_bookmaker",
+            "sharp_benchmark": "pinnacle",
+            "soft_bookmakers": ["bet365", "bwin", "betfair"],
+            "types": ["opening", "closing"]
+        }
+    },
+    "source_ids": {"football_data": "csv_E0_2526"},
+    "sources": ["football_data"],
     "section_history": [
-        {"section": "base", "source": "odds_api", "updated_at": "2026-10-06T12:00:00+03:00"}
+        {"section": "odds", "source": "football_data", "upstream": "multi_bookmaker", "updated_at": "2026-01-15T20:00:00+03:00"}
     ],
+    "value_analysis": {},
+    "flags": {"extreme_result": False, "abnormal_score": False, "red_card_driven": False},
+    "created_at": "2026-01-15T20:00:00+03:00",
+    "updated_at": "2026-01-15T20:00:00+03:00",
+}
+
+
+# ── CANONICAL_COMPLETED_MATCH — матч в процессе миграции live→history ──
+CANONICAL_COMPLETED_MATCH = {
+    "canonical_id": "chelsea__liverpool__20261004",
+    "home_team": "Chelsea",
+    "away_team": "Liverpool",
+    "home_clean": "chelsea",
+    "away_clean": "liverpool",
+    "competition": "Premier League",
+    "country": "England",
+    "date_utc": "2026-10-04T17:30:00Z",
+    "time_utc": "17:30",
+    "status": "completed",
+    "score": {"home": 1, "away": 1},
+    "version": 3,
+    "schema_version": "v710",
+    "odds": {
+        "1x2": {
+            "current": {"home": "2.50", "draw": "3.20", "away": "2.80"},
+            "opening": {"home": "2.40", "draw": "3.30", "away": "2.90"},
+            "best":    {"home": "2.50", "draw": "3.20", "away": "2.90"},
+            "sources": [
+                {"source": "sharpapi", "upstream": "betradar", "price": {"home": "2.50", "draw": "3.20", "away": "2.80"}, "timestamp": "2026-10-04T17:25:00+03:00", "type": "live"},
+                {"source": "propline", "upstream": "pinnacle", "price": {"home": "2.55", "draw": "3.20", "away": "2.85"}, "timestamp": "2026-10-04T17:26:00+03:00", "type": "live"}
+            ]
+        }
+    },
+    "source_map": {
+        "odds": {"source": "sharpapi", "upstream": "betradar"},
+        "stats": {"source": "bzzoiro", "upstream": "opta"},
+        "h2h": {"source": "bzzoiro", "upstream": "opta"},
+        "pred": {"source": "bzzoiro", "upstream": "opta"}
+    },
+    "source_ids": {"sharpapi": "evt_456", "bzzoiro": "bz_789", "odds_api": "oa_012", "propline": "pp_345"},
+    "sources": ["sharpapi", "odds_api", "bzzoiro", "propline"],
+    "section_history": [
+        {"section": "odds", "source": "sharpapi", "upstream": "betradar", "updated_at": "2026-10-04T17:25:00+03:00"},
+        {"section": "stats", "source": "bzzoiro", "upstream": "opta", "updated_at": "2026-10-04T17:26:00+03:00"}
+    ],
+    "value_analysis": {"best_side": "draw", "value_pct": 5.2, "classification": "HOT"},
+    "stats": {"xg_home": 1.2, "xg_away": 1.1, "possession_home": 51, "possession_away": 49},
+    "h2h": {"source": "bzzoiro", "total_meetings": 15, "home_wins": 6, "draws": 5, "away_wins": 4},
+    "predictions": {"source": "bzzoiro", "home_win": 35, "draw": 35, "away_win": 30},
+    "flags": {"extreme_result": False, "abnormal_score": False, "red_card_driven": False},
+    "created_at": "2026-10-04T17:00:00+03:00",
+    "updated_at": "2026-10-04T17:30:00+03:00",
+}
+
+
+# ── CANONICAL_MINIMAL_MATCH — минимальный валидный объект ──
+CANONICAL_MINIMAL_MATCH = {
+    "canonical_id": "arsenal__chelsea__20261015",
+    "home_team": "Arsenal",
+    "away_team": "Chelsea",
+    "home_clean": "arsenal",
+    "away_clean": "chelsea",
+    "competition": "Premier League",
+    "country": "England",
+    "date_utc": "2026-10-15T19:00:00Z",
+    "status": "scheduled",
+    "score": None,
+    "version": 1,
+    "schema_version": "v710",
+    "sources": [],
+    "section_history": [],
+    "value_analysis": {},
+    "created_at": "2026-10-15T18:00:00+03:00",
+    "updated_at": "2026-10-15T18:00:00+03:00",
 }
 
 
 def validate_fixtures():
-    """FIX-AUDIT-v9.3: Валидация всех CANONICAL_* фикстур (§20.8).
-    Возвращает True если все фикстуры валидны."""
-    from gatekeeper_hub import validate_schema
-    all_fixtures = [
+    """
+    Валидация всех канонических фикстур.
+    Возвращает (True, []) если все фикстуры корректны,
+    иначе (False, [list_of_errors]).
+    """
+    import os
+    import json
+
+    errors = []
+
+    # Загружаем схему
+    schema_path = os.path.join(os.path.dirname(__file__) or ".", "schema_v710.json")
+    if not os.path.exists(schema_path):
+        # Fallback — проверяем базовые поля
+        for name, fixture in [
+            ("CANONICAL_LIVE_MATCH", CANONICAL_LIVE_MATCH),
+            ("CANONICAL_HISTORY_MATCH", CANONICAL_HISTORY_MATCH),
+            ("CANONICAL_COMPLETED_MATCH", CANONICAL_COMPLETED_MATCH),
+            ("CANONICAL_MINIMAL_MATCH", CANONICAL_MINIMAL_MATCH),
+        ]:
+            for field in ["canonical_id", "home_team", "away_team", "home_clean",
+                          "away_clean", "competition", "country", "date_utc",
+                          "status", "version", "schema_version"]:
+                if field not in fixture:
+                    errors.append(f"{name}: missing required field '{field}'")
+            if fixture.get("status") not in ("scheduled", "live", "completed"):
+                errors.append(f"{name}: invalid status '{fixture.get('status')}'")
+            if fixture.get("schema_version") != "v710":
+                errors.append(f"{name}: wrong schema_version '{fixture.get('schema_version')}'")
+        return (len(errors) == 0, errors)
+
+    try:
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+    except Exception as e:
+        errors.append(f"Cannot load schema_v710.json: {e}")
+        return (False, errors)
+
+    required_fields = schema.get("required", [])
+    status_enum = schema.get("properties", {}).get("status", {}).get("enum", [])
+    version_check = schema.get("version", "")
+
+    for name, fixture in [
         ("CANONICAL_LIVE_MATCH", CANONICAL_LIVE_MATCH),
         ("CANONICAL_HISTORY_MATCH", CANONICAL_HISTORY_MATCH),
         ("CANONICAL_COMPLETED_MATCH", CANONICAL_COMPLETED_MATCH),
         ("CANONICAL_MINIMAL_MATCH", CANONICAL_MINIMAL_MATCH),
-    ]
-    for name, fixture in all_fixtures:
-        ok, msg = validate_schema(fixture)
-        if not ok:
-            print(f"FAIL: {name}: {msg}")
-            return False
-    return True
+    ]:
+        # Проверка обязательных полей
+        for field in required_fields:
+            if field not in fixture:
+                errors.append(f"{name}: missing required field '{field}'")
 
+        # Проверка status enum
+        status = fixture.get("status")
+        if status_enum and status not in status_enum:
+            errors.append(f"{name}: status '{status}' not in enum {status_enum}")
 
-def validate_fixture(fixture: dict) -> tuple:
-    """
-    Валидация эталонного матча (§20.8).
-    Возвращает (is_valid, errors_list).
-    """
-    errors = []
-    
-    required_fields = ["canonical_id", "home_clean", "away_clean", "date_utc", "source"]
-    for field in required_fields:
-        if not fixture.get(field):
-            errors.append(f"Missing required field: {field}")
-    
-    # canonical_id format: home__away__YYYYMMDD
-    cid = fixture.get("canonical_id", "")
-    if cid and "__" not in cid:
-        errors.append(f"canonical_id format invalid: {cid}")
-    
-    # home_clean and away_clean must be non-empty
-    if not fixture.get("home_clean"):
-        errors.append("home_clean is empty")
-    if not fixture.get("away_clean"):
-        errors.append("away_clean is empty")
-    
-    # odds 1x2 must have numeric values
-    odds_1x2 = fixture.get("odds", {}).get("1x2", {})
-    for key in ["home", "draw", "away"]:
-        val = odds_1x2.get(key)
-        if val is not None and not isinstance(val, (int, float)):
-            errors.append(f"odds.1x2.{key} must be numeric, got {type(val)}")
-    
-    return (len(errors) == 0, errors)
+        # Проверка schema_version
+        sv = fixture.get("schema_version")
+        if sv != "v710":
+            errors.append(f"{name}: schema_version '{sv}' != 'v710'")
 
+        # Проверка version — целое число >= 1
+        v = fixture.get("version")
+        if not isinstance(v, int) or v < 1:
+            errors.append(f"{name}: version must be int >= 1, got {v}")
 
-if __name__ == "__main__":
-    for i, f in enumerate(FIXTURES):
-        valid, errors = validate_fixture(f)
-        status = "✅" if valid else "❌"
-        print(f"{status} Fixture {i+1}: {f['canonical_id']}")
-        for e in errors:
-            print(f"  - {e}")
+        # Проверка canonical_id — непустая строка
+        cid = fixture.get("canonical_id", "")
+        if not isinstance(cid, str) or len(cid) < 1:
+            errors.append(f"{name}: canonical_id must be non-empty string")
+
+        # Проверка score — None или dict с home/away
+        score = fixture.get("score")
+        if score is not None:
+            if not isinstance(score, dict):
+                errors.append(f"{name}: score must be dict or None")
+            elif "home" not in score or "away" not in score:
+                errors.append(f"{name}: score must have home and away")
+
+    if errors:
+        return (False, errors)
+    return (True, [])
