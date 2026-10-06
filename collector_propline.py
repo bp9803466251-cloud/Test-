@@ -264,13 +264,14 @@ def collect_propline() -> Dict[str, Any]:
                             if decimal is None:
                                 continue
                             name_norm = clean_team_name(name)
-                            if name_norm == home_team or home_team in name_norm:
-                                if odds_home is None or decimal > odds_home:
-                                    odds_home = decimal
-                            elif name in ("Draw", "draw"):
+                            # Draw проверяем первым — не зависит от команд
+                            if name in ("Draw", "draw"):
                                 if odds_draw is None or decimal > odds_draw:
                                     odds_draw = decimal
-                            elif name_norm == away_team or away_team in name_norm:
+                            elif name_norm == home_team:
+                                if odds_home is None or decimal > odds_home:
+                                    odds_home = decimal
+                            elif name_norm == away_team:
                                 if odds_away is None or decimal > odds_away:
                                     odds_away = decimal
                     elif isinstance(h2h, dict):

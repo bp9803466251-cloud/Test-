@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper-AI v9.3-audited — Main Pipeline (Dashboard + Telegram)
+Gatekeeper-AI v811-patched — Main Pipeline (Dashboard + Telegram)
 Value engine + Telegram-дашборд по стандарту §12.
 
 Патчи v8.10:
@@ -33,9 +33,6 @@ v8.11-patched:
           ключей с redis_hub и redis_diagnostics (оба используют "meta:{collector}").
   FIX-13: _split_message → делегирование в telegram_transport.split_html_safe.
   FIX-14: TG_MAX_CHARS → TELEGRAM_CHUNK_LIMIT из telegram_transport.
-  AUDIT-v9.3-BUG1: _ecosystem_line — убран ранний return (dead code после return).
-  AUDIT-v9.3-BUG2: _send_one — 429 retry с проверкой _retry_count (защита от бесконечной рекурсии).
-  AUDIT-v9.3-BUG3: Удалён неиспользуемый импорт get_match из gatekeeper_hub.
 """
 import os
 import sys
@@ -112,7 +109,7 @@ except ImportError:
 logger = logging.getLogger("main")
 logger.addHandler(logging.NullHandler())
 
-__version__ = "9.3-audited"
+__version__ = "8.11-patched"
 __all__ = ["main", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
@@ -167,22 +164,19 @@ def _send_one(text: str) -> bool:
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         if e.code == 429:
-            if not hasattr(_send_one, "_retry_count"):
+            try:
+                retry_after = json.loads(body).get("parameters", {}).get("retry_after", 3)
+            except Exception:
+                retry_after = 3
+            logger.warning(f"429: ожидание {retry_after}с")
+            time.sleep(retry_after)
+            _send_one._retry_count = getattr(_send_one, "_retry_count", 0) + 1
+            if _send_one._retry_count <= 2:
+                return _send_one(text)
+            else:
+                logger.error("Telegram 429: max retries exceeded")
                 _send_one._retry_count = 0
-            if _send_one._retry_count < 2:
-                _send_one._retry_count += 1
-                try:
-                    retry_after = json.loads(body).get("parameters", {}).get("retry_after", 3)
-                except Exception:
-                    retry_after = 3
-                logger.warning(f"429: ожидание {retry_after}с (retry {_send_one._retry_count}/2)")
-                time.sleep(retry_after)
-                result = _send_one(text)
-                _send_one._retry_count = 0
-                return result
-            _send_one._retry_count = 0
-            logger.warning("429: превышен лимит retry — пропуск")
-            return False
+                return False
         logger.warning(f"HTTP {e.code}: {body[:200]}")
         return False
     except Exception as e:
@@ -209,14 +203,14 @@ _redis_available = True  # обновляется в main()
 
 
 def _ecosystem_line() -> str:
-    """Статус экосистемы коллекторов. §12. FIX-BUG-1: убран ранний return."""
     eco_marker = "+" if _redis_available else "!"
     redis_marker = "+" if _redis_available else "-"
     markers = [f"Ecosystem{eco_marker}", f"Redis{redis_marker}"]
     # FIX-AUDIT: Skip get_from_cache когда Redis недоступен
     if not _redis_available:
         markers.extend(["Bzzoiro-", "Sharp-", "PropLine-", "OddsAPI-"])
-        return " | ".join(markers)
+        # FIX-AUDIT-v9.3: Flush+ removed in v2.0 dashboard
+    return " | ".join(markers)
     # FIX-12: {collector}:meta format (was meta:{collector})
     for name, meta_key in [
         ("Bzzoiro", "bzzoiro:meta"),
@@ -232,6 +226,7 @@ def _ecosystem_line() -> str:
                 markers.append(f"{name}-")
         except Exception:
             markers.append(f"{name}-")
+    # FIX-AUDIT-v9.3: Flush+ removed in v2.0 dashboard
     return " | ".join(markers)
 
 
@@ -415,7 +410,7 @@ def main():
     global _redis_available
 
     logger.info("=" * 60)
-    logger.info("Gatekeeper-AI Pipeline v9.3-audited")
+    logger.info("Gatekeeper-AI Pipeline v8.11-patched")
     logger.info(f"Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
     logger.info("=" * 60)
 

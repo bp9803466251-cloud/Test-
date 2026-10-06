@@ -142,11 +142,6 @@ def collect_odds_api() -> Dict[str, Any]:
     sports = sports_data.get("data", [])
     football_sports = [s for s in sports if s.get("group") == "Soccer" and s.get("active", True)]
     logger.info(f"Активных футбольных лиг: {len(football_sports)}")
-    try:
-        from gatekeeper_hub import log_event
-    except ImportError:
-        def log_event(source, level, message, **kwargs):
-            pass
     log_event("odds_api", "INFO", "Collection started", run_id=run_id, active_leagues=len(football_sports))
 
     stored = 0
@@ -242,15 +237,16 @@ def collect_odds_api() -> Dict[str, Any]:
                             price_float = _normalize_odds_value(price)
                             if price_float is None:
                                 continue
-                            # Сравниваем с нормализованным именем
+                            # Сравниваем с нормализованным именем — exact match
                             name_norm = clean_team_name(name)
-                            if name_norm == home_team or home_team in name_norm or name_norm in home_team:
-                                if odds_home is None or price_float > odds_home:
-                                    odds_home = price_float
-                            elif name in ("Draw", "draw", "Ничья"):
+                            # Draw проверяем первым — не зависит от команд
+                            if name in ("Draw", "draw", "Ничья"):
                                 if odds_draw is None or price_float > odds_draw:
                                     odds_draw = price_float
-                            elif name_norm == away_team or away_team in name_norm or name_norm in away_team:
+                            elif name_norm == home_team:
+                                if odds_home is None or price_float > odds_home:
+                                    odds_home = price_float
+                            elif name_norm == away_team:
                                 if odds_away is None or price_float > odds_away:
                                     odds_away = price_float
 

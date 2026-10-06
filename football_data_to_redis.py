@@ -49,6 +49,7 @@ from datetime import datetime, timezone, timedelta
 try:
     from gatekeeper_hub import (
         upsert_match,
+        upsert_history_match,
         is_shutdown_requested,
         run_initialization,
         UPSTREAM_MAP,
@@ -57,6 +58,10 @@ try:
 except ImportError:
     _HUB_AVAILABLE = False
     UPSTREAM_MAP = {}
+
+    def upsert_history_match(canonical_id, match_data):
+        """Fallback: делегирует в fallback upsert_match."""
+        return upsert_match(match_data, source="football_data")
 
 try:
     from gatekeeper_hub import register_module, log_event
@@ -855,11 +860,11 @@ class FootballDataCollector:
                 return content
             except urllib.error.HTTPError as e:
                 if e.code == 404:
-                    print(f"  [SKIP] {season}/{league_code} — сезон ещё не начался (404)")
+                    logger.info(f"  [SKIP] {season}/{league_code} — season not started (404)")
                     return None
                 if attempt < 2:
                     wait = 3 * (attempt + 1)
-                    print(f"  [RETRY] HTTP {e.code} for {url}, ждём {wait}s...")
+                    logger.warning(f"  [RETRY] HTTP {e.code} for {url}, waiting {wait}s...")
                     time.sleep(wait)
                     continue
                 logger.error(f"HTTP {e.code} for {url}")
@@ -867,7 +872,7 @@ class FootballDataCollector:
             except (urllib.error.URLError, OSError) as e:
                 if attempt < 2:
                     wait = 3 * (attempt + 1)
-                    print(f"  [RETRY] {e} for {url}, ждём {wait}s...")
+                    logger.warning(f"  [RETRY] {e} for {url}, waiting {wait}s...")
                     time.sleep(wait)
                     continue
                 logger.error(f"Error {e} for {url}")
@@ -891,7 +896,7 @@ class FootballDataCollector:
 
         for row in reader:
             if is_shutdown_requested():
-                print("    [SHUTDOWN] Graceful shutdown — прерываем CSV-обработку")
+                logger.info("[SHUTDOWN] Graceful shutdown — CSV processing interrupted")
                 break
             if limit and count >= limit:
                 break
@@ -922,16 +927,18 @@ class FootballDataCollector:
             # v7.0: idempotency_key — защита от дублей при повторном CI
             idempotency_key = f"{self.run_id}:{payload['canonical_id']}"
 
-            # v7.0: Запись через хаб (upsert_match), не прямой SET
+            # v9.3-audited: Запись через upsert_history_match (принимает dict payload)
+            # Fallback: локальная upsert_match (тоже принимает dict)
             try:
-                # FIX-AUDIT-v9.3: mode="history" — запись в history:match:{cid}, не в live
-                upsert_match(
-                    payload,
-                    source=SOURCE_NAME,
-                    idempotency_key=idempotency_key,
-                    dry_run=self.dry_run,
-                    mode="history",
-                )
+                cid = payload.get("canonical_id", "")
+                if _HUB_AVAILABLE and cid:
+                    upsert_history_match(cid, payload)
+                else:
+                    upsert_match(
+                        payload,
+                        source=SOURCE_NAME,
+                        idempotency_key=idempotency_key,
+                    )
             except Exception as e:
                 self.errors += 1
                 logger.error(f"Write error: {e}")
@@ -1097,14 +1104,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Don't write to Redis")
     args = parser.parse_args()
 
-    print(f"=== Football-Data Collector v{VERSION} (schema {SCHEMA_VERSION}) ===")
-    print(f"  Dry run: {args.dry_run}")
-    print(f"  Seasons: {args.seasons or 'auto'}")
-    print(f"  Leagues: {args.leagues or 'all 22'}")
-    print(f"  Limit: {args.limit or 'none'}")
-    print(f"  History days: {args.history_days or 'all'}")
-    print(f"  Hub: {'available' if _HUB_AVAILABLE else 'fallback (direct redis_hub)'}")
-    print(f"  Registry: {'available' if _REGISTRY_AVAILABLE else 'fallback (local TEAM_ALIASES)'}")
+    logger.info(f"=== Football-Data Collector v{VERSION} (schema {SCHEMA_VERSION}) ===")
+    logger.info(f"  Dry run: {args.dry_run}")
+    logger.info(f"  Seasons: {args.seasons or 'auto'}")
+    logger.info(f"  Leagues: {args.leagues or 'all 22'}")
+    logger.info(f"  Limit: {args.limit or 'none'}")
+    logger.info(f"  History days: {args.history_days or 'all'}")
+    logger.info(f"  Hub: {'available' if _HUB_AVAILABLE else 'fallback (direct redis_hub)'}")
+    logger.info(f"  Registry: {'available' if _REGISTRY_AVAILABLE else 'fallback (local TEAM_ALIASES)'}")
 
     # Инициализация хаба
     init_metrics = run_initialization(collector=SOURCE_NAME)
@@ -1112,12 +1119,12 @@ def main():
 
     if not init_metrics.get("redis_available", False) and not args.dry_run:
         if not is_redis_available():
-            print("[FATAL] Redis недоступен. Проверьте SHARED_UPSTASH_REDIS_REST_URL/TOKEN.")
+            logger.error("[FATAL] Redis unavailable. Check SHARED_UPSTASH_REDIS_REST_URL/TOKEN.")
             sys.exit(1)
-        print("  Redis: OK (direct)")
+        logger.info("  Redis: OK (direct)")
     else:
-        print(f"  Redis: {'OK (hub)' if init_metrics.get('redis_available') else 'dry-run'}")
-        print(f"  Run ID: {run_id}")
+        logger.info(f"  Redis: {'OK (hub)' if init_metrics.get('redis_available') else 'dry-run'}")
+        logger.info(f"  Run ID: {run_id}")
 
     # Parse seasons
     if args.seasons:
@@ -1132,8 +1139,8 @@ def main():
     else:
         leagues = list(LEAGUES.keys())
 
-    print(f"  Seasons parsed: {seasons}")
-    print(f"  Leagues parsed: {leagues} ({len(leagues)})")
+    logger.info(f"  Seasons parsed: {seasons}")
+    logger.info(f"  Leagues parsed: {leagues} ({len(leagues)})")
 
     collector = FootballDataCollector(dry_run=args.dry_run, run_id=run_id)
 
@@ -1141,10 +1148,10 @@ def main():
     total_errors = 0
 
     for season in seasons:
-        print(f"\n--- Season {season} ---")
+        logger.info(f"--- Season {season} ---")
         for league_code in leagues:
             league_name = LEAGUES.get(league_code, {}).get("name", league_code)
-            print(f"  [{league_code}] {league_name}...")
+            logger.info(f"  [{league_code}] {league_name}...")
 
             csv_content = collector.download_csv(season, league_code)
             if csv_content is None:
@@ -1158,24 +1165,24 @@ def main():
                 limit=args.limit, history_days=args.history_days
             )
             total_matches += matches
-            print(f"    Matches: {matches}")
+            logger.info(f"    Matches: {matches}")
 
             # v7.0: save_meta после каждой лиги (crash-safe)
             collector.save_meta(season, league_code, matches, collector.errors)
 
         if is_shutdown_requested():
-            print("\n  [SHUTDOWN] Graceful shutdown — прерываем")
+            logger.info("[SHUTDOWN] Graceful shutdown — interrupted")
             break
 
     collector.flush_remaining()
 
-    print(f"\n=== DONE ===")
-    print(f"  Total matches: {total_matches}")
-    print(f"  Total errors: {total_errors}")
-    print(f"  Collector errors: {collector.errors}")
-    print(f"  Skipped (invalid/old): {collector.skipped}")
+    logger.info("=== DONE ===")
+    logger.info(f"  Total matches: {total_matches}")
+    logger.info(f"  Total errors: {total_errors}")
+    logger.info(f"  Collector errors: {collector.errors}")
+    logger.info(f"  Skipped (invalid/old): {collector.skipped}")
     if args.dry_run:
-        print(f"  (dry-run: nothing written to Redis)")
+        logger.info(f"  (dry-run: nothing written to Redis)")
 
     return 0 if total_errors == 0 and collector.errors == 0 else 1
 

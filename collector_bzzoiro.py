@@ -284,10 +284,9 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     # §2.6: передаём collector= для трассировки
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     if not init_metrics or not init_metrics.get("redis_available"):
-        logger.info("[BZZOIRO] ERROR: Redis init failed")
-        save_meta(COLLECTOR_NAME, stored_matches=0, error_count=1,
-                  events_only=events_only, run_id="")
-        return {"error": "redis_init_failed"}
+        logger.error("[BZZOIRO] Redis init failed — save_meta недоступен")
+        log_event("bzzoiro", "ERROR", "Redis init failed — collection aborted")
+        return {"error": "redis_init_failed", "stored_matches": 0, "error_count": 1}
 
     run_id = init_metrics.get("run_id", "")
     logger.info(f"[BZZOIRO] Run ID: {run_id}")
@@ -376,6 +375,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     skipped_finished = 0
     deduped = 0
     no_date_count = 0
+    upsert_errors = 0
     seen = set()
 
     for idx, ev in enumerate(all_events):
@@ -460,9 +460,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 created += 1
             stored_matches.append((result_id, bzzoiro_id, ev))
         else:
-            skipped_past += 1
+            upsert_errors += 1
+            logger.warning(f"[BZZOIRO] upsert returned None for event #{idx}: {home_norm} vs {away_norm}")
 
-    logger.info(f"[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}")
+    logger.info(f"[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}, upsert_errors={upsert_errors}")
 
     # --- Шаг 3: Enrichment ---
     odds_enriched = 0
@@ -683,7 +684,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
               stored_matches=len(stored_matches),
               created=created,
               updated=updated,
-              error_count=enrichment_errors,
+              upsert_errors=upsert_errors,
+              error_count=enrichment_errors + upsert_errors,
               pages_fetched=pages_fetched,
               enrichment={
                   "odds": odds_enriched,
