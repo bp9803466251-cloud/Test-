@@ -7,8 +7,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: telegram-dashboard
+  group: gatekeeper-redis  # FIX-AUDIT-v9.3: единая группа для предотвращения race condition
   cancel-in-progress: false
+
+env:  # FIX-AUDIT-v9.3: workflow-level env
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  GK_CONFIG_FILE: 'gatekeeper_config.yaml'
 
 jobs:
   dashboard:
@@ -22,7 +27,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
       - name: Install dependencies
@@ -73,7 +78,7 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}  # FIX-AUDIT-v9.3: прямой маппинг (Вариант B)
           GATEKEEPER_ENV: prod
           GK_CONFIG_FILE: gatekeeper_config.yaml
           PYTHONUNBUFFERED: "1"
@@ -82,7 +87,7 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}  # FIX-AUDIT-v9.3: прямой маппинг (Вариант B)
         run: |
           MSG="❌ Telegram Dashboard FAILED%0ARun: ${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
