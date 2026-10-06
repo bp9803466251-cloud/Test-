@@ -59,10 +59,6 @@ except ImportError:
     _HUB_AVAILABLE = False
     UPSTREAM_MAP = {}
 
-    def upsert_history_match(canonical_id, match_data):
-        """Fallback: делегирует в fallback upsert_match."""
-        return upsert_match(match_data, source="football_data")
-
 try:
     from gatekeeper_hub import register_module, log_event
 except ImportError:
@@ -860,11 +856,11 @@ class FootballDataCollector:
                 return content
             except urllib.error.HTTPError as e:
                 if e.code == 404:
-                    logger.info(f"  [SKIP] {season}/{league_code} — season not started (404)")
+                    logger.info(f"  [SKIP] {season}/{league_code} — сезон ещё не начался (404)")
                     return None
                 if attempt < 2:
                     wait = 3 * (attempt + 1)
-                    logger.warning(f"  [RETRY] HTTP {e.code} for {url}, waiting {wait}s...")
+                    logger.info(f"  [RETRY] HTTP {e.code} for {url}, ждём {wait}s...")
                     time.sleep(wait)
                     continue
                 logger.error(f"HTTP {e.code} for {url}")
@@ -872,7 +868,7 @@ class FootballDataCollector:
             except (urllib.error.URLError, OSError) as e:
                 if attempt < 2:
                     wait = 3 * (attempt + 1)
-                    logger.warning(f"  [RETRY] {e} for {url}, waiting {wait}s...")
+                    logger.info(f"  [RETRY] {e} for {url}, ждём {wait}s...")
                     time.sleep(wait)
                     continue
                 logger.error(f"Error {e} for {url}")
@@ -896,7 +892,7 @@ class FootballDataCollector:
 
         for row in reader:
             if is_shutdown_requested():
-                logger.info("[SHUTDOWN] Graceful shutdown — CSV processing interrupted")
+                logger.info("    [SHUTDOWN] Graceful shutdown — прерываем CSV-обработку")
                 break
             if limit and count >= limit:
                 break
@@ -927,17 +923,16 @@ class FootballDataCollector:
             # v7.0: idempotency_key — защита от дублей при повторном CI
             idempotency_key = f"{self.run_id}:{payload['canonical_id']}"
 
-            # v9.3-audited: Запись через upsert_history_match (принимает dict payload)
-            # Fallback: локальная upsert_match (тоже принимает dict)
+            # v7.0: Запись через хаб (upsert_match), не прямой SET
             try:
-                cid = payload.get("canonical_id", "")
-                if _HUB_AVAILABLE and cid:
-                    upsert_history_match(cid, payload)
+                if _HUB_AVAILABLE:
+                    upsert_history_match(payload["canonical_id"], payload)
                 else:
                     upsert_match(
                         payload,
                         source=SOURCE_NAME,
                         idempotency_key=idempotency_key,
+                        dry_run=self.dry_run,
                     )
             except Exception as e:
                 self.errors += 1
@@ -1119,7 +1114,7 @@ def main():
 
     if not init_metrics.get("redis_available", False) and not args.dry_run:
         if not is_redis_available():
-            logger.error("[FATAL] Redis unavailable. Check SHARED_UPSTASH_REDIS_REST_URL/TOKEN.")
+            logger.info("[FATAL] Redis недоступен. Проверьте SHARED_UPSTASH_REDIS_REST_URL/TOKEN.")
             sys.exit(1)
         logger.info("  Redis: OK (direct)")
     else:
@@ -1148,7 +1143,7 @@ def main():
     total_errors = 0
 
     for season in seasons:
-        logger.info(f"--- Season {season} ---")
+        logger.info(f"\n--- Season {season} ---")
         for league_code in leagues:
             league_name = LEAGUES.get(league_code, {}).get("name", league_code)
             logger.info(f"  [{league_code}] {league_name}...")
@@ -1171,15 +1166,15 @@ def main():
             collector.save_meta(season, league_code, matches, collector.errors)
 
         if is_shutdown_requested():
-            logger.info("[SHUTDOWN] Graceful shutdown — interrupted")
+            logger.info("\n  [SHUTDOWN] Graceful shutdown — прерываем")
             break
 
     collector.flush_remaining()
 
-    logger.info("=== DONE ===")
+    logger.info(f"\n=== DONE ===")
     logger.info(f"  Total matches: {total_matches}")
-    logger.info(f"  Total errors: {total_errors}")
-    logger.info(f"  Collector errors: {collector.errors}")
+    logger.error(f"  Total errors: {total_errors}")
+    logger.error(f"  Collector errors: {collector.errors}")
     logger.info(f"  Skipped (invalid/old): {collector.skipped}")
     if args.dry_run:
         logger.info(f"  (dry-run: nothing written to Redis)")

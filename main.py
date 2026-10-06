@@ -47,6 +47,7 @@ from datetime import datetime, timezone, timedelta
 from gatekeeper_hub import (
     run_initialization,
     get_matches_by_date_range,
+    get_match,
     save_search_results,
     save_analysis,
     save_meta,
@@ -164,19 +165,22 @@ def _send_one(text: str) -> bool:
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         if e.code == 429:
-            try:
-                retry_after = json.loads(body).get("parameters", {}).get("retry_after", 3)
-            except Exception:
-                retry_after = 3
-            logger.warning(f"429: ожидание {retry_after}с")
-            time.sleep(retry_after)
-            _send_one._retry_count = getattr(_send_one, "_retry_count", 0) + 1
-            if _send_one._retry_count <= 2:
-                return _send_one(text)
-            else:
-                logger.error("Telegram 429: max retries exceeded")
+            if not hasattr(_send_one, "_retry_count"):
                 _send_one._retry_count = 0
-                return False
+            if _send_one._retry_count < 2:
+                try:
+                    retry_after = json.loads(body).get("parameters", {}).get("retry_after", 3)
+                except Exception:
+                    retry_after = 3
+                _send_one._retry_count += 1
+                logger.warning(f"429: ожидание {retry_after}с, retry {_send_one._retry_count}/2")
+                time.sleep(retry_after)
+                result = _send_one(text)
+                _send_one._retry_count = 0
+                return result
+            _send_one._retry_count = 0
+            logger.warning("429: retry limit reached, отмена")
+            return False
         logger.warning(f"HTTP {e.code}: {body[:200]}")
         return False
     except Exception as e:

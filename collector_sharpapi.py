@@ -276,7 +276,7 @@ def collect_sharpapi():
     # FIX-AUDIT-v9.3: Вариант B — env = secret name (без маппинга)
     api_key = os.environ.get("SHARPAPI_API_KEY") or os.environ.get("SHARP_API_KEY")
     if not api_key:
-        logger.error("[SHARPAPI] SHARPAPI_API_KEY (или SHARP_API_KEY) не задан")
+        logger.error("[SHARPAPI] SHARP_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
     headers = {
@@ -303,6 +303,7 @@ def collect_sharpapi():
         _flush_old_matches()
 
     logger.info(f"[SHARPAPI] Сбор матчей из /odds?sport=soccer&market=moneyline ...")
+
     log_event("sharpapi", "INFO", "Collection started", run_id=run_id, max_pages=max_pages)
     odds_rows, pages = _fetch_odds_pages(headers, max_pages, limit, rate_delay)
     logger.info(f"[SHARPAPI] Получено строк odds: {len(odds_rows)} (страниц: {pages})")
