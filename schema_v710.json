@@ -1,8 +1,7 @@
 {
   "version": "v710",
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "GatekeeperAI Match Object v710",
-  "description": "Канонический формат матча GatekeeperAI (schema v710, §19.1)",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GatekeeperAI Match Schema v710",
   "type": "object",
   "required": [
     "canonical_id",
@@ -15,62 +14,48 @@
     "date_utc",
     "status",
     "version",
-    "schema_version",
-    "odds",
-    "source_ids",
-    "sources",
-    "created_at",
-    "updated_at"
+    "schema_version"
   ],
   "properties": {
     "canonical_id": {
       "type": "string",
-      "description": "{home_clean}__{away_clean}__{YYYYMMDD}",
-      "pattern": "^[a-z0-9_]+__[a-z0-9_]+__\\d{8}$"
+      "minLength": 1
     },
     "home_team": {
       "type": "string",
-      "description": "Оригинальное название домашней команды"
+      "minLength": 1
     },
     "away_team": {
       "type": "string",
-      "description": "Оригинальное название гостевой команды"
+      "minLength": 1
     },
     "home_clean": {
       "type": "string",
-      "minLength": 1,
-      "description": "Нормализованное название"
+      "minLength": 1
     },
     "away_clean": {
       "type": "string",
-      "minLength": 1,
-      "description": "Нормализованное название"
+      "minLength": 1
     },
     "competition": {
       "type": "string",
-      "description": "Название лиги/турнира (строка, не dict) — §1.18"
+      "minLength": 1
     },
     "country": {
       "type": "string",
-      "description": "Страна"
+      "minLength": 1
     },
     "date_utc": {
       "type": "string",
-      "format": "date-time",
-      "description": "ISO 8601 UTC"
+      "minLength": 1
     },
     "status": {
       "type": "string",
       "enum": [
         "scheduled",
         "live",
-        "completed",
-        "cancelled",
-        "postponed",
-        "interrupted",
-        "archived"
-      ],
-      "description": "Статус матча"
+        "completed"
+      ]
     },
     "score": {
       "type": [
@@ -81,120 +66,80 @@
         "home": {
           "type": [
             "integer",
-            "null"
+            "string"
           ]
         },
         "away": {
           "type": [
             "integer",
-            "null"
+            "string"
           ]
-        }
-      },
-      "required": [
-        "home",
-        "away"
-      ],
-      "description": "Плоский счёт"
-    },
-    "version": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "CAS-версия"
-    },
-    "schema_version": {
-      "type": "string",
-      "const": "v710",
-      "description": "Версия схемы"
-    },
-    "odds": {
-      "type": [
-        "object",
-        "null"
-      ],
-      "description": "Коэффициенты",
-      "properties": {
-        "1x2": {
-          "type": "object",
-          "properties": {
-            "current": {
-              "type": "object"
-            },
-            "opening": {
-              "type": "object"
-            },
-            "best": {
-              "type": "object"
-            },
-            "closing": {
-              "type": "object"
-            },
-            "sources": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "source": {
-                    "type": "string"
-                  },
-                  "upstream": {
-                    "type": "string"
-                  },
-                  "price": {
-                    "type": "object"
-                  },
-                  "timestamp": {
-                    "type": "string"
-                  },
-                  "type": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "source",
-                  "price"
-                ]
-              }
-            }
-          }
         }
       }
     },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "v710"
+      ]
+    },
+    "odds": {
+      "type": "object"
+    },
     "predictions": {
-      "type": "object",
-      "description": "Прогнозы"
+      "type": "object"
     },
     "stats": {
-      "type": "object",
-      "description": "Статистика матча"
+      "type": "object"
     },
     "h2h": {
-      "type": "object",
-      "description": "Head-to-head"
+      "type": "object"
     },
     "source_ids": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "string"
-      },
-      "description": "ID матча в источнике"
+      "type": "object"
     },
     "source_map": {
-      "type": "object",
-      "description": "Карта источников"
+      "type": "object"
+    },
+    "flags": {
+      "type": "object"
+    },
+    "half_time_score": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "full_time_result": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "referee": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "season": {
+      "type": "string"
+    },
+    "league_code": {
+      "type": "string"
     },
     "sources": {
       "type": "array",
       "items": {
         "type": "string"
-      },
-      "uniqueItems": true,
-      "minItems": 1,
-      "description": "Источники данных"
+      }
     },
     "section_history": {
       "type": "array",
-      "maxItems": 20,
       "items": {
         "type": "object",
         "properties": {
@@ -206,90 +151,27 @@
           },
           "updated_at": {
             "type": "string"
-          },
-          "upstream": {
-            "type": "string"
           }
-        },
-        "required": [
-          "section",
-          "source",
-          "updated_at",
-          "upstream"
-        ]
-      },
-      "description": "FIFO-буфер"
+        }
+      }
     },
     "value_analysis": {
-      "type": "object",
-      "description": "Результат value-анализа"
+      "type": "object"
     },
     "time_utc": {
       "type": [
         "string",
         "null"
-      ],
-      "description": "Время начала"
+      ]
     },
     "csv_raw": {
-      "type": "object",
-      "description": "Сырые колонки CSV"
-    },
-    "flags": {
-      "type": "object",
-      "description": "Системные флаги"
-    },
-    "half_time_score": {
-      "type": [
-        "object",
-        "null"
-      ],
-      "properties": {
-        "home": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "away": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "description": "Счёт первого тайма"
-    },
-    "full_time_result": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "enum": [
-        "H",
-        "D",
-        "A",
-        null
-      ],
-      "description": "Результат"
+      "type": "object"
     },
     "created_at": {
-      "type": "string",
-      "format": "date-time",
-      "description": "ISO 8601 MSK"
+      "type": "string"
     },
     "updated_at": {
-      "type": "string",
-      "format": "date-time",
-      "description": "ISO 8601 MSK"
-    },
-    "season": {
-      "type": "string",
-      "description": "Сезон"
-    },
-    "league_code": {
-      "type": "string",
-      "description": "Код лиги"
+      "type": "string"
     }
   },
   "additionalProperties": true
