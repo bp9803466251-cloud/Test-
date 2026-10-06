@@ -1,11 +1,14 @@
-# GatekeeperAI v8.11-patched — Configuration (§20.3)
+# GatekeeperAI v9.3-audited — Configuration (§20.3)
 # FIX-AUDIT-v9.3: collector_upstream → upstream_map, value_threshold → value_engine.threshold
+# FIX-AUDIT-v9.3: убраны мёртвые секции (redis, circuit_breaker — читаются из env)
+# FIX-AUDIT-v9.3: добавлена секция collectors (get_collector_config)
+# FIX-AUDIT-v9.3: index.lookahead_days исправлен с 3 на 7 (рассинхрон с hub)
 version: "v9.3"
 
-# Pipeline settings
-pipeline_batch_size: 50
-index_lookback_days: 2
-index_lookahead_days: 3
+# Pipeline settings (информационные — hub использует хардкоды)
+index:
+  lookback_days: 2
+  lookahead_days: 7
 
 # Feature flags
 features:
@@ -33,15 +36,41 @@ cleanup:
   dry_run: false
   auto_migrate: true
   expire_seconds: 86400
+  owner: main
 
-# Redis settings (env-based, these are defaults)
-redis:
-  timeout: 30
-  hash_name: GatekeeperAI
-  max_pipeline: 50
+# Per-collector settings (§20.3 — get_collector_config)
+collectors:
+  sharpapi:
+    rate_delay: 0.5
+    max_retries: 2
+    timeout: 30
+    days_ahead: 3
+  odds_api:
+    rate_delay: 1.0
+    max_retries: 1
+    timeout: 30
+    days_ahead: 3
+  bzzoiro:
+    rate_delay: 0.3
+    max_retries: 1
+    timeout: 30
+    days_ahead: 7
+  propline:
+    rate_delay: 0.5
+    max_retries: 3
+    timeout: 15
+    days_ahead: 3
+  football_data:
+    rate_delay: 1.0
+    max_retries: 3
+    timeout: 30
 
-# Circuit breaker (§1.9)
-circuit_breaker:
-  failure_threshold: 10
-  recovery_timeout: 60
-  
+# Redis settings — читаются из env (redis_config.py), не из YAML.
+# Оставлено как документация:
+#   SHARED_UPSTASH_REDIS_REST_URL    — Base URL
+#   SHARED_UPSTASH_REDIS_REST_TOKEN  — Bearer token
+#   REDIS_TIMEOUT=30                 — таймаут (сек)
+#   CB_FAILURE_THRESHOLD=10          — порог circuit breaker
+#   CB_RECOVERY_TIMEOUT=60           — восстановление CB (сек)
+#   REDIS_HASH_NAME=GatekeeperAI     — имя хэша
+#   REDIS_MAX_PIPELINE=50            — размер батча
