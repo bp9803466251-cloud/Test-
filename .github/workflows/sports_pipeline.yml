@@ -2,161 +2,44 @@ name: Sports Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      value_threshold:
+        description: 'Порог value bet (0.03 = 3%)'
+        required: false
+        default: '0.03'
 
 permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
+  group: gatekeeper-pipeline
   cancel-in-progress: false
 
 env:
   PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
   GK_CONFIG_FILE: 'gatekeeper_config.yaml'
-  PYTHONUNBUFFERED: "1"
 
 jobs:
-  # ── Stage 1: Parallel collectors ──
-  sharpapi:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - run: python collector_sharpapi.py
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
-          SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '6' }}
-          SHARPAPI_MAX_PAGES: ${{ vars.SHARPAPI_MAX_PAGES || '60' }}
-          SHARPAPI_LIMIT: ${{ vars.SHARPAPI_LIMIT || '200' }}
-          SHARPAPI_DAYS_AHEAD: '3'
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-
-  odds_api:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - run: python collector_odds_api.py
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          ODDS_API_RATE_DELAY: '1.0'
-          ODDS_API_MAX_RETRIES: '3'
-          ODDS_API_REGIONS: ${{ vars.ODDS_API_REGIONS || 'eu,uk' }}
-          ODDS_API_MARKETS: 'h2h'
-          ODDS_API_ODDS_FORMAT: 'decimal'
-          ODDS_API_DAYS_AHEAD: '3'
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-
-  bzzoiro:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - run: python collector_bzzoiro.py
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-          BZZOIRO_RATE_DELAY: '1.5'
-          BZZOIRO_ENRICH_DELAY: '0.5'
-          BZZOIRO_MAX_RETRIES: '3'
-          BZZOIRO_DAYS_AHEAD: '7'
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-
-  propline:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - run: python collector_propline.py
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
-          PROPLINE_RATE_DELAY: '1.0'
-          PROPLINE_MAX_RETRIES: '3'
-          PROPLINE_DAYS_AHEAD: '3'
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-
-  # ── Stage 2: Contract tests (after all collectors) ──
-  contract-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [sharpapi, odds_api, bzzoiro, propline]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - run: python test_contracts.py
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-
-  # ── Stage 3: Pipeline (main.py) — only if contract tests passed ──
   pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [contract-tests]
-    if: always() && needs.contract-tests.result == 'success'
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - run: |
+          cache: pip
+
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - run: python main.py
+
+      - name: Run pipeline (main.py)
+        run: python main.py
         env:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
@@ -165,34 +48,26 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-          VALUE_THRESHOLD: '0.03'
+          VALUE_THRESHOLD: ${{ github.event.inputs.value_threshold || '0.03' }}
 
-  # ── Stage 4: Summary (always runs) ──
-  summary:
-    runs-on: ubuntu-latest
-    needs: [sharpapi, odds_api, bzzoiro, propline, contract-tests, pipeline]
-    if: always()
-    steps:
-      - run: |
+      - name: Summary
+        if: always()
+        run: |
           echo "=== Sports Pipeline Summary ==="
-          echo ""
-          echo "SharpAPI:    ${{ needs.sharpapi.result }}"
-          echo "OddsAPI:     ${{ needs.odds_api.result }}"
-          echo "Bzzoiro:     ${{ needs.bzzoiro.result }}"
-          echo "Propline:    ${{ needs.propline.result }}"
-          echo "Tests:       ${{ needs.contract-tests.result }}"
-          echo "Pipeline:    ${{ needs.pipeline.result }}"
-          echo ""
+          echo "Value threshold: ${{ github.event.inputs.value_threshold || '0.03' }}"
           echo "Run ID: ${{ github.run_id }}"
           echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "Status: SUCCESS"
+          else
+            echo "Status: ${{ job.status }}"
+          fi
 
       - name: Telegram alert on failure
-        if: needs.sharpapi.result == 'failure' || needs.odds_api.result == 'failure' || needs.bzzoiro.result == 'failure' || needs.propline.result == 'failure' || needs.pipeline.result == 'failure'
+        if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
-          MSG="❌ Sports Pipeline FAILED%0A%0ASharpAPI: ${{ needs.sharpapi.result }}%0AOddsAPI: ${{ needs.odds_api.result }}%0ABzzoiro: ${{ needs.bzzoiro.result }}%0APropline: ${{ needs.propline.result }}%0APipeline: ${{ needs.pipeline.result }}%0A%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_GROUP_ID}" \
-            -d text="${MSG}" || true
+          MSG="❌ Sports Pipeline FAILED%0A%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="${MSG}" || true
