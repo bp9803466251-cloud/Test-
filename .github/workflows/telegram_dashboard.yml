@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Send Telegram dashboard
         run: |
@@ -78,8 +78,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           GATEKEEPER_ENV: prod
-          GK_CONFIG_FILE: gatekeeper_config.yaml
-          PYTHONUNBUFFERED: "1"
+          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
 
       - name: Telegram alert on failure
         if: failure()

@@ -6,7 +6,6 @@ on:
 permissions:
   contents: read
 
-# FIX-AUDIT-v9.3: concurrency.group → gatekeeper-redis (§13 — prevents race condition)
 concurrency:
   group: gatekeeper-redis
   cancel-in-progress: false
@@ -29,14 +28,13 @@ jobs:
           cache: 'pip'
       - run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
       - run: python collector_sharpapi.py
         env:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          # FIX-AUDIT-v9.3: vars.* with fallback instead of hardcoded values (unify with standalone)
           SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
           SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '6' }}
           SHARPAPI_MAX_PAGES: ${{ vars.SHARPAPI_MAX_PAGES || '60' }}
@@ -55,7 +53,7 @@ jobs:
           cache: 'pip'
       - run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
       - run: python collector_odds_api.py
         env:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
@@ -65,7 +63,6 @@ jobs:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           ODDS_API_RATE_DELAY: '1.0'
           ODDS_API_MAX_RETRIES: '3'
-          # FIX-AUDIT-v9.3: vars.* with fallback instead of hardcoded 'eu'
           ODDS_API_REGIONS: ${{ vars.ODDS_API_REGIONS || 'eu,uk' }}
           ODDS_API_MARKETS: 'h2h'
           ODDS_API_ODDS_FORMAT: 'decimal'
@@ -74,7 +71,6 @@ jobs:
 
   bzzoiro:
     runs-on: ubuntu-latest
-    # FIX-AUDIT-v9.3: timeout 20 → 30 (§15: Bzzoiro needs 30 min)
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +80,7 @@ jobs:
           cache: 'pip'
       - run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
       - run: python collector_bzzoiro.py
         env:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
@@ -109,7 +105,7 @@ jobs:
           cache: 'pip'
       - run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
       - run: python collector_propline.py
         env:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
@@ -136,7 +132,7 @@ jobs:
           cache: 'pip'
       - run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
       - run: python test_contracts.py
         env:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
@@ -145,7 +141,7 @@ jobs:
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
 
-  # ── Stage 3: Pipeline (main.py) — only if collectors succeeded ──
+  # ── Stage 3: Pipeline (main.py) — only if contract tests passed ──
   pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -159,7 +155,7 @@ jobs:
           cache: 'pip'
       - run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
       - run: python main.py
         env:
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
@@ -167,7 +163,6 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          # FIX-AUDIT-v9.3: TELEGRAM_GROUP_ID 1:1 (§1.8a)
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
           VALUE_THRESHOLD: '0.03'
@@ -195,11 +190,9 @@ jobs:
         if: needs.sharpapi.result == 'failure' || needs.odds_api.result == 'failure' || needs.bzzoiro.result == 'failure' || needs.propline.result == 'failure' || needs.pipeline.result == 'failure'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          # FIX-AUDIT-v9.3: TELEGRAM_GROUP_ID 1:1 (§1.8a)
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
           MSG="❌ Sports Pipeline FAILED%0A%0ASharpAPI: ${{ needs.sharpapi.result }}%0AOddsAPI: ${{ needs.odds_api.result }}%0ABzzoiro: ${{ needs.bzzoiro.result }}%0APropline: ${{ needs.propline.result }}%0APipeline: ${{ needs.pipeline.result }}%0A%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" || true
-            

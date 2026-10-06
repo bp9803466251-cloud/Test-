@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis  # FIX-AUDIT-v9.3: единая группа для предотвращения race condition
+  group: gatekeeper-redis
   cancel-in-progress: false
 
 env:
@@ -30,7 +30,8 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -82,7 +83,7 @@ jobs:
 
             # Отправляем URL в Telegram
             if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
-              TG_CHAT="${{ secrets.TELEGRAM_GROUP_ID }}"  # FIX-AUDIT-v9.3: прямой маппинг (Вариант B)
+              TG_CHAT="${{ secrets.TELEGRAM_GROUP_ID }}"
               MSG="🖥 <b>GatekeeperAI Monitor</b>%0AURL: $PUBLIC_URL%0APort: $PORT%0ADuration: ${DURATION}m%0A%0AAuto-refresh: 30s"
               curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
                 -d "chat_id=${TG_CHAT}" \
@@ -105,11 +106,10 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}  # FIX-AUDIT-v9.3: прямой маппинг (Вариант B)
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
           MSG="🔴 <b>Web Dashboard FAILED</b>%0ARepo: ${{ github.repository }}%0ARun: ${{ github.run_id }}%0A%0A👉 https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_GROUP_ID}" \
             -d "text=${MSG}" \
             -d "parse_mode=HTML" || true
-            
