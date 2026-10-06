@@ -193,15 +193,15 @@ def send_telegram_dashboard(dashboard_text: str) -> Dict[str, Any]:
     Возвращает {"success": bool, "sent_parts": int, "total_parts": int}.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    # FIX: все YAML-воркфлоу передают TELEGRAM_CHAT_ID, не TELEGRAM_GROUP_ID.
+    # FIX: все YAML-воркфлоу передают TELEGRAM_GROUP_ID, не TELEGRAM_GROUP_ID.
     # Без этого фикса chat_id всегда None — дашборд никогда не отправлялся.
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_GROUP_ID")
+    chat_id = os.environ.get("TELEGRAM_GROUP_ID", "")
 
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN не задан в окружении")
         return {"success": False, "sent_parts": 0, "total_parts": 0}
     if not chat_id:
-        logger.error("TELEGRAM_GROUP_ID (или TELEGRAM_CHAT_ID) не задан в окружении")
+        logger.error("TELEGRAM_GROUP_ID (или TELEGRAM_GROUP_ID) не задан в окружении")
         return {"success": False, "sent_parts": 0, "total_parts": 0}
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"

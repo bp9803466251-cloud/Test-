@@ -19,7 +19,7 @@ Value engine + Telegram-дашборд по стандарту §12.
 
 Аудит-патчи:
   AUDIT-1: VALUE_THRESHOLD вместо VALUE_BET_THRESHOLD (workflow передаёт VALUE_THRESHOLD).
-  AUDIT-2: TELEGRAM_CHAT_ID вместо TELEGRAM_GROUP_ID (workflow передаёт TELEGRAM_CHAT_ID).
+  AUDIT-2: TELEGRAM_GROUP_ID 1:1 (§1.8a).
   AUDIT-3: _split_message — балансировка HTML-тегов (предотвращает отклонение Telegram).
   AUDIT-4: _fmt_odds — защита от str/None (value_engine может вернуть строку).
   AUDIT-5: _send_one — retry на network errors (ConnectionRefused, Timeout).
@@ -121,8 +121,8 @@ except ImportError:
     VALUE_THRESHOLD = float(os.environ.get("VALUE_THRESHOLD", "") or os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-# FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID first (§13), TELEGRAM_GROUP_ID — backward compat
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "") or os.environ.get("TELEGRAM_GROUP_ID", "")
+# FIX-AUDIT-v9.3: TELEGRAM_GROUP_ID first (§13), TELEGRAM_GROUP_ID — backward compat
+TG_CHAT = os.environ.get("TELEGRAM_GROUP_ID", "")
 # FIX-14: Используем TELEGRAM_CHUNK_LIMIT из telegram_transport
 TG_MAX_CHARS = TELEGRAM_CHUNK_LIMIT
 

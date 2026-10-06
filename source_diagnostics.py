@@ -5,7 +5,7 @@
 Объединяет диагностику всех источников, Redis и матчей в одном файле.
 
 v8.11-patched:
-  FIX-1: SHARP_API_KEY → SHARPAPI_API_KEY (§1.8 — SHARPAPI_ префикс)
+  FIX-1: SHARP_API_KEY → SHARP_API_KEY (§1.8 — SHARPAPI_ префикс)
   FIX-2: API_FOOTBALL_KEY → FOOTBALL_DATA_API_KEY (синхрон с workflow env)
   FIX-3: FOOTBALL_DATA_TOKEN → FOOTBALL_DATA_API_KEY (синхрон с workflow env)
   FIX-4: Добавлен logging.getLogger + NullHandler (§20.5)
@@ -73,7 +73,7 @@ def diagnose_sources() -> dict:
     except Exception as e:
         logger.warning("diagnose_sources: sharpapi:meta read error: %s", e)
         sharpapi_meta = None
-    sharpapi_key = "✅" if os.getenv("SHARPAPI_API_KEY") else "❌"  # FIX-1: §1.8
+    sharpapi_key = "✅" if os.getenv("SHARP_API_KEY") else "❌"  # FIX-1: §1.8
     if sharpapi_meta and isinstance(sharpapi_meta, dict):
         last_run = sharpapi_meta.get("last_run", sharpapi_meta.get("last_run_at", "неизвестно"))
         total_events = sharpapi_meta.get("total_events", 0)

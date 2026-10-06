@@ -710,7 +710,9 @@ def main():
     p = argparse.ArgumentParser(description="GatekeeperAI Diagnostics")
 
     # ── Флаги §18.5 (flush/управление) ──
-    p.add_argument("--flush", action="store_true", help="Удаление завершённых матчей (§18.5)")
+    p.add_argument("--hard", action="store_true",
+                        help="Hard flush — полное удаление без восстановления (§18.4)")
+        parser.add_argument("--flush", action="store_true", help="Удаление завершённых матчей (§18.5)")
     p.add_argument("--history", action="store_true", help="Read-only анализ history-ключей (§18.5)")
     p.add_argument("--history-only", action="store_true", help="Удаление history:* ключей (§18.5)")
     p.add_argument("--purge", action="store_true", help="FLUSHDB (требует --yes) (§18.5)")

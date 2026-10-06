@@ -20,18 +20,14 @@ FIXTURES = [
         "canonical_id": "arsenal__chelsea__20261015",
         "home_clean": "arsenal",
         "away_clean": "chelsea",
-        "home": "Arsenal",
-        "away": "Chelsea",
+        "home_team": "Arsenal",
+        "away_team": "Chelsea",
         "date_utc": "2026-10-15T19:00:00Z",
         "source": "sharpapi",
         "sources": ["sharpapi"],
         "upstream": "betradar",
         "status": "upcoming",
-        "competition": {
-            "name": "Premier League",
-            "country": "England",
-            "code": "EPL"
-        },
+        "competition": "Premier League",
         "odds": {
             "1x2": {
                 "home": 1.85,
@@ -62,18 +58,14 @@ FIXTURES = [
         "canonical_id": "real_madrid__barcelona__20261022",
         "home_clean": "real_madrid",
         "away_clean": "barcelona",
-        "home": "Real Madrid",
-        "away": "Barcelona",
+        "home_team": "Real Madrid",
+        "away_team": "Barcelona",
         "date_utc": "2026-10-22T20:00:00Z",
         "source": "odds_api",
         "sources": ["odds_api"],
         "upstream": "betradar",
         "status": "upcoming",
-        "competition": {
-            "name": "La Liga",
-            "country": "Spain",
-            "code": "SP1"
-        },
+        "competition": "La Liga",
         "odds": {
             "1x2": {
                 "home": 2.10,
@@ -98,18 +90,14 @@ FIXTURES = [
         "canonical_id": "bayern_munich__borussia_dortmund__20261029",
         "home_clean": "bayern_munich",
         "away_clean": "borussia_dortmund",
-        "home": "Bayern Munich",
-        "away": "Borussia Dortmund",
+        "home_team": "Bayern Munich",
+        "away_team": "Borussia Dortmund",
         "date_utc": "2026-10-29T17:30:00Z",
         "source": "bzzoiro",
         "sources": ["bzzoiro"],
         "upstream": "opta",
         "status": "upcoming",
-        "competition": {
-            "name": "Bundesliga",
-            "country": "Germany",
-            "code": "BL"
-        },
+        "competition": "Bundesliga",
         "odds": {
             "1x2": {
                 "home": 1.65,

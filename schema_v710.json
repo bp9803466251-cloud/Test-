@@ -37,13 +37,13 @@
     },
     "home_clean": {
       "type": "string",
-      "description": "Нормализованное название (через clean_team_name)",
-      "minLength": 1
+      "minLength": 1,
+      "description": "Нормализованное название"
     },
     "away_clean": {
       "type": "string",
-      "description": "Нормализованное название (через clean_team_name)",
-      "minLength": 1
+      "minLength": 1,
+      "description": "Нормализованное название"
     },
     "competition": {
       "type": "string",
@@ -56,7 +56,7 @@
     "date_utc": {
       "type": "string",
       "format": "date-time",
-      "description": "ISO 8601 UTC — единственный источник даты (§1.18)"
+      "description": "ISO 8601 UTC"
     },
     "status": {
       "type": "string",
@@ -69,7 +69,7 @@
         "interrupted",
         "archived"
       ],
-      "description": "Статус матча (state machine §24.1)"
+      "description": "Статус матча"
     },
     "score": {
       "type": [
@@ -90,47 +90,43 @@
           ]
         }
       },
-      "description": "Плоский счёт {home: int, away: int} — §1.18",
       "required": [
         "home",
         "away"
-      ]
+      ],
+      "description": "Плоский счёт"
     },
     "version": {
       "type": "integer",
       "minimum": 1,
-      "description": "CAS-версия (инкрементируется при patch_match)"
+      "description": "CAS-версия"
     },
     "schema_version": {
       "type": "string",
       "const": "v710",
-      "description": "Версия схемы — gatekeeper для миграций (§20.8)"
+      "description": "Версия схемы"
     },
     "odds": {
       "type": [
         "object",
         "null"
       ],
-      "description": "Коэффициенты в формате 1x2 (§1.21)",
+      "description": "Коэффициенты",
       "properties": {
         "1x2": {
           "type": "object",
           "properties": {
             "current": {
-              "type": "object",
-              "description": "Текущие коэффициенты {home, draw, away} — float"
+              "type": "object"
             },
             "opening": {
-              "type": "object",
-              "description": "Открытые коэффициенты {home, draw, away} — float"
+              "type": "object"
             },
             "best": {
-              "type": "object",
-              "description": "Лучшие коэффициенты {home, draw, away} — float"
+              "type": "object"
             },
             "closing": {
-              "type": "object",
-              "description": "Закрытые коэффициенты {home, draw, away} — float"
+              "type": "object"
             },
             "sources": {
               "type": "array",
@@ -157,8 +153,7 @@
                   "source",
                   "price"
                 ]
-              },
-              "description": "История источников коэффициентов"
+              }
             }
           }
         }
@@ -166,35 +161,35 @@
     },
     "predictions": {
       "type": "object",
-      "description": "Прогнозы: {source, home_win, draw, away_win} — top-level секция (§8.5)"
+      "description": "Прогнозы"
     },
     "stats": {
       "type": "object",
-      "description": "Статистика матча (от Bzzoiro)"
+      "description": "Статистика матча"
     },
     "h2h": {
       "type": "object",
-      "description": "Head-to-head (от Bzzoiro)"
+      "description": "Head-to-head"
     },
     "source_ids": {
       "type": "object",
-      "description": "ID матча в источнике {source: id} — §1.26",
       "additionalProperties": {
         "type": "string"
-      }
+      },
+      "description": "ID матча в источнике"
     },
     "source_map": {
       "type": "object",
-      "description": "Карта источников для history-матчей"
+      "description": "Карта источников"
     },
     "sources": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Уникальные источники данных (список) — §1.28",
       "uniqueItems": true,
-      "minItems": 1
+      "minItems": 1,
+      "description": "Источники данных"
     },
     "section_history": {
       "type": "array",
@@ -222,22 +217,22 @@
           "upstream"
         ]
       },
-      "description": "FIFO-буфер, не более 20 записей (§19.1)"
+      "description": "FIFO-буфер"
     },
     "value_analysis": {
       "type": "object",
-      "description": "Результат value-анализа ({} до расчёта) — §8"
+      "description": "Результат value-анализа"
     },
     "time_utc": {
       "type": [
         "string",
         "null"
       ],
-      "description": "Время начала (HH:MM), доп. к date_utc"
+      "description": "Время начала"
     },
     "csv_raw": {
       "type": "object",
-      "description": "Сырые колонки CSV (для history) — §8.5"
+      "description": "Сырые колонки CSV"
     },
     "flags": {
       "type": "object",
@@ -275,25 +270,25 @@
         "A",
         null
       ],
-      "description": "Результат: H (home), D (draw), A (away)"
+      "description": "Результат"
     },
     "created_at": {
       "type": "string",
       "format": "date-time",
-      "description": "ISO 8601 MSK — время создания"
+      "description": "ISO 8601 MSK"
     },
     "updated_at": {
       "type": "string",
       "format": "date-time",
-      "description": "ISO 8601 MSK — время последнего обновления"
+      "description": "ISO 8601 MSK"
     },
     "season": {
       "type": "string",
-      "description": "Сезон (для history, напр. '2526')"
+      "description": "Сезон"
     },
     "league_code": {
       "type": "string",
-      "description": "Код лиги (для history, напр. 'E0')"
+      "description": "Код лиги"
     }
   },
   "additionalProperties": true

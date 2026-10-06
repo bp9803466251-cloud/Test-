@@ -1957,13 +1957,13 @@ if __name__ == "__main__":
     print(f"\nMetrics: {json.dumps(METRICS.report(), indent=2)}")
 
 
-def get_all_fields(canonical_id=None):
+def get_all_fields():
     """Прокси к redis_hub.get_all_fields — §1.4: единый шлюз."""
     rh = _get_redis()
     if not rh:
         return {} if canonical_id else {}
     try:
-        return rh.get_all_fields(canonical_id) if canonical_id else rh.get_all_fields()
+        return rh.get_all_fields() if canonical_id else rh.get_all_fields()
     except Exception as e:
         logger.error("get_all_fields error: %s", e)
         return {}

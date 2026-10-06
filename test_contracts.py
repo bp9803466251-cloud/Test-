@@ -110,7 +110,7 @@ def test_config():
 
     config = load_config()
     assert "redis" in config, "redis config exists"
-    assert "collectors" in config, "collectors config exists"
+    assert "features" in config, "collectors config exists"
     assert "cleanup" in config, "cleanup config exists"
     assert isinstance(is_feature_enabled("graceful_shutdown"), bool), "graceful_shutdown returns bool"
     assert isinstance(is_feature_enabled("auto_migrate"), bool), "auto_migrate returns bool"
@@ -397,7 +397,7 @@ def test_metrics():
     # collect_metrics — базовая проверка
     metrics_data = collect_metrics()
     assert "timestamp" in metrics_data, "metrics has timestamp"
-    assert "counters" in metrics_data, "metrics has counters"
+    assert "matches_total" in metrics_data, "metrics has counters"
 
     # save_metrics — базовая проверка
     dashboard = save_metrics({

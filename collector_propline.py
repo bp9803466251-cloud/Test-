@@ -352,8 +352,7 @@ def collect_propline() -> Dict[str, Any]:
         "deduped": deduped,
         "run_id": run_id,
     }
-    if not dry_run:
-        save_meta(COLLECTOR_NAME, **meta)
+    save_meta(COLLECTOR_NAME, **meta)  # FIX-AUDIT: save_meta always (M-3)
 
     log_event("propline", "INFO", "Collection complete")
 
