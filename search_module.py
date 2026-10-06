@@ -3,20 +3,22 @@ search_module.py — Модуль поиска и нормализации ко�
 Импортирует clean_team_name из team_registry (§19.2).
 Устраняет циклическую зависимость между hub и search.
 
-v8.11-patched:
+v9.3-audited:
   FIX-1: build_canonical_id fallback — None → локальная реализация
   FIX-2: normalize_team_name re-export для backward compat коллекторов
   FIX-3: search_teams — fuzzy fallback при 0 точных + 0 partial совпадений
   FIX-4: find_match_candidates — reverse (home↔away) fallback
   FIX-5: __version__ в __all__ исправлен (был строкой, не переменной)
   FIX-6: NullHandler добавлен (§20.5)
+  FIX-7: save_search_results re-export из хаба (backward compat) — v9.3
+  FIX-8: version bumped to 9.3-audited
 """
 
 import logging
 
 from team_registry import clean_team_name, TEAM_ALIASES
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -46,6 +48,19 @@ except ImportError:
     normalize_team_name = clean_team_name
 
 
+# save_search_results — re-export из хаба (backward compat)
+# Гайд §14: save_search_results() — функция хаба, но старый код может
+# импортировать её из search_module. Ленивый импорт исключает циклическую зависимость.
+def save_search_results(results, namespace=""):
+    """Реэкспорт save_search_results из gatekeeper_hub (lazy import)."""
+    try:
+        from gatekeeper_hub import save_search_results as _hub_save
+        return _hub_save(results, namespace=namespace)
+    except ImportError:
+        logger.warning("gatekeeper_hub недоступен — save_search_results noop")
+        return False
+
+
 # Реэкспорт для удобства (коллекторы импортируют из search_module)
 __all__ = [
     "clean_team_name",
@@ -53,6 +68,7 @@ __all__ = [
     "TEAM_ALIASES",
     "search_teams",
     "find_match_candidates",
+    "save_search_results",
     "build_canonical_id",
     "__version__",
 ]

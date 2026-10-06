@@ -7,7 +7,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 __all__ = ["collect_metrics", "save_metrics", "__version__"]
 
 logger = logging.getLogger("metrics")
@@ -26,6 +26,10 @@ def collect_metrics(hub=None):
         "timestamp": now_msk(),
         "matches_total": 0,
         "matches_with_odds": 0,
+        "matches_with_predictions": 0,
+        "matches_with_h2h": 0,
+        "matches_with_stats": 0,
+        "matches_with_value": 0,
         "collectors_active": 0,
         "errors_total": 0,
     }
@@ -41,11 +45,25 @@ def collect_metrics(hub=None):
         matches = hub.get_all_matches()
         metrics["matches_total"] = len(matches) if matches else 0
         
-        with_odds = 0
+        with_odds = with_pred = with_h2h = with_stats = with_value = 0
         for cid, data in (matches or {}).items():
-            if isinstance(data, dict) and data.get("odds"):
-                with_odds += 1
+            if isinstance(data, dict):
+                if data.get("odds"):
+                    with_odds += 1
+                if data.get("predictions"):
+                    with_pred += 1
+                if data.get("h2h"):
+                    with_h2h += 1
+                if data.get("stats"):
+                    with_stats += 1
+                va = data.get("value_analysis", {})
+                if va and va.get("has_value"):
+                    with_value += 1
         metrics["matches_with_odds"] = with_odds
+        metrics["matches_with_predictions"] = with_pred
+        metrics["matches_with_h2h"] = with_h2h
+        metrics["matches_with_stats"] = with_stats
+        metrics["matches_with_value"] = with_value
     except Exception as e:
         logger.error("collect_metrics error: %s", e)
     
@@ -54,7 +72,20 @@ def collect_metrics(hub=None):
         collectors = ["sharpapi", "odds_api", "bzzoiro", "propline", "football_data", "main"]
         active = 0
         for c in collectors:
-            meta = hub.get_from_cache(f"{c}:meta")
+            meta = None
+            # Try hash field first (get_from_cache = HGET)
+            try:
+                meta = hub.get_from_cache(f"{c}:meta")
+            except Exception:
+                pass
+            # Fallback: separate key (get_key = GET)
+            if not meta:
+                try:
+                    raw = hub.get_key(f"{c}:meta")
+                    if raw and isinstance(raw, str):
+                        meta = json.loads(raw)
+                except Exception:
+                    pass
             if meta and isinstance(meta, dict) and meta.get("last_run"):
                 active += 1
         metrics["collectors_active"] = active

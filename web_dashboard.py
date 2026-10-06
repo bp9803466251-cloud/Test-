@@ -36,7 +36,7 @@ from urllib.parse import urlparse, parse_qs
 logger = logging.getLogger("web_dashboard")
 logger.addHandler(logging.NullHandler())
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 __all__ = ["run_server", "DashboardHandler", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
