@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper-AI v811-patched — Main Pipeline (Dashboard + Telegram)
+Gatekeeper-AI v9.3-audited — Main Pipeline (Dashboard + Telegram)
 Value engine + Telegram-дашборд по стандарту §12.
 
 Патчи v8.10:
@@ -110,7 +110,7 @@ except ImportError:
 logger = logging.getLogger("main")
 logger.addHandler(logging.NullHandler())
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 __all__ = ["main", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
@@ -212,15 +212,16 @@ def _ecosystem_line() -> str:
     markers = [f"Ecosystem{eco_marker}", f"Redis{redis_marker}"]
     # FIX-AUDIT: Skip get_from_cache когда Redis недоступен
     if not _redis_available:
-        markers.extend(["Bzzoiro-", "Sharp-", "PropLine-", "OddsAPI-"])
-        # FIX-AUDIT-v9.3: Flush+ removed in v2.0 dashboard
-    return " | ".join(markers)
-    # FIX-12: {collector}:meta format (was meta:{collector})
+        markers.extend(["Bzzoiro-", "Sharp-", "PropLine-", "OddsAPI-", "FootballData-"])
+        return " | ".join(markers)
+    # v9.3-audited: FIX dead code — early return убран, цикл выполняется
+    # FIX-12: {collector}:meta format
     for name, meta_key in [
         ("Bzzoiro", "bzzoiro:meta"),
         ("Sharp", "sharpapi:meta"),
         ("PropLine", "propline:meta"),
         ("OddsAPI", "odds_api:meta"),
+        ("FootballData", "football_data:meta"),
     ]:
         try:
             meta = get_from_cache(meta_key)
@@ -230,7 +231,6 @@ def _ecosystem_line() -> str:
                 markers.append(f"{name}-")
         except Exception:
             markers.append(f"{name}-")
-    # FIX-AUDIT-v9.3: Flush+ removed in v2.0 dashboard
     return " | ".join(markers)
 
 
@@ -244,6 +244,7 @@ def _last_module() -> str:
         ("Bzzoiro", "bzzoiro:meta"),
         ("PropLine", "propline:meta"),
         ("OddsAPI", "odds_api:meta"),
+        ("FootballData", "football_data:meta"),
     ]
     latest = None
     latest_dt = None
@@ -414,7 +415,7 @@ def main():
     global _redis_available
 
     logger.info("=" * 60)
-    logger.info("Gatekeeper-AI Pipeline v8.11-patched")
+    logger.info("Gatekeeper-AI Pipeline v9.3-audited")
     logger.info(f"Время: {datetime.now(MSK_TZ).strftime('%Y-%m-%d %H:%M:%S MSK')}")
     logger.info("=" * 60)
 
