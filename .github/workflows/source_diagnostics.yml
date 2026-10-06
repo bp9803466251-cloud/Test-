@@ -12,7 +12,9 @@ on:
           - sources
           - redis
           - matches
+          - indexes
           - errors
+          - sample
         default: full
 
 permissions:
@@ -37,6 +39,11 @@ jobs:
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+      SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
+      BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY || '' }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY || '' }}
+      PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY || '' }}
+      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY || '' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       GITHUB_REPOSITORY: ${{ github.repository }}
@@ -84,7 +91,4 @@ jobs:
       - name: Send Telegram Alert on Failure
         if: failure()
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_GROUP_ID}" \
-            -d text="❌ Source Diagnostics FAILED at $(date '+%Y-%m-%d %H:%M:%S UTC')" \
-            -d parse_mode="HTML" || true
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="❌ Source Diagnostics FAILED at $(date '+%Y-%m-%d %H:%M:%S UTC')"             -d parse_mode="HTML" || true
