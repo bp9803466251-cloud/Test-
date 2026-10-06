@@ -1,17 +1,21 @@
 name: CI Tests
 
+# FIX-AUDIT-v9.3: push/pull_request → workflow_dispatch only (§1.2 — no auto triggers)
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+  workflow_dispatch:
+
+# FIX-AUDIT-v9.3: PYTHON_VERSION in workflow-level env (consistency)
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: "1"
 
 permissions:
   contents: read
 
+# FIX-AUDIT-v9.3: concurrency.group → gatekeeper-redis, cancel-in-progress → false (§13)
 concurrency:
-  group: ci-tests
-  cancel-in-progress: true
+  group: gatekeeper-redis
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -21,7 +25,6 @@ jobs:
     env:
       GATEKEEPER_ENV: test
       GK_CONFIG_FILE: gatekeeper_config.yaml
-      PYTHONUNBUFFERED: "1"
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
@@ -35,7 +38,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # FIX-AUDIT-v9.3: use env.PYTHON_VERSION instead of hardcoded '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
       - name: Install dependencies
@@ -89,11 +93,13 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+          # FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID instead of TELEGRAM_GROUP_ID (§13)
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
         run: |
           MESSAGE="🔴 CI Tests FAILED in ${{ github.repository }}"
           curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_GROUP_ID}" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "text=${MESSAGE}" \
             -d "parse_mode=HTML" || true
+            
