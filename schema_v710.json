@@ -1,19 +1,12 @@
 {
   "version": "v710",
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "GatekeeperAI Match Schema v710",
   "type": "object",
   "required": [
     "canonical_id",
-    "home_team",
-    "away_team",
     "home_clean",
     "away_clean",
-    "competition",
-    "country",
     "date_utc",
     "status",
-    "version",
     "schema_version"
   ],
   "properties": {
@@ -22,12 +15,10 @@
       "minLength": 1
     },
     "home_team": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     },
     "away_team": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     },
     "home_clean": {
       "type": "string",
@@ -37,60 +28,32 @@
       "type": "string",
       "minLength": 1
     },
+    "date_utc": {
+      "type": "string"
+    },
     "competition": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     },
     "country": {
-      "type": "string",
-      "minLength": 1
-    },
-    "date_utc": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     },
     "status": {
       "type": "string",
       "enum": [
         "scheduled",
         "live",
-        "completed"
+        "completed",
+        "cancelled",
+        "postponed"
       ]
-    },
-    "score": {
-      "type": [
-        "object",
-        "null"
-      ],
-      "properties": {
-        "home": {
-          "type": [
-            "integer",
-            "string"
-          ]
-        },
-        "away": {
-          "type": [
-            "integer",
-            "string"
-          ]
-        }
-      }
-    },
-    "version": {
-      "type": "integer",
-      "minimum": 1
     },
     "schema_version": {
-      "type": "string",
-      "enum": [
-        "v710"
-      ]
+      "type": "string"
     },
-    "odds": {
+    "score": {
       "type": "object"
     },
-    "predictions": {
+    "odds": {
       "type": "object"
     },
     "stats": {
@@ -99,73 +62,20 @@
     "h2h": {
       "type": "object"
     },
-    "source_ids": {
+    "predictions": {
       "type": "object"
-    },
-    "source_map": {
-      "type": "object"
-    },
-    "flags": {
-      "type": "object"
-    },
-    "half_time_score": {
-      "type": [
-        "object",
-        "null"
-      ]
-    },
-    "full_time_result": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "referee": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "season": {
-      "type": "string"
-    },
-    "league_code": {
-      "type": "string"
-    },
-    "sources": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "section_history": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "section": {
-            "type": "string"
-          },
-          "source": {
-            "type": "string"
-          },
-          "updated_at": {
-            "type": "string"
-          }
-        }
-      }
     },
     "value_analysis": {
       "type": "object"
     },
-    "time_utc": {
-      "type": [
-        "string",
-        "null"
-      ]
+    "section_history": {
+      "type": "array"
     },
-    "csv_raw": {
-      "type": "object"
+    "sources": {
+      "type": "array"
+    },
+    "source": {
+      "type": "string"
     },
     "created_at": {
       "type": "string"
@@ -173,6 +83,5 @@
     "updated_at": {
       "type": "string"
     }
-  },
-  "additionalProperties": true
+  }
 }
