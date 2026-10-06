@@ -18,14 +18,16 @@ on:
 permissions:
   contents: read
 
+# FIX-AUDIT-v9.3: concurrency.group → gatekeeper-redis (§13)
 concurrency:
-  group: source-diagnostics
+  group: gatekeeper-redis
   cancel-in-progress: false
 
 jobs:
   run-diagnostics:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # FIX-AUDIT-v9.3: timeout 10 → 5 (§16: diagnostics = read-only, 5 min)
+    timeout-minutes: 5
 
     env:
       PYTHON_VERSION: "3.11"
@@ -35,13 +37,10 @@ jobs:
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-      BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY }}
-      SHARPAPI_API_KEY: ${{ secrets.SHARPAPI_API_KEY }}
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
-      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+      # FIX-AUDIT-v9.3: removed API keys — diagnostics is read-only (§16)
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+      # FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID instead of TELEGRAM_GROUP_ID (§13)
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
       GITHUB_REPOSITORY: ${{ github.repository }}
 
     steps:
@@ -87,5 +86,8 @@ jobs:
       - name: Send Telegram Alert on Failure
         if: failure()
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="❌ Source Diagnostics FAILED at $(date '+%Y-%m-%d %H:%M:%S UTC')"             -d parse_mode="HTML" || true
-          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="❌ Source Diagnostics FAILED at $(date '+%Y-%m-%d %H:%M:%S UTC')" \
+            -d parse_mode="HTML" || true
+            
