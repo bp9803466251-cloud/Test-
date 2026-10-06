@@ -1,4 +1,4 @@
-# GatekeeperAI v8.11-patched — dependencies
+# GatekeeperAI v9.3-audited — dependencies
 # §1.3: No requests — urllib.request only for Redis transport
 # curl_cffi for collector HTTP with browser impersonation (§1.24)
 curl_cffi>=0.7.0,<1.0
