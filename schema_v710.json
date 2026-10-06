@@ -1,8 +1,8 @@
 {
+  "version": "v710",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GatekeeperAI Match Object v710",
   "description": "Канонический формат матча GatekeeperAI (schema v710, §19.1)",
-  "version": "v710",
   "type": "object",
   "required": [
     "canonical_id",
@@ -129,42 +129,34 @@
             "closing": {
               "type": "object"
             },
-            "home": {
-              "type": [
-                "number",
-                "null"
-              ]
-            },
-            "draw": {
-              "type": [
-                "number",
-                "null"
-              ]
-            },
-            "away": {
-              "type": [
-                "number",
-                "null"
-              ]
-            },
             "sources": {
               "type": "array",
-              "description": "Источники коэффициентов (строки или объекты)",
-              "items": {}
-            },
-            "upstream": {
-              "type": "string"
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string"
+                  },
+                  "upstream": {
+                    "type": "string"
+                  },
+                  "price": {
+                    "type": "object"
+                  },
+                  "timestamp": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "price"
+                ]
+              }
             }
           }
-        },
-        "ou25": {
-          "type": "object"
-        },
-        "ah": {
-          "type": "object"
-        },
-        "btts": {
-          "type": "object"
         }
       }
     },
@@ -177,11 +169,7 @@
       "description": "Статистика матча"
     },
     "h2h": {
-      "type": [
-        "object",
-        "array",
-        "null"
-      ],
+      "type": "object",
       "description": "Head-to-head"
     },
     "source_ids": {
@@ -226,9 +214,9 @@
         "required": [
           "section",
           "source",
-          "updated_at"
-        ],
-        "description": "FIFO-буфер (upstream опционален)"
+          "updated_at",
+          "upstream"
+        ]
       },
       "description": "FIFO-буфер"
     },
@@ -302,10 +290,6 @@
     "league_code": {
       "type": "string",
       "description": "Код лиги"
-    },
-    "upstream": {
-      "type": "string",
-      "description": "Upstream-источник (§1.20)"
     }
   },
   "additionalProperties": true
