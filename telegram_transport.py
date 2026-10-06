@@ -22,7 +22,7 @@ import urllib.error
 import json
 from typing import List, Dict, Any
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 
 __all__ = [
     "split_html_safe",
@@ -167,7 +167,7 @@ def normalize_dashboard_text(dashboard_text: str) -> str:
     )
 
     # Добавление пробелов: после маркера перед номером и вокруг всех |
-    dashboard_text = re.sub(r"\u2794(\d)", "\u2794 \\1", dashboard_text)
+    dashboard_text = re.sub("\u2794(\\d)", "\u2794 \\1", dashboard_text)
     dashboard_text = re.sub(r"\s*\|\s*", " | ", dashboard_text)
 
     # FIX: [^|\n<] — не заходим внутрь HTML-тегов.

@@ -1,4 +1,6 @@
-# GatekeeperAI Configuration v9.3-audited
+# GatekeeperAI Configuration (§20.3)
+# Env-переменные только для секретов. Все параметры — здесь.
+
 features:
   graceful_shutdown: true
   auto_migrate: true
@@ -7,32 +9,41 @@ features:
   safe_mode: true
 
 value_engine:
-  value_threshold: 0.03
+  threshold: 0.03
   warm_threshold: 0.015
 
 collectors:
   sharpapi:
-    rate_limit_delay: 6
-    max_pages: 60
-  odds_api:
     rate_delay: 1.0
+    max_retries: 3
+  odds_api:
+    rate_delay: 0.5
+    max_retries: 3
   bzzoiro:
     rate_delay: 2.0
+    max_retries: 2
   propline:
-    rate_delay: 1.5
-  football_data:
-    history_days: 0
+    rate_delay: 1.0
+    max_retries: 3
+
+cleanup:
+  match_ttl_hours: 48
+  index_lookback_days: 7
+  index_lookahead_days: 7
+  auto_migrate: true
+  owner: main
 
 redis:
   timeout: 30
-  circuit_breaker_threshold: 10
-  circuit_breaker_recovery: 60
+  cb_failure_threshold: 10
+  cb_recovery_timeout: 60
   hash_name: GatekeeperAI
   max_pipeline: 10
 
 telegram:
-  chunk_limit: 4000
+  timeout: 10
   max_retries: 3
+  chunk_limit: 4000
 
 upstream_map:
   sharpapi: betradar

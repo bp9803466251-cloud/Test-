@@ -972,15 +972,11 @@ def clean_team_name(name: str) -> str:
 
     try:
         # FIX-AUDIT: Нормализация диакритиков (Köln -> koln, Malmö -> malmo)
-        # FIX: ø, æ, ð, þ, ß не декомпозируются через NFD — ручной маппинг
+        # FIX-CI: ø, æ, ð, þ, ß не декомпозируются через NFD — ручной маппинг
         import unicodedata
         _special = {"ø": "o", "æ": "ae", "ð": "d", "þ": "th", "ß": "ss",
-                    "Ö": "O", "Ü": "U", "Ä": "A", "É": "E", "È": "E",
-                    "Ñ": "N", "Ç": "C", "Á": "A", "Ó": "O", "Í": "I",
-                    "Ú": "U", "Ñ": "N"}
-        name_fixed = name
-        for k, v in _special.items():
-            name_fixed = name_fixed.replace(k, v)
+                    "Ø": "O", "Æ": "AE", "Ð": "D", "Þ": "TH", "Œ": "OE", "œ": "oe"}
+        name_fixed = "".join(_special.get(c, c) for c in name)
         normalized = unicodedata.normalize("NFD", name_fixed)
         key = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
         key = key.strip().lower()
@@ -1030,8 +1026,11 @@ def build_canonical_id(home: str, away: str, date_str: str) -> str:
     date_str — ISO 8601 или YYYY-MM-DD.
     """
     try:
-        h = clean_team_name(home) or home.strip().lower().replace(" ", "_")
-        a = clean_team_name(away) or away.strip().lower().replace(" ", "_")
+        h = clean_team_name(home) or home.strip().lower().replace(" ", "_") if home else ""
+        a = clean_team_name(away) or away.strip().lower().replace(" ", "_") if away else ""
+        if not h or not a:
+            logger.warning("build_canonical_id: empty team name(s)")
+            return ""
         # Извлекаем YYYYMMDD из date_str
         d = date_str.strip() if date_str else ""
         if "T" in d:

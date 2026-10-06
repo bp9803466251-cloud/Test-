@@ -1280,7 +1280,8 @@ def calc_brier_score(pred_probs: List[float], actual_outcome: int) -> float:
 
 
 def calc_rps(pred_probs: List[float], actual_outcome: int) -> float:
-    """Ranked Probability Score for ordinal markets."""
+    """Ranked Probability Score for ordinal markets.
+    Normalized by (K-1) where K=3 outcomes → divide by 2."""
     cum_pred = []
     cum_actual = []
     sp = sa = 0.0
@@ -1289,7 +1290,8 @@ def calc_rps(pred_probs: List[float], actual_outcome: int) -> float:
         sa += 1.0 if i == actual_outcome else 0.0
         cum_pred.append(sp)
         cum_actual.append(sa)
-    return sum((cum_pred[i] - cum_actual[i]) ** 2 for i in range(3))
+    raw = sum((cum_pred[i] - cum_actual[i]) ** 2 for i in range(3))
+    return raw / (3 - 1)  # normalize by (K-1)
 
 
 def backtest_match(prediction: Dict, actual_result: Dict) -> Dict[str, Any]:

@@ -16,7 +16,7 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 __all__ = ["BaseCollector", "__version__"]
 
 logger = logging.getLogger("base_collector")

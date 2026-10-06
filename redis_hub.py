@@ -46,7 +46,7 @@ from redis_config import (
 )
 
 # ── Константы ──────────────────────────────────────────────
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 ENVELOPE_VERSION = "v700-prod"
 HASH_NAME = REDIS_HASH_NAME
 REDIS_TIMEOUT = _CFG_TIMEOUT

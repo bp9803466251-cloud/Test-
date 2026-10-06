@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 logger = logging.getLogger("gatekeeper_config")
 logger.addHandler(logging.NullHandler())
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 __all__ = [
     "load_config", "reload_config", "register_reload_callback",
     "is_feature_enabled", "should_run_cleanup", "get_env", "get_config_errors",

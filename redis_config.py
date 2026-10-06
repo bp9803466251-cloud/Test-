@@ -27,7 +27,7 @@ v8.11-patched:
 import os
 import logging
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 
 __all__ = [
     "REDIS_REST_URL",
