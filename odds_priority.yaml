@@ -6,7 +6,7 @@
 # Часть 1: приоритеты источников (коллекторы) и upstream — для gatekeeper_hub._load_odds_priority()
 # Часть 2: csv_columns — маппинг колонок CSV для football_data_to_redis.py
 #
-# v8.11-patched:
+# v9.3-audited:
 #   FIX-1: btts — убраны дублирующие O/U колонки, добавлены реальные BTTS колонки
 #   FIX-2: ah — P>2.5/P<2.5 это O/U, не Asian Handicap. Заменены на реальные AH колонки
 #   FIX-3: ou25 — BbMx>2.5/BbMx<2.5 это BTTS-макс, не O/U. Заменены на Avg>2.5/Avg<2.5
@@ -155,3 +155,4 @@ csv_columns:
       name: bet365_OU
       columns: [B365>2.5, B365<2.5]
       type: soft
+      
