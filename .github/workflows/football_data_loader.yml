@@ -30,11 +30,17 @@ on:
         required: false
         default: false
 
+# FIX-AUDIT-v9.3: PYTHON_VERSION in workflow-level env (consistency)
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: "1"
+
 permissions:
   contents: read
 
+# FIX-AUDIT-v9.3: concurrency.group → gatekeeper-redis (§13)
 concurrency:
-  group: football-data-loader
+  group: gatekeeper-redis
   cancel-in-progress: false
 
 jobs:
@@ -43,7 +49,6 @@ jobs:
     timeout-minutes: 180
 
     env:
-      PYTHON_VERSION: '3.11'
       SEASONS_INPUT: ${{ github.event.inputs.seasons || '' }}
       LEAGUES_INPUT: ${{ github.event.inputs.leagues || '' }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days || '0' }}
@@ -55,10 +60,10 @@ jobs:
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
+      # FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID instead of TELEGRAM_GROUP_ID (§13)
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID || secrets.TELEGRAM_CHAT_ID }}
       GK_CONFIG_FILE: gatekeeper_config.yaml
       FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
-      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -78,7 +83,7 @@ jobs:
       - name: Flush old keys (optional)
         if: ${{ github.event.inputs.flush == 'true' }}
         run: |
-          echo "Flushing football_data:* and history:* keys..."
+          echo "Flushing football_data:* keys..."
           python -c "
           import os, json, urllib.request
           URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '').rstrip('/')
@@ -99,7 +104,8 @@ jobs:
               )
               with urllib.request.urlopen(req, timeout=30) as r:
                   return json.loads(r.read()).get('result')
-          patterns = ['football_data:*', 'history:match:*', 'history:league:*']
+          # FIX-AUDIT-v9.3: only flush football_data:* — NOT history:match:* or history:league:* (§1.7d)
+          patterns = ['football_data:*']
           total_deleted = 0
           for pattern in patterns:
               cursor = '0'
@@ -192,7 +198,8 @@ jobs:
                   total += int(cnt)
           print(f'Total matches across leagues: {total}')
 
-          meta_raw = cmd('GET', 'meta:football_data')
+          # FIX-AUDIT-v9.3: football_data:meta instead of meta:football_data (§5)
+          meta_raw = cmd('GET', 'football_data:meta')
           if meta_raw:
               try:
                   meta_all = json.loads(meta_raw)
@@ -229,6 +236,6 @@ jobs:
         run: |
           MSG="❌ Football Data Loader FAILED%0A%0ARun: ${{ github.run_id }}%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_GROUP_ID}" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MSG}" || true
             
