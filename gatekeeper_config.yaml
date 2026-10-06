@@ -1,5 +1,6 @@
 # GatekeeperAI v8.11-patched — Configuration (§20.3)
-version: "v811"
+# FIX-AUDIT-v9.3: collector_upstream → upstream_map, value_threshold → value_engine.threshold
+version: "v9.3"
 
 # Pipeline settings
 pipeline_batch_size: 50
@@ -14,16 +15,17 @@ features:
   value_bets: true
   safe_mode: true
 
-# Collector upstream mapping (§19.2)
-collector_upstream:
+# FIX-AUDIT-v9.3: upstream_map (was collector_upstream) — соответствует гайду §20.3
+upstream_map:
   sharpapi: betradar
   odds_api: betradar
   bzzoiro: opta
   propline: pinnacle
   football_data: bet365
 
-# Value engine
-value_threshold: 0.03
+# FIX-AUDIT-v9.3: value_threshold перемещён в value_engine — соответствует гайду §20.3
+value_engine:
+  threshold: 0.03
 
 # Cleanup settings
 cleanup:
@@ -42,3 +44,4 @@ redis:
 circuit_breaker:
   failure_threshold: 10
   recovery_timeout: 60
+  
