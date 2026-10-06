@@ -3,10 +3,11 @@
   "type": "object",
   "required": [
     "canonical_id",
-    "home_clean",
-    "away_clean",
+    "home",
+    "away",
     "date_utc",
     "status",
+    "competition",
     "schema_version"
   ],
   "properties": {
@@ -14,27 +15,21 @@
       "type": "string",
       "minLength": 1
     },
-    "home_team": {
-      "type": "string"
+    "home": {
+      "type": "string",
+      "minLength": 1
     },
-    "away_team": {
-      "type": "string"
+    "away": {
+      "type": "string",
+      "minLength": 1
     },
     "home_clean": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     },
     "away_clean": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     },
     "date_utc": {
-      "type": "string"
-    },
-    "competition": {
-      "type": "string"
-    },
-    "country": {
       "type": "string"
     },
     "status": {
@@ -43,15 +38,38 @@
         "scheduled",
         "live",
         "completed",
-        "cancelled",
-        "postponed"
+        "postponed",
+        "cancelled"
       ]
     },
-    "schema_version": {
+    "competition": {
+      "type": "string"
+    },
+    "league_code": {
+      "type": "string"
+    },
+    "country": {
+      "type": "string"
+    },
+    "season": {
       "type": "string"
     },
     "score": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "home": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "away": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
     },
     "odds": {
       "type": "object"
@@ -59,22 +77,25 @@
     "stats": {
       "type": "object"
     },
-    "h2h": {
+    "predictions": {
       "type": "object"
     },
-    "predictions": {
+    "h2h": {
       "type": "object"
     },
     "value_analysis": {
       "type": "object"
     },
-    "section_history": {
-      "type": "array"
-    },
     "sources": {
-      "type": "array"
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "source": {
+      "type": "string"
+    },
+    "schema_version": {
       "type": "string"
     },
     "created_at": {
@@ -82,6 +103,10 @@
     },
     "updated_at": {
       "type": "string"
+    },
+    "section_history": {
+      "type": "object"
     }
-  }
+  },
+  "additionalProperties": true
 }
