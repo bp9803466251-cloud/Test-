@@ -388,6 +388,10 @@ def batch_evaluate(
     """
     results: Dict[str, Optional[float]] = {}
 
+    # FIX-AUDIT-v9.3: Defensive dict conversion — get_matches_by_date_range мог вернуть list
+    if isinstance(matches, list):
+        matches = {m.get("canonical_id", ""): m for m in matches if isinstance(m, dict)}
+
     for cid, match in matches.items():
         if is_shutdown_requested():
             logger.info("Graceful shutdown — batch_evaluate прерван")
@@ -412,6 +416,10 @@ def batch_evaluate_full(
     Error isolation: try-except вокруг каждого матча (§1.25).
     """
     results: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    # FIX-AUDIT-v9.3: Defensive dict conversion — get_matches_by_date_range мог вернуть list
+    if isinstance(matches, list):
+        matches = {m.get("canonical_id", ""): m for m in matches if isinstance(m, dict)}
 
     for cid, match in matches.items():
         if is_shutdown_requested():

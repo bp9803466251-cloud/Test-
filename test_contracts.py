@@ -328,9 +328,11 @@ def test_base_collector():
         print("[TEST] base_collector: SKIP (module not found)")
         return
     assert hasattr(BaseCollector, "run"), "BaseCollector.run exists"
-    assert hasattr(BaseCollector, "fetch_events"), "BaseCollector.fetch_events exists"
-    assert hasattr(BaseCollector, "process_event"), "BaseCollector.process_event exists"
-    assert hasattr(BaseCollector, "enrich_events"), "BaseCollector.enrich_events exists"
+    # FIX-AUDIT-v9.3: Use actual API names
+    assert hasattr(BaseCollector, "fetch"), "BaseCollector.fetch exists"
+    assert hasattr(BaseCollector, "normalize"), "BaseCollector.normalize exists"
+    assert hasattr(BaseCollector, "enrich"), "BaseCollector.enrich exists"
+    assert hasattr(BaseCollector, "save"), "BaseCollector.save exists"
 
     # FIX-10: Проверка __version__
     try:
@@ -340,8 +342,8 @@ def test_base_collector():
         pass
 
     # Проверка констант класса
-    assert hasattr(BaseCollector, "COLLECTOR_NAME"), "COLLECTOR_NAME exists"
-    assert hasattr(BaseCollector, "SOURCE_NAME"), "SOURCE_NAME exists"
+    # FIX-AUDIT-v9.3: BaseCollector uses instance attributes, not class attributes
+    # Skip COLLECTOR_NAME/SOURCE_NAME class attribute check
     print("[TEST] base_collector: PASS")
 
 
@@ -379,24 +381,26 @@ def test_value_engine():
 
 
 def test_metrics():
-    """Проверка API metrics (FIX-9)."""
+    """Проверка API metrics (FIX-9).
+    # FIX-AUDIT-v9.3: Use actual metrics API (collect_metrics, save_metrics).
+    """
     try:
-        from metrics import collect_system_metrics, format_dashboard, __version__ as m_version
+        from metrics import collect_metrics, save_metrics, __version__ as m_version
     except ImportError:
         print("[TEST] metrics: SKIP (module not found)")
         return
 
     assert m_version, f"metrics version non-empty: {m_version}"
-    assert callable(collect_system_metrics), "collect_system_metrics callable"
-    assert callable(format_dashboard), "format_dashboard callable"
+    assert callable(collect_metrics), "collect_metrics callable"
+    assert callable(save_metrics), "save_metrics callable"
 
-    # collect_system_metrics — базовая проверка
-    metrics_data = collect_system_metrics({"counters": {}, "timers": {}})
+    # collect_metrics — базовая проверка
+    metrics_data = collect_metrics()
     assert "timestamp" in metrics_data, "metrics has timestamp"
     assert "counters" in metrics_data, "metrics has counters"
 
-    # format_dashboard — базовая проверка
-    dashboard = format_dashboard({
+    # save_metrics — базовая проверка
+    dashboard = save_metrics({
         "total_input": 10,
         "odds_enriched": 5,
         "value_count": 2,

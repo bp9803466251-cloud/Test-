@@ -3,6 +3,7 @@
 metrics.py — Сбор метрик GatekeeperAI v8.11-patched.
 Использует set_key (raw JSON) для system:health (§9.1).
 """
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -48,9 +49,15 @@ def collect_metrics(hub=None):
     except Exception as e:
         logger.error("collect_metrics error: %s", e)
     
+    # FIX-AUDIT-v9.3: Считаем активные коллекторы по meta ключам (не MODULE_REGISTRY)
     try:
-        registry = getattr(hub, "MODULE_REGISTRY", {})
-        metrics["collectors_active"] = len(registry)
+        collectors = ["sharpapi", "odds_api", "bzzoiro", "propline", "football_data", "main"]
+        active = 0
+        for c in collectors:
+            meta = hub.get_from_cache(f"{c}:meta")
+            if meta and isinstance(meta, dict) and meta.get("last_run"):
+                active += 1
+        metrics["collectors_active"] = active
     except Exception:
         pass
     
@@ -64,7 +71,7 @@ def save_metrics(metrics=None):
     
     try:
         import gatekeeper_hub as hub
-        hub.set_key("system:health", __import__("json").dumps(metrics))
+        hub.set_key("system:health", json.dumps(metrics))
         logger.info("Metrics saved to system:health")
     except Exception as e:
         logger.error("save_metrics error: %s", e)
@@ -74,4 +81,4 @@ def save_metrics(metrics=None):
 
 if __name__ == "__main__":
     m = collect_metrics()
-    print(__import__("json").dumps(m, indent=2))
+    print(json.dumps(m, indent=2))

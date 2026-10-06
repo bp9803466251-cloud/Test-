@@ -121,7 +121,8 @@ except ImportError:
     VALUE_THRESHOLD = float(os.environ.get("VALUE_THRESHOLD", "") or os.environ.get("VALUE_BET_THRESHOLD", "0.03"))
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_GROUP_ID", "") or os.environ.get("TELEGRAM_CHAT_ID", "")
+# FIX-AUDIT-v9.3: TELEGRAM_CHAT_ID first (§13), TELEGRAM_GROUP_ID — backward compat
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "") or os.environ.get("TELEGRAM_GROUP_ID", "")
 # FIX-14: Используем TELEGRAM_CHUNK_LIMIT из telegram_transport
 TG_MAX_CHARS = TELEGRAM_CHUNK_LIMIT
 
@@ -203,12 +204,9 @@ def _ecosystem_line() -> str:
     # FIX-AUDIT: Skip get_from_cache когда Redis недоступен
     if not _redis_available:
         markers.extend(["Bzzoiro-", "Sharp-", "PropLine-", "OddsAPI-"])
-        if os.environ.get("SHARPAPI_FLUSH_OLD") == "1":
-            markers.append("Flush\U0001f9f9")
-        else:
-            markers.append("Flush+")
-        return " | ".join(markers)
-    # FIX-12: meta:{collector} вместо {collector}:meta
+        # FIX-AUDIT-v9.3: Flush+ removed in v2.0 dashboard
+    return " | ".join(markers)
+    # FIX-12: {collector}:meta format (was meta:{collector})
     for name, meta_key in [
         ("Bzzoiro", "bzzoiro:meta"),
         ("Sharp", "sharpapi:meta"),
@@ -223,10 +221,7 @@ def _ecosystem_line() -> str:
                 markers.append(f"{name}-")
         except Exception:
             markers.append(f"{name}-")
-    if os.environ.get("SHARPAPI_FLUSH_OLD") == "1":
-        markers.append("Flush\U0001f9f9")
-    else:
-        markers.append("Flush+")
+    # FIX-AUDIT-v9.3: Flush+ removed in v2.0 dashboard
     return " | ".join(markers)
 
 
@@ -234,7 +229,7 @@ def _ecosystem_line() -> str:
 # Last module (§12)
 # ---------------------------------------------------------------------------
 def _last_module() -> str:
-    # FIX-12: meta:{collector} вместо {collector}:meta
+    # FIX-12: {collector}:meta format (was meta:{collector})
     modules = [
         ("Sharp", "sharpapi:meta"),
         ("Bzzoiro", "bzzoiro:meta"),
@@ -393,8 +388,8 @@ def _format_dashboard(result: dict) -> str:
         f"\U0001f4caOdds:{stats['with_odds']}",
         f"\U0001f525Value:{stats['value_bets']}",
         f"Pred:{stats['with_pred']}",
-        f"H2H:{stats['with_h2h']}",
-        f"Stats:{stats['with_stats']}",
+        f"📚Hist:{stats['with_h2h']}",
+        f"🎯An:{stats['with_stats']}",
         f"\U0001f552{now_str}",
         f"\u2b50{module}",
     ]
@@ -434,7 +429,9 @@ def main():
     logger.info(f"Redis init OK, latency={latency}ms")
 
     # === ШАГ 2: Получение матчей ===
-    matches = get_matches_by_date_range()
+    # FIX-AUDIT-v9.3: Defensive dict conversion
+    _raw = get_matches_by_date_range()
+    matches = _raw if isinstance(_raw, dict) else {m.get("canonical_id", ""): m for m in (_raw or [])}
     logger.info(f"get_matches_by_date_range -> {len(matches)} матчей")
 
     if not matches:

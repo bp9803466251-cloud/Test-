@@ -26,6 +26,11 @@ from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
 )
+# FIX-AUDIT-v9.3: get_all_fields для подсчёта created/updated
+try:
+    from gatekeeper_hub import get_all_fields
+except ImportError:
+    get_all_fields = lambda: {}
 # Direct redis_hub import removed — §1.4: hub is the only gateway
 
 # §20.7: Module registry
@@ -268,8 +273,8 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
 
 
 def collect_sharpapi():
-    # GitHub secret: SHARP_API_KEY (primary). SHARPAPI_API_KEY — legacy fallback.
-    api_key = os.environ.get("SHARPAPI_API_KEY") or os.environ.get("SHARP_API_KEY")
+    # FIX-AUDIT-v9.3: Вариант B — env = secret name (без маппинга)
+    api_key = os.environ.get("SHARP_API_KEY")
     if not api_key:
         logger.error("[SHARPAPI] SHARP_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
@@ -374,8 +379,18 @@ def collect_sharpapi():
     seen_keys = set()
     created = 0
     updated = 0
+    # FIX-AUDIT-v9.3: existing_keys для корректного подсчёта created/updated
+    existing_keys = set(get_all_fields().keys())
 
-    for eid, ev in events_map.items():
+    # FIX-AUDIT-v9.3: сортировка по дате (§1.32) — ближайшие матчи первыми
+    def _event_date_key(item):
+        eid, ev = item
+        dt_str = ev.get("start_time", "")
+        return dt_str or ""
+
+    sorted_events = sorted(events_map.items(), key=_event_date_key)
+
+    for eid, ev in sorted_events:
         # Graceful shutdown — аудит §2.3
         if is_shutdown_requested():
             logger.info(f"[SHARPAPI] Получен SIGTERM, останавливаем запись матчей")
@@ -432,7 +447,11 @@ def collect_sharpapi():
 
         if cid:
             stored += 1
-            created += 1
+            # FIX-AUDIT-v9.3: корректный подсчёт через existing_keys
+            if f"match:{cid}" in existing_keys:
+                updated += 1
+            else:
+                created += 1
 
             # FIX §2.1: odds как float (вместо str)
             # FIX §2.2: idempotency_key в patch_match

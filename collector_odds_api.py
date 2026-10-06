@@ -32,14 +32,11 @@ from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
 )
-# FIX: get_match_any может отсутствовать — fallback на get_match
+# FIX-AUDIT-v9.3: get_all_fields для подсчёта created/updated (вместо get_match_any)
 try:
-    from gatekeeper_hub import get_match_any
+    from gatekeeper_hub import get_all_fields
 except ImportError:
-    try:
-        from gatekeeper_hub import get_match as get_match_any
-    except ImportError:
-        get_match_any = lambda cid: None
+    get_all_fields = lambda: {}
 
 try:
     from gatekeeper_hub import is_shutdown_requested
@@ -56,12 +53,11 @@ except ImportError:
             return func
         return deco
 
+# FIX-AUDIT-v9.3: убраны мёртвые normalize_team_name, build_canonical_id
 try:
-    from team_registry import normalize_team_name, build_canonical_id, clean_team_name
+    from team_registry import clean_team_name
 except ImportError:
     logger.error("team_registry не найден")
-    normalize_team_name = lambda x: x.strip().lower() if x else ""
-    build_canonical_id = lambda h, a, d: f"{h}__{a}__{d[:10].replace('-','')}"
     clean_team_name = lambda name: name.lower().strip().replace(" ", "_") if name else ""
 
 COLLECTOR_NAME = "odds_api"
@@ -162,6 +158,13 @@ def collect_odds_api() -> Dict[str, Any]:
     quota_remaining = "?"
     quota_used = "?"
     error_count = 0
+    # FIX-AUDIT-v9.3: existing_keys вычисляется один раз перед циклом
+    existing_keys = set(get_all_fields().keys())
+
+    # FIX-AUDIT-v9.3: вспомогательная функция для сортировки по дате (§1.32)
+    def _event_date_key(ev):
+        dt_str = ev.get("commence_time", "") or ev.get("start_time", "")
+        return dt_str or ""
 
     for sport in football_sports:
         if is_shutdown_requested():
@@ -185,6 +188,8 @@ def collect_odds_api() -> Dict[str, Any]:
         quota_used = odds_data.get("quota_used", quota_used)
 
         events = odds_data.get("data", [])
+        # FIX-AUDIT-v9.3: сортировка по дате (§1.32)
+        events.sort(key=_event_date_key)
         for ev in events:
             if is_shutdown_requested():
                 logger.info("Graceful shutdown — прерываем цикл матчей")
@@ -275,8 +280,8 @@ def collect_odds_api() -> Dict[str, Any]:
 
                 if cid:
                     stored += 1
-                    existing = get_match_any(cid)
-                    if existing:
+                    # FIX-AUDIT-v9.3: existing_keys вместо get_match_any (§1.32)
+                    if f"match:{cid}" in existing_keys:
                         updated += 1
                     else:
                         created += 1

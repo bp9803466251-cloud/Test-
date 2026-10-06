@@ -138,7 +138,9 @@ def _collect_health() -> dict:
             health["errors"].append(f"init: {e}")
 
         try:
-            matches = hub.get_matches_by_date_range()
+            # FIX-AUDIT-v9.3: Defensive dict conversion
+            _raw = hub.get_matches_by_date_range()
+            matches = _raw if isinstance(_raw, dict) else {m.get("canonical_id", ""): m for m in (_raw or [])}
             health["matches_total"] = len(matches)
             for m in matches.values():
                 if isinstance(m, dict):
@@ -202,7 +204,9 @@ def _collect_matches(limit=50, offset=0) -> dict:
         return {"matches": [], "total": 0, "error": "hub unavailable"}
 
     try:
-        all_matches = hub.get_matches_by_date_range()
+        # FIX-AUDIT-v9.3: Defensive dict conversion
+        _raw = hub.get_matches_by_date_range()
+        all_matches = _raw if isinstance(_raw, dict) else {m.get("canonical_id", ""): m for m in (_raw or [])}
         total = len(all_matches)
         items = []
         for i, (cid, m) in enumerate(all_matches.items()):
@@ -241,7 +245,9 @@ def _collect_quality() -> dict:
     try:
         if not hasattr(hub, "validate_match_quality"):
             return {"error": "validate_match_quality not implemented"}
-        matches = hub.get_matches_by_date_range()
+        # FIX-AUDIT-v9.3: Defensive dict conversion
+        _raw = hub.get_matches_by_date_range()
+        matches = _raw if isinstance(_raw, dict) else {m.get("canonical_id", ""): m for m in (_raw or [])}
         scores = []
         issues_count = 0
         warnings_count = 0

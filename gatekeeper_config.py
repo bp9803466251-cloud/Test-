@@ -135,9 +135,13 @@ def _apply_yaml_values():
     if not _config_cache:
         return
     # VALUE_THRESHOLD (§20.3)
+    # FIX-AUDIT-v9.3: Чтение value_engine.threshold с fallback на верхний уровень
     ve = _config_cache.get("value_engine", {})
     if isinstance(ve, dict):
         threshold = ve.get("threshold")
+        if threshold is None:
+            # Fallback: value_threshold на верхнем уровне (старый формат YAML)
+            threshold = _config_cache.get("value_threshold")
         if threshold is not None:
             try:
                 VALUE_THRESHOLD = float(threshold)
@@ -242,9 +246,12 @@ def get_value_threshold():
 # ═══════════════════════════════════════════════════════════
 
 def get_upstream_map():
-    """Возвращает upstream map из YAML или defaults."""
+    """Возвращает upstream map из YAML или defaults.
+    # FIX-AUDIT-v9.3: upstream_map — primary key (§20.3),
+    # collector_upstream — backward compat fallback.
+    """
     cfg = load_config()
-    upstream = cfg.get("collector_upstream", cfg.get("upstream_map", {}))
+    upstream = cfg.get("upstream_map", cfg.get("collector_upstream", {}))
     if isinstance(upstream, dict) and upstream:
         return upstream
     return dict(_DEFAULT_UPSTREAM)

@@ -319,8 +319,13 @@ def diagnose_matches() -> dict:
     print("=" * 60)
 
     try:  # FIX-8: error isolation
-        matches = get_matches_by_date_range()
-        if not matches:
+        # FIX-AUDIT-v9.3: Always convert to dict (get_matches_by_date_range мог вернуть list)
+        _raw = get_matches_by_date_range()
+        if isinstance(_raw, dict):
+            matches = _raw
+        elif _raw:
+            matches = {m.get("canonical_id", ""): m for m in _raw if isinstance(m, dict)}
+        else:
             matches_list = get_all_matches()
             matches = {}
             for m in matches_list:

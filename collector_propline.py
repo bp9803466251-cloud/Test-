@@ -51,6 +51,12 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
+# FIX-AUDIT-v9.3: get_all_fields для подсчёта created/updated
+try:
+    from gatekeeper_hub import get_all_fields
+except ImportError:
+    get_all_fields = lambda: {}
+
 # §20.7: Module registry
 try:
     from gatekeeper_hub import register_module
@@ -171,6 +177,13 @@ def collect_propline() -> Dict[str, Any]:
     error_count = 0
     deduped = 0
     seen = set()
+    # FIX-AUDIT-v9.3: existing_keys вычисляется один раз перед циклом
+    existing_keys = set(get_all_fields().keys())
+
+    # FIX-AUDIT-v9.3: вспомогательная функция для сортировки по дате (§1.32)
+    def _event_date_key(ev):
+        dt_str = ev.get("commence_time", "") or ev.get("start_time", "")
+        return dt_str or ""
 
     for sport_key in SOCCER_LEAGUES:
         if is_shutdown_requested():
@@ -186,6 +199,8 @@ def collect_propline() -> Dict[str, Any]:
 
         events = data.get("events", [])
         logger.info(f"Got {len(events)} events for {sport_key}")
+        # FIX-AUDIT-v9.3: сортировка по дате (§1.32)
+        events.sort(key=_event_date_key)
 
         for ev in events:
             if is_shutdown_requested():
@@ -291,7 +306,11 @@ def collect_propline() -> Dict[str, Any]:
 
                 if cid:
                     stored += 1
-                    created += 1
+                    # FIX-AUDIT-v9.3: корректный подсчёт через existing_keys
+                    if f"match:{cid}" in existing_keys:
+                        updated += 1
+                    else:
+                        created += 1
 
                     # Patch odds
                     odds_current = {}

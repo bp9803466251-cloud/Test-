@@ -924,11 +924,13 @@ class FootballDataCollector:
 
             # v7.0: Запись через хаб (upsert_match), не прямой SET
             try:
+                # FIX-AUDIT-v9.3: mode="history" — запись в history:match:{cid}, не в live
                 upsert_match(
                     payload,
                     source=SOURCE_NAME,
                     idempotency_key=idempotency_key,
                     dry_run=self.dry_run,
+                    mode="history",
                 )
             except Exception as e:
                 self.errors += 1

@@ -108,11 +108,11 @@ def validate_schema(match_obj, schema_version=SCHEMA_VERSION):
     return True, "ok"
 
 
+# FIX-AUDIT-v9.3: validate_schema_bool — обёртка, возвращает чистый bool.
+# Для вызовов, где нужен только bool (§19.4: validate_schema() -> bool).
 def validate_schema_bool(match_obj, schema_version=SCHEMA_VERSION):
-    """FIX-AUDIT-v9.3: bool-only wrapper for validate_schema.
-    Use this when you need a simple bool (e.g. `if not validate_schema_bool(obj):`).
-    validate_schema() returns (bool, str) tuple — always truthy."""
-    ok, _msg = validate_schema(match_obj, schema_version)
+    """Возвращает True/False (без сообщения об ошибке). §19.4."""
+    ok, _ = validate_schema(match_obj, schema_version)
     return ok
 
 
@@ -425,7 +425,6 @@ __all__ = [
     "get_all_fields",              # FIX: прокси для metrics.py (system:health raw JSON, §9.1)
     # FIX-AUDIT: schema + indexes
     "validate_schema",
-    "validate_schema_bool",  # FIX-AUDIT-v9.3: bool wrapper
     "update_history_indexes",
     # §20.1: Serialization
     "_json_default",
@@ -983,6 +982,14 @@ def upsert_match(home_team="", away_team="", date_utc="",
         key = ns_key(_base, canonical_id)
         existing = rh.get_from_cache(key)
 
+        # FIX-AUDIT-v9.3: Валидация перед записью (§19.4)
+        _ok, _msg = validate_schema(match_obj)
+        if not _ok:
+            log_event(source, "ERROR", f"upsert_match: schema validation failed: {_msg}",
+                      cid=canonical_id)
+            METRICS.inc("upsert_match_schema_error")
+            return ""
+
         if existing and isinstance(existing, dict):
             for k, v in match_obj.items():
                 if k not in ("canonical_id", "schema_version", "version"):
@@ -1017,12 +1024,6 @@ def upsert_match(home_team="", away_team="", date_utc="",
             # FIX-3: Python-объект, не serialize_match()
             rh.save_to_cache(key, existing)
         else:
-            # FIX-AUDIT-v9.3: validate_schema before save (§19.6)
-            ok, msg = validate_schema(match_obj)
-            if not ok:
-                log_event(source, "WARN", "upsert_match: schema validation failed",
-                          cid=canonical_id, error=msg)
-                METRICS.inc("upsert_match_schema_error")
             # FIX-3: Python-объект, не serialize_match()
             rh.save_to_cache(key, match_obj)
 
@@ -1819,8 +1820,8 @@ def run_initialization(collector="unknown"):
 
     # 4. Cleanup (§24.7)
     # FIX-7: should_run_cleanup принимает 1 аргумент
-    # FIX-AUDIT-v9.3: capture cleanup_count and migration_count for return dict
-    cleanup_result = {"count": 0, "migrated": 0}
+    # FIX-AUDIT-v9.3: Сохраняем результат cleanup для метрик
+    cleanup_result = None
     if should_run_cleanup(collector):
         cleanup_result = cleanup_expired(auto_migrate=is_feature_enabled("auto_migrate"))
     else:
@@ -1834,6 +1835,13 @@ def run_initialization(collector="unknown"):
     elapsed_ms = int((time.monotonic() - start) * 1000)
     METRICS.time("init_latency", elapsed_ms / 1000)
 
+    # FIX-AUDIT-v9.3: cleanup_count + migration_count в результате
+    cleanup_count = 0
+    migration_count = 0
+    if cleanup_result and isinstance(cleanup_result, dict):
+        cleanup_count = cleanup_result.get("cleaned", 0)
+        migration_count = cleanup_result.get("migrated", 0)
+
     return {
         "redis_available": _get_redis() is not None,
         "run_id": _run_id,
@@ -1841,9 +1849,8 @@ def run_initialization(collector="unknown"):
         "hub_version": __version__,
         "config_errors": len(errors),
         "init_latency_ms": elapsed_ms,
-        # FIX-AUDIT-v9.3: cleanup_count and migration_count (§14 API contract)
-        "cleanup_count": cleanup_result.get("count", 0) if isinstance(cleanup_result, dict) else 0,
-        "migration_count": cleanup_result.get("migrated", 0) if isinstance(cleanup_result, dict) else 0,
+        "cleanup_count": cleanup_count,
+        "migration_count": migration_count,
     }
 
 
@@ -1879,24 +1886,24 @@ def get_all_matches():
 
 
 def get_matches_by_date_range(date_from="", date_to=""):
-    """Возвращает матчи в диапазоне дат как dict {canonical_id: match}.
-    FIX-AUDIT-v9.3: return dict instead of list — main.py, value_engine,
-    web_dashboard, source_diagnostics all expect .items() / .values()."""
+    """Возвращает матчи в диапазоне дат. Для main.py.
+    # FIX-AUDIT-v9.3: Возвращает dict {canonical_id: match} вместо list.
+    # Все потребители (main.py, value_engine.py, web_dashboard.py, source_diagnostics.py)
+    # вызывают .items() / .values() — list вызывал AttributeError.
+    """
     all_matches = get_all_matches()
     if not all_matches:
         return {}
-    # Always return dict, even without date filter
+    if not date_from and not date_to:
+        return all_matches if isinstance(all_matches, dict) else {m.get("canonical_id", ""): m for m in all_matches}
     result = {}
-    for m in all_matches:
-        cid = m.get("canonical_id", "")
-        if not cid:
-            continue
+    for m in (all_matches.values() if isinstance(all_matches, dict) else all_matches):
         mdate = m.get("date_utc", "")[:10]
         if date_from and mdate < date_from:
             continue
         if date_to and mdate > date_to:
             continue
-        result[cid] = m
+        result[m.get("canonical_id", "")] = m
     return result
 
 
