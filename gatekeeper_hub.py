@@ -1,5 +1,5 @@
 """
-gatekeeper_hub.py — Единый хаб GatekeeperAI v8.11-patched.
+gatekeeper_hub.py — Единый хаб GatekeeperAI v9.3-audited.
 Центральный шлюз для создания, обновления и чтения матчей.
 
 Патчи (v8.9-patched):
@@ -19,6 +19,19 @@ gatekeeper_hub.py — Единый хаб GatekeeperAI v8.11-patched.
   FIX-14: section_history — match-level tracking в upsert/patch
   FIX-15: validate_schema — проверка home_clean/away_clean non-empty
   FIX-16: get_all_odds — sources из odds.1x2.sources (не match.sources)
+
+  v9.3-audited (06.10.2026):
+  BUG-1: get_all_fields — NameError canonical_id исправлен
+  BUG-2: run_initialization — ключ "cleaned" → "count"
+  BUG-3: upsert_match — двойная нормализация odds убрана
+  BUG-4: _merge_odds — section_history убран из odds.1x2 (только match-level)
+  BUG-5: get_all_odds — independent_sources считает upstream, не source
+  + 15 недостающих функций из таблицы API хаба (§2)
+  + update_history_indexes — league + team индексы (§8.7)
+  + get_all_matches — dict вместо list (§2)
+  + get_matches_by_date_range — шарды вместо фильтрации (§2)
+  + median + line_dispersion в get_all_odds (§22.6)
+  + константы MATCH_FINISH_BUFFER_HOURS, MAX_CAS_RETRIES вынесены
 """
 
 import os
@@ -67,13 +80,15 @@ except ImportError:
 # §22.8: Hub version
 # ═══════════════════════════════════════════════════════════
 
-__version__ = "8.11-patched"
+__version__ = "9.3-audited"
 HUB_API_VERSION = "8.9"
 SCHEMA_VERSION = "v710"
 
 # §19.1: FIFO-буферы (schema v710: maxItems)
 MAX_HISTORY_ENTRIES = 20       # section_history (schema maxItems: 20)
 MAX_ODDS_SNAPSHOTS = 10        # odds.1x2.sources[]
+MATCH_FINISH_BUFFER_HOURS = 2   # буфер после матча (§1.7)
+MAX_CAS_RETRIES = 3             # retry при конфликте версий (§2, CAS)
 
 # ═══════════════════════════════════════════════════════════
 # FIX-AUDIT: validate_schema — валидация матча против schema v710
@@ -437,6 +452,27 @@ __all__ = [
     "register_module",
     "get_module_registry",
     "get_module_status",
+    # FIX-AUDIT-v9.3: Недостающие функции (§2)
+    "validate_schema_bool",
+    "MATCH_FINISH_BUFFER_HOURS",
+    "MAX_CAS_RETRIES",
+    "upsert_history_match",
+    "get_history_match",
+    "get_analysis",
+    "patch_match_by_teams",
+    "get_match_by_teams",
+    "get_matches_count",
+    "find_match_fuzzy",
+    "find_match_by_source_id",
+    "migrate_to_history",
+    "get_history_by_league",
+    "get_history_count",
+    "clean_team_name",
+    "_build_1x2",
+    "_resolve_upstream",
+    "_count_independent",
+    "_calc_median_odds",
+    "_calc_line_dispersion",
 ]
 
 
@@ -972,9 +1008,9 @@ def upsert_match(home_team="", away_team="", date_utc="",
         match_obj.setdefault("section_history", []).append({
             "section": "odds",
             "source": source,
+            "upstream": UPSTREAM_MAP.get(source, ""),
             "updated_at": now_msk(),
         })
-        match_obj["odds"] = _normalize_incoming_odds(extra_fields["odds"])
 
     rh = _get_redis()
     if rh:
@@ -1202,18 +1238,8 @@ def _merge_odds(existing_odds, new_odds, source, upstream=None):
         else:
             result[market] = new_odds[market]
 
-    # FIX-AUDIT: section_history tracking (schema v710)
-    sec_1x2 = result.get("1x2", {})
-    if isinstance(sec_1x2, dict):
-        history = sec_1x2.setdefault("section_history", [])
-        history.append({
-            "section": "odds",
-            "source": source,
-            "upstream": upstream or "",
-            "updated_at": now_msk(),
-        })
-        if len(history) > MAX_HISTORY_ENTRIES:
-            sec_1x2["section_history"] = history[-MAX_HISTORY_ENTRIES:]
+    # FIX-BUG-4: section_history пишется только на уровне матча
+    # (в upsert_match / patch_match), не внутри odds.1x2
 
     return result
 
@@ -1293,7 +1319,7 @@ def patch_match(canonical_id, section, data, source="unknown",
         match_obj["section_history"] = match_obj["section_history"][-MAX_HISTORY_ENTRIES:]
 
     # FIX-AUDIT-6: CAS retry — optimistic locking с retry до 3 раз (§24.2)
-    max_cas_retries = 3
+    max_cas_retries = MAX_CAS_RETRIES
     for attempt in range(max_cas_retries):
         expected_version = match_obj.get("version", 1)
         match_obj["version"] = expected_version + 1
@@ -1423,22 +1449,59 @@ def _remove_from_index(canonical_id):
 
 
 
-def update_history_indexes(canonical_id, date_utc):
+def update_history_indexes(canonical_id, date_utc, league_code="",
+                               home_clean="", away_clean=""):
     """
-    Добавляет canonical_id в дневной индекс index:shard:{YYYYMMDD}. §1.7c
-    Для football_data_to_redis.py — индексация исторических матчей.
+    Обновление индексов для history-матча. §2, §8.7.
+    - index:shard:{YYYYMMDD} — SET (дневной шард)
+    - history:league:{code} — ZSET (score=timestamp)
+    - history:team:{name} — SET (матчи команды)
+    Возвращает bool.
     """
     rh = _get_redis()
-    if not rh or not date_utc:
-        return
-    shard_key = f"index:shard:{date_utc[:10].replace('-', '')}"
-    try:
-        rh._execute_upstash_cmd(["SADD", shard_key, canonical_id])
+    if not rh or not canonical_id:
+        return False
+
+    updated = False
+
+    # 1. Дневной шард
+    if date_utc:
+        shard_key = f"index:shard:{date_utc[:10].replace('-', '')}"
+        try:
+            rh._execute_upstash_cmd(["SADD", shard_key, canonical_id])
+            updated = True
+        except Exception as e:
+            log_event("hub", "WARN", "update_history_indexes: shard failed",
+                      cid=canonical_id, error=str(e))
+
+    # 2. Индекс лиги (ZSET, score=timestamp)
+    if league_code:
+        try:
+            score = str(time.time())
+            rh._execute_upstash_cmd(
+                ["ZADD", f"history:league:{league_code}", score, canonical_id]
+            )
+            updated = True
+        except Exception as e:
+            log_event("hub", "WARN", "update_history_indexes: league failed",
+                      cid=canonical_id, error=str(e))
+
+    # 3. Индекс команд (SET)
+    for team in (home_clean, away_clean):
+        if team:
+            try:
+                rh._execute_upstash_cmd(
+                    ["SADD", f"history:team:{team}", canonical_id]
+                )
+                updated = True
+            except Exception as e:
+                log_event("hub", "WARN", "update_history_indexes: team failed",
+                          cid=canonical_id, team=team, error=str(e))
+
+    if updated:
         log_event("hub", "DEBUG", "update_history_indexes",
-                  cid=canonical_id, shard=shard_key)
-    except Exception as e:
-        log_event("hub", "WARN", "update_history_indexes failed",
-                  cid=canonical_id, error=str(e))
+                  cid=canonical_id, league=league_code)
+    return updated
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1500,7 +1563,7 @@ def cleanup_expired(dry_run=False, auto_migrate=True):
         elif date_utc:
             try:
                 match_date = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
-                if match_date + timedelta(hours=2) < datetime.now(timezone.utc):
+                if match_date + timedelta(hours=MATCH_FINISH_BUFFER_HOURS) < datetime.now(timezone.utc):
                     should_delete = True
                     expired_deleted += 1
             except (ValueError, TypeError):
@@ -1607,10 +1670,13 @@ def get_all_odds(match: dict) -> dict:
             "closing": sec.get("closing", {}),
             "sources": sec.get("sources", match.get("sources", [])),
             "verification": match.get("odds_verification", "UNVERIFIED"),
-            "independent_sources": len(set(
-                s.get("source", "") for s in sec.get("sources", [])
-                if isinstance(s, dict)
-            ) or match.get("sources", [])),
+            "independent_sources": _count_independent(sec.get("sources", [])),
+            "independent_upstreams": list(set(
+                s.get("upstream", "") for s in sec.get("sources", [])
+                if isinstance(s, dict) and s.get("upstream")
+            )),
+            "median": _calc_median_odds(sec.get("sources", [])),
+            "line_dispersion": _calc_line_dispersion(sec.get("sources", [])),
             "betradar_consensus": False,
         }
 
@@ -1624,7 +1690,7 @@ def get_all_odds(match: dict) -> dict:
             "closing": odds.get("closing", {}),
             "sources": match.get("sources", []),
             "verification": "UNVERIFIED",
-            "independent_sources": len(set(match.get("sources", []))),
+            "independent_sources": _count_independent(match.get("sources", [])),
             "betradar_consensus": False,
         }
 
@@ -1839,7 +1905,7 @@ def run_initialization(collector="unknown"):
     cleanup_count = 0
     migration_count = 0
     if cleanup_result and isinstance(cleanup_result, dict):
-        cleanup_count = cleanup_result.get("cleaned", 0)
+        cleanup_count = cleanup_result.get("count", 0)
         migration_count = cleanup_result.get("migrated", 0)
 
     return {
@@ -1868,42 +1934,74 @@ def get_run_id():
 # ═══════════════════════════════════════════════════════════
 
 def get_all_matches():
-    """Возвращает все live-матчи из Redis. Для source_diagnostics.py."""
+    """Возвращает все live-матчи из Redis. §2.
+    Возвращает dict {canonical_id: match}."""
     rh = _get_redis()
     if not rh:
-        return []
+        return {}
     all_fields = rh.get_all_fields()
     if not all_fields or not isinstance(all_fields, dict):
-        return []
-    matches = []
+        return {}
+    matches = {}
     for field_id, raw in all_fields.items():
         if not field_id.startswith("match:") or ":meta" in field_id or "idem" in field_id or "canary" in field_id:
             continue
         match = deserialize_match(raw) if isinstance(raw, str) else raw
         if match and isinstance(match, dict):
-            matches.append(match)
+            cid = match.get("canonical_id", field_id.replace("match:", ""))
+            matches[cid] = match
     return matches
 
 
 def get_matches_by_date_range(date_from="", date_to=""):
-    """Возвращает матчи в диапазоне дат. Для main.py.
-    # FIX-AUDIT-v9.3: Возвращает dict {canonical_id: match} вместо list.
-    # Все потребители (main.py, value_engine.py, web_dashboard.py, source_diagnostics.py)
-    # вызывают .items() / .values() — list вызывал AttributeError.
+    """Возвращает матчи в диапазоне дат через шарды. §2.
+    Возвращает dict {canonical_id: match}.
     """
-    all_matches = get_all_matches()
-    if not all_matches:
+    rh = _get_redis()
+    if not rh:
         return {}
-    if not date_from and not date_to:
-        return all_matches if isinstance(all_matches, dict) else {m.get("canonical_id", ""): m for m in all_matches}
+
+    now = datetime.now(timezone.utc) if "timezone" in dir() else datetime.now()
+
+    # Если даты не заданы — используем lookback/lookahead
+    if not date_from:
+        date_from = (now - timedelta(days=INDEX_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    if not date_to:
+        date_to = (now + timedelta(days=INDEX_LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
+
     result = {}
-    for m in (all_matches.values() if isinstance(all_matches, dict) else all_matches):
-        mdate = m.get("date_utc", "")[:10]
-        if date_from and mdate < date_from:
-            continue
-        if date_to and mdate > date_to:
-            continue
-        result[m.get("canonical_id", "")] = m
+
+    # Сканируем шарды в диапазоне
+    d = datetime.strptime(date_from, "%Y-%m-%d")
+    end = datetime.strptime(date_to, "%Y-%m-%d")
+    while d <= end:
+        shard_key = f"index:shard:{d.strftime('%Y%m%d')}"
+        try:
+            cids = rh._execute_upstash_cmd(["SMEMBERS", shard_key])
+            if cids:
+                cid_list = cids if isinstance(cids, list) else [cids]
+                for cid in cid_list:
+                    if cid not in result:
+                        match = get_match_any(cid)
+                        if match and isinstance(match, dict):
+                            result[cid] = match
+        except Exception:
+            pass
+        d += timedelta(days=1)
+
+    # Fallback: если шарды пусты — полный скан
+    if not result:
+        all_matches = get_all_matches()
+        if isinstance(all_matches, dict):
+            return all_matches
+        for m in (all_matches or []):
+            mdate = m.get("date_utc", "")[:10]
+            if date_from and mdate < date_from:
+                continue
+            if date_to and mdate > date_to:
+                continue
+            result[m.get("canonical_id", "")] = m
+
     return result
 
 
@@ -1946,6 +2044,373 @@ def set_key(key, value):
 
 
 
+# ═══════════════════════════════════════════════════════════
+# FIX-AUDIT-v9.3: Недостающие функции из таблицы API хаба (§2)
+# ═══════════════════════════════════════════════════════════
+
+# §2: Вспомогательные приватные функции
+
+def _build_1x2(price):
+    """Создание 1x2-блока из плоского price. §2."""
+    if not price or not isinstance(price, dict):
+        return {}
+    return {
+        "opening": {
+            "home": price.get("home"),
+            "draw": price.get("draw"),
+            "away": price.get("away"),
+        },
+        "current": {
+            "home": price.get("home"),
+            "draw": price.get("draw"),
+            "away": price.get("away"),
+        },
+    }
+
+
+def _resolve_upstream(source, upstream=""):
+    """Резолв upstream через UPSTREAM_MAP. §2."""
+    if upstream:
+        return upstream
+    return UPSTREAM_MAP.get(source, "unknown")
+
+
+def _count_independent(sources):
+    """Подсчёт уникальных upstream в sources[]. §2, §22.5."""
+    if not sources or not isinstance(sources, list):
+        return 0
+    upstreams = set()
+    for s in sources:
+        if isinstance(s, dict):
+            u = s.get("upstream", "")
+            if u:
+                upstreams.add(u)
+        elif isinstance(s, str) and s:
+            upstreams.add(s)
+    return len(upstreams)
+
+
+def _calc_median_odds(sources):
+    """Медианные коэффициенты из sources[]. §22.6."""
+    if not sources or not isinstance(sources, list):
+        return {}
+    homes, draws, aways = [], [], []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        price = s.get("price", {})
+        if not isinstance(price, dict):
+            continue
+        for key, lst in (("home", homes), ("draw", draws), ("away", aways)):
+            v = price.get(key)
+            if v is not None:
+                try:
+                    lst.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+    if not homes:
+        return {}
+
+    def _median(lst):
+        n = len(lst)
+        if n == 0:
+            return None
+        lst.sort()
+        if n % 2 == 1:
+            return lst[n // 2]
+        return (lst[n // 2 - 1] + lst[n // 2]) / 2
+
+    return {
+        "home": str(_median(homes)) if homes else None,
+        "draw": str(_median(draws)) if draws else None,
+        "away": str(_median(aways)) if aways else None,
+    }
+
+
+def _calc_line_dispersion(sources):
+    """Дисперсия линий между букмекерами. §22.6.
+    Возвращает {home: float, draw: float, away: float}."""
+    if not sources or not isinstance(sources, list) or len(sources) < 2:
+        return {"home": 0.0, "draw": 0.0, "away": 0.0}
+    by_key = {"home": [], "draw": [], "away": []}
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        price = s.get("price", {})
+        if not isinstance(price, dict):
+            continue
+        for k in by_key:
+            v = price.get(k)
+            if v is not None:
+                try:
+                    by_key[k].append(float(v))
+                except (TypeError, ValueError):
+                    pass
+    result = {}
+    for k, vals in by_key.items():
+        if len(vals) < 2:
+            result[k] = 0.0
+        else:
+            mean = sum(vals) / len(vals)
+            var = sum((v - mean) ** 2 for v in vals) / len(vals)
+            result[k] = round(var ** 0.5, 4)
+    return result
+
+
+# §2: Публичный clean_team_name (делегирует в team_registry)
+def clean_team_name(name):
+    """Нормализация названия команды. §19.2.
+    Делегирует в team_registry (через _clean_team_name)."""
+    return _clean_team_name(name)
+
+
+# §2, §8.7: upsert_history_match
+def upsert_history_match(canonical_id, match_data):
+    """Запись исторического матча в history:match:{cid}. §2, §8.7.
+    raw JSON, без конверта. Возвращает bool."""
+    METRICS.inc("upsert_history_match")
+    rh = _get_redis()
+    if not rh or not canonical_id or not match_data:
+        return False
+
+    if not isinstance(match_data, dict):
+        return False
+
+    match_data["schema_version"] = SCHEMA_VERSION
+    match_data.setdefault("version", 1)
+    match_data.setdefault("status", "completed")
+    match_data["updated_at"] = now_msk()
+
+    ok, msg = validate_schema(match_data)
+    if not ok:
+        log_event("hub", "ERROR",
+                  f"upsert_history_match: schema validation failed: {msg}",
+                  cid=canonical_id)
+        return False
+
+    key = ns_key("history:match", canonical_id)
+    try:
+        rh.save_to_cache(key, match_data)
+        log_event("hub", "INFO", "upsert_history_match", cid=canonical_id)
+        return True
+    except Exception as e:
+        log_event("hub", "ERROR", "upsert_history_match failed",
+                  cid=canonical_id, error=str(e))
+        return False
+
+
+# §2: get_history_match (алиас для get_history)
+def get_history_match(canonical_id):
+    """Чтение исторического матча из history:match:{cid}. §2."""
+    return get_history(canonical_id)
+
+
+# §2: get_analysis
+def get_analysis(canonical_id):
+    """Чтение анализа из analysis:{cid}. §2."""
+    rh = _get_redis()
+    if not rh:
+        return None
+    key = ns_key("analysis", canonical_id)
+    analysis = rh.get_from_cache(key)
+    if analysis and isinstance(analysis, dict):
+        return analysis
+    return None
+
+
+# §2: patch_match_by_teams
+def patch_match_by_teams(home_team, away_team, date_utc, section, data,
+                          source="unknown", upstream="", idempotency_key=""):
+    """Патч по командам и дате — обёртка над patch_match(). §2."""
+    date_utc = normalize_date(date_utc)
+    cid = build_canonical_id(home_team, away_team, date_utc)
+    if not cid:
+        log_event(source, "WARN", "patch_match_by_teams: empty canonical_id")
+        return False
+    return patch_match(cid, section, data, source=source,
+                       upstream=upstream, idempotency_key=idempotency_key)
+
+
+# §2: get_match_by_teams
+def get_match_by_teams(home_team, away_team, date_utc):
+    """Чтение матча по командам и дате. §2."""
+    date_utc = normalize_date(date_utc)
+    cid = build_canonical_id(home_team, away_team, date_utc)
+    if not cid:
+        return None
+    return get_match_any(cid)
+
+
+# §2: get_matches_count
+def get_matches_count():
+    """Количество live-матчей в индексе. §2."""
+    matches = get_all_matches()
+    if isinstance(matches, dict):
+        return len(matches)
+    return len(matches) if matches else 0
+
+
+# §2: find_match_fuzzy
+def find_match_fuzzy(home_team, away_team):
+    """Нечёткий поиск матча по названиям команд (без даты). §2.
+    Ищет среди всех live-матчей совпадение по home_clean/away_clean."""
+    rh = _get_redis()
+    if not rh:
+        return None
+
+    home_clean = _clean_team_name(home_team)
+    away_clean = _clean_team_name(away_team)
+    if not home_clean or not away_clean:
+        return None
+
+    all_fields = rh.get_all_fields()
+    if not all_fields or not isinstance(all_fields, dict):
+        return None
+
+    for field_id, raw in all_fields.items():
+        if not field_id.startswith("match:") or ":meta" in field_id:
+            continue
+        if "idem" in field_id or "canary" in field_id:
+            continue
+        match = deserialize_match(raw) if isinstance(raw, str) else raw
+        if not match or not isinstance(match, dict):
+            continue
+        if (match.get("home_clean") == home_clean and
+                match.get("away_clean") == away_clean):
+            return match
+    return None
+
+
+# §2: find_match_by_source_id
+def find_match_by_source_id(source_name, source_id):
+    """Поиск матча по source_ids. §2."""
+    rh = _get_redis()
+    if not rh:
+        return None
+
+    all_fields = rh.get_all_fields()
+    if not all_fields or not isinstance(all_fields, dict):
+        return None
+
+    for field_id, raw in all_fields.items():
+        if not field_id.startswith("match:") or ":meta" in field_id:
+            continue
+        if "idem" in field_id or "canary" in field_id:
+            continue
+        match = deserialize_match(raw) if isinstance(raw, str) else raw
+        if not match or not isinstance(match, dict):
+            continue
+        sids = match.get("source_ids", {})
+        if isinstance(sids, dict) and sids.get(source_name) == source_id:
+            return match
+    return None
+
+
+# §2: migrate_to_history
+def migrate_to_history(canonical_id=""):
+    """Миграция match:* -> history:match:*. §2.
+    Если canonical_id задан — мигрирует один матч.
+    Если пустой — мигрирует все completed матчи.
+    Возвращает количество мигрированных."""
+    METRICS.inc("migrate_to_history")
+    rh = _get_redis()
+    if not rh:
+        return 0
+
+    migrated = 0
+
+    if canonical_id:
+        key = ns_key("match", canonical_id)
+        match_obj = rh.get_from_cache(key)
+        if not match_obj or not isinstance(match_obj, dict):
+            return 0
+        match_obj["status"] = "completed"
+        match_obj["migrated_at"] = now_msk()
+        history_key = ns_key("history:match", canonical_id)
+        rh.save_to_cache(history_key, match_obj)
+        try:
+            rh.delete_from_cache(key)
+        except Exception:
+            pass
+        _remove_from_index(canonical_id)
+        return 1
+
+    # Миграция всех completed
+    all_fields = rh.get_all_fields()
+    if not all_fields or not isinstance(all_fields, dict):
+        return 0
+
+    for field_id, raw in all_fields.items():
+        if is_shutdown_requested():
+            break
+        if not field_id.startswith("match:") or ":meta" in field_id:
+            continue
+        if "idem" in field_id or "canary" in field_id:
+            continue
+        match = deserialize_match(raw) if isinstance(raw, str) else raw
+        if not match or not isinstance(match, dict):
+            continue
+        if match.get("status") != "completed":
+            continue
+        cid = match.get("canonical_id", "")
+        if not cid:
+            continue
+        match["migrated_at"] = now_msk()
+        history_key = ns_key("history:match", cid)
+        rh.save_to_cache(history_key, match)
+        try:
+            rh.delete_from_cache(field_id)
+        except Exception:
+            pass
+        _remove_from_index(cid)
+        migrated += 1
+
+    log_event("hub", "INFO", "migrate_to_history", migrated=migrated)
+    return migrated
+
+
+# §2: get_history_by_league
+def get_history_by_league(league_code, limit=100):
+    """Чтение матчей лиги из ZSET history:league:{code}. §2."""
+    rh = _get_redis()
+    if not rh or not league_code:
+        return []
+    try:
+        raw_ids = rh._execute_upstash_cmd(
+            ["ZREVRANGE", f"history:league:{league_code}", "0", str(limit - 1)]
+        )
+        if not raw_ids:
+            return []
+        cids = raw_ids if isinstance(raw_ids, list) else [raw_ids]
+        matches = []
+        for cid in cids:
+            m = get_history_match(cid)
+            if m:
+                matches.append(m)
+        return matches
+    except Exception as e:
+        log_event("hub", "ERROR", "get_history_by_league failed",
+                  league=league_code, error=str(e))
+        return []
+
+
+# §2: get_history_count
+def get_history_count():
+    """Количество history-матчей. §2."""
+    rh = _get_redis()
+    if not rh:
+        return 0
+    try:
+        keys = rh.scan_keys("history:match:*")
+        if isinstance(keys, list):
+            return len(keys)
+        return 0
+    except Exception as e:
+        log_event("hub", "ERROR", "get_history_count failed", error=str(e))
+        return 0
+
+
+
 if __name__ == "__main__":
     init = run_initialization("self_test")
     print(f"\nHub version: {__version__}")
@@ -1961,9 +2426,9 @@ def get_all_fields():
     """Прокси к redis_hub.get_all_fields — §1.4: единый шлюз."""
     rh = _get_redis()
     if not rh:
-        return {} if canonical_id else {}
+        return {}
     try:
-        return rh.get_all_fields() if canonical_id else rh.get_all_fields()
+        return rh.get_all_fields()
     except Exception as e:
         logger.error("get_all_fields error: %s", e)
         return {}
