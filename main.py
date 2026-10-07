@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper-AI v811-patched — Main Pipeline (Dashboard + Telegram)
+Gatekeeper-AI v8.12-recalc — Main Pipeline (Dashboard + Telegram)
 Value engine + Telegram-дашборд по стандарту §12.
 
 Патчи v8.10:
@@ -32,7 +32,8 @@ v8.11-patched:
   FIX-12: Meta keys "sharpapi:meta" → "sharpapi:meta" — confirmed: "{collector}:meta" format is correct
           ключей с redis_hub и redis_diagnostics (оба используют "meta:{collector}").
   FIX-13: _split_message → делегирование в telegram_transport.split_html_safe.
-  FIX-14: TG_MAX_CHARS → TELEGRAM_CHUNK_LIMIT из telegram_transport.
+  FIX-14: TG_MAX_CHARS
+  FIX-15: _recalc_stats — пересчёт stats напрямую из matches (Pred:0 баг) → TELEGRAM_CHUNK_LIMIT из telegram_transport.
 """
 import os
 import sys
@@ -433,6 +434,52 @@ def _fmt_bet(info: dict, is_hot: bool) -> tuple:
     return header, teams, data_str
 
 
+# ---------------------------------------------------------------------------
+# FIX-15: Recalculate stats from matches directly (value_engine may undercount)
+# ---------------------------------------------------------------------------
+def _recalc_stats(matches: dict, stats: dict) -> dict:
+    """Recalculate dashboard stats directly from matches for accuracy.
+    
+    Value engine may undercount predictions if it uses different
+    field checks than diagnostics. This ensures dashboard matches
+    what's actually in Redis.
+    """
+    with_pred = 0
+    with_h2h = 0
+    with_odds = 0
+    with_stats = 0
+    for cid, m in matches.items():
+        if not isinstance(m, dict):
+            continue
+        # Predictions: non-empty dict
+        pred = m.get("predictions")
+        if isinstance(pred, dict) and pred:
+            with_pred += 1
+        # H2H: non-empty dict
+        h2h = m.get("h2h")
+        if isinstance(h2h, dict) and h2h:
+            with_h2h += 1
+        # Odds: check 1x2.current for actual values
+        odds = m.get("odds", {})
+        if isinstance(odds, dict) and odds:
+            o1x2 = odds.get("1x2", {})
+            if isinstance(o1x2, dict) and o1x2:
+                current = o1x2.get("current", o1x2)
+                if isinstance(current, dict):
+                    if any(current.get(k) for k in ("home", "draw", "away")):
+                        with_odds += 1
+        # Stats: non-empty dict
+        match_stats = m.get("stats")
+        if isinstance(match_stats, dict) and match_stats:
+            with_stats += 1
+    stats["with_pred"] = with_pred
+    stats["with_h2h"] = with_h2h
+    stats["with_odds"] = with_odds
+    stats["with_stats"] = with_stats
+    stats["total"] = len(matches)
+    return stats
+
+
 def _format_dashboard(result: dict) -> str:
     lines = []
     hot = result["hot"]
@@ -557,6 +604,12 @@ def main():
         save_meta("main", last_run=now_msk(), total_events=len(matches),
                   stored_matches=0, error_count=1)
         return
+
+    # FIX-15: Recalculate stats from matches directly (value_engine may undercount)
+    if isinstance(result.get("stats"), dict):
+        result["stats"] = _recalc_stats(matches, result["stats"])
+    else:
+        result["stats"] = _recalc_stats(matches, {"total": len(matches)})
 
     logger.info(f"HOT: {len(result['hot'])}, WARM: {len(result['warm'])}, "
                  f"Value: {result['stats'].get('value_bets', 0)}")
