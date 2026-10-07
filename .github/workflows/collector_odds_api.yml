@@ -50,12 +50,14 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          ODDS_API_RATE_DELAY: '1.0'
-          ODDS_API_MAX_RETRIES: '3'
+          ODDS_API_MAX_RETRIES: '2'
           ODDS_API_REGIONS: ${{ github.event.inputs.regions || 'eu,uk' }}
           ODDS_API_MARKETS: 'h2h'
           ODDS_API_ODDS_FORMAT: 'decimal'
           ODDS_API_DAYS_AHEAD: ${{ github.event.inputs.days_ahead || '3' }}
+          ODDS_API_HTTP_TIMEOUT: '15'
+          ODDS_API_MAX_WORKERS: '5'
+          ODDS_API_QUOTA_MIN: '10'
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
 
       - name: Summary
