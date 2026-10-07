@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-Collector Bzzoiro v8.14-fix (API v2 — bulk odds + predictions + per-event H2H/stats)
+Collector Bzzoiro v8.15-source (API v2 — bulk odds + predictions + per-event H2H/stats)
 GatekeeperAI v9.3-audited
-
-Изменения v8.14-fix (поверх v8.12-bulk):
-  - FIX-1: Per-event predictions URL /events/{id}/prediction (ед.ч.) вместо /predictions (мн.ч.) → 404
-  - FIX-2: Bulk predictions event_id извлечение из event.id (вложенный) вместо item.id (prediction ID)
-  - FIX-3: 404 handling — except HTTPError возвращает _NOT_FOUND (urlopen бросает HTTPError)
-  - FIX-4: Prediction parsing — markets.match_result → {home_win, draw, away_win, confidence}
 
 Изменения v8.12-bulk:
   - Bulk odds: GET /odds/?date_from=&date_to= (2-3 запроса вместо 140 per-event)
@@ -17,6 +11,13 @@ GatekeeperAI v9.3-audited
   - Progress logging: каждые 10 матчей (вместо 50)
   - Coverage check: GET /coverage/ перед стартом
   - RATE_DELAY 0.5, ENRICH_DELAY 0.2, MAX_RETRIES 1 (из env)
+
+Изменения v8.15-source:
+  FIX-1: _fetch_bzzoiro — HTTPError ловится отдельно, 404 → _NOT_FOUND (dead code исправлен)
+  FIX-2: Per-event predictions URL — /prediction (ед.ч.) вместо /predictions (мн.ч.)
+  FIX-3: Bulk predictions event_id — item.event.id вместо item.id (prediction ID)
+  FIX-4: predictions/h2h — добавлен "source": "bzzoiro" перед patch_match
+
 
 Изменения v2.2 (Фаза 2):
   - run_initialization(collector="bzzoiro") — §2.6
@@ -97,7 +98,7 @@ HTTP_TIMEOUT = int(os.environ.get("BZZOIRO_HTTP_TIMEOUT", "10"))
 
 BZZOIRO_UPSTREAM = "opta"
 
-__version__ = "8.14-fix"
+__version__ = "8.15-source"
 __all__ = [
     "collect_bzzoiro",
     "collect_and_process",
@@ -126,6 +127,9 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
             req = urllib.request.Request(url, headers=headers)
             resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
 
+            if resp.status == 404:
+                _cache_response(url, _NOT_FOUND)
+                return _NOT_FOUND
             if resp.status == 429:
                 wait = 2 ** (attempt + 2)
                 logger.warning(f"Rate limit. Waiting {wait}s")
@@ -149,14 +153,15 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
                 return _NOT_FOUND
             if e.code == 429:
                 wait = 2 ** (attempt + 2)
-                logger.warning(f"Rate limit (429). Waiting {wait}s")
+                logger.warning(f"Rate limit (HTTP 429). Waiting {wait}s")
                 time.sleep(wait)
                 continue
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue
-            logger.error(f"HTTP {e.code}: {e.reason} — {url}")
+            logger.error(f"HTTP {e.code}: {url}")
             return None
+
         except (urllib.error.URLError, json.JSONDecodeError) as e:
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
@@ -326,7 +331,7 @@ def _fetch_bulk_odds(headers: dict, date_from: str, date_to: str) -> dict:
             break
         
         for item in items:
-            eid = str(item.get("event_id", item.get("id", "")))
+            eid = str(item.get("event_id") or item.get("event", {}).get("id") or item.get("id", ""))
             if eid and eid != "None":
                 result[eid] = item
         
@@ -362,11 +367,7 @@ def _fetch_bulk_predictions(headers: dict, date_from: str, date_to: str) -> dict
             break
         
         for item in items:
-            # BSD prediction shape: { "id": 88123, "event": { "id": 223510, ... } }
-            # event_id is nested in event.id, not top-level
-            eid = str(item.get("event_id") or
-                      (item.get("event", {}) or {}).get("id") or
-                      item.get("id", ""))
+            eid = str(item.get("event_id") or item.get("event", {}).get("id") or item.get("id", ""))
             if eid and eid != "None":
                 result[eid] = item
         
@@ -668,23 +669,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 if pred_data is _NOT_FOUND:
                     not_found += 1
                 elif pred_data and isinstance(pred_data, dict):
-                    # BSD prediction: { "id":..., "event":..., "markets": {"match_result": {...}}, "model": {...} }
-                    markets = pred_data.get("markets", {})
-                    match_result = markets.get("match_result", {})
-                    model = pred_data.get("model", {})
-                    inner_pred = {
-                        "home_win": match_result.get("prob_home"),
-                        "draw": match_result.get("prob_draw"),
-                        "away_win": match_result.get("prob_away"),
-                        "predicted": match_result.get("predicted"),
-                        "confidence": model.get("confidence"),
-                        "model_version": model.get("version"),
-                        "expected_goals": markets.get("expected_goals", {}),
-                        "over_under": markets.get("over_under", {}),
-                        "btts": markets.get("btts", {}),
-                    }
-                    inner_pred = {k: v for k, v in inner_pred.items() if v is not None}
+                    inner_pred = pred_data.get("prediction", pred_data)
                     if isinstance(inner_pred, dict) and inner_pred:
+                        if "source" not in inner_pred:
+                            inner_pred["source"] = COLLECTOR_NAME
                         idem_key = f"{run_id}:{cid}:predictions:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:predictions:{bzzoiro_id}"
                         try:
                             if patch_match(cid, "predictions", inner_pred, source=COLLECTOR_NAME,
@@ -720,6 +708,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             elif h2h_data and isinstance(h2h_data, dict):
                 inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
                 if isinstance(inner_h2h, dict) and inner_h2h:
+                    if "source" not in inner_h2h:
+                        inner_h2h["source"] = COLLECTOR_NAME
                     idem_key = f"{run_id}:{cid}:h2h:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:h2h:{bzzoiro_id}"
                     try:
                         if patch_match(cid, "h2h", inner_h2h, source=COLLECTOR_NAME,

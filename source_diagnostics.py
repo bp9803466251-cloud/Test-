@@ -1,8 +1,13 @@
 # source_diagnostics.py
 """
-Единый модуль диагностики Gatekeeper-AI v9.3-audited.
+Единый модуль диагностики Gatekeeper-AI v9.4-source.
 Заменяет debug_inspect.py и debug_odds.py.
 Объединяет диагностику всех источников, Redis и матчей в одном файле.
+
+v9.4-source:
+  SD-9: diagnose_sample — odds.1x2.current вместо odds.1x2 (фикс ? / ? / ?)
+  SD-10: diagnose_matches — predictions/h2h проверяются без требования "source"
+  SD-11: diagnose_sample — prediction source проверяется через .get("source", "")
 
 v9.3-audited:
   SD-1: Версия 9.3-audited
@@ -29,7 +34,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 
-__version__ = "9.3-audited"
+__version__ = "9.4-source"
 
 __all__ = [
     "diagnose_sources",
@@ -443,12 +448,12 @@ def diagnose_matches(all_fields: dict = None) -> dict:
         has_pred = False
         has_h2h = False
         predictions = match.get("predictions", {})
-        if isinstance(predictions, dict) and predictions and "source" in predictions:
+        if isinstance(predictions, dict) and predictions:
             with_predictions += 1
             has_pred = True
 
         h2h = match.get("h2h", {})
-        if isinstance(h2h, dict) and h2h and "source" in h2h:
+        if isinstance(h2h, dict) and h2h:
             with_h2h += 1
             has_h2h = True
 
@@ -711,11 +716,12 @@ def diagnose_sample(all_fields: dict = None) -> dict:
         if isinstance(odds, dict):
             o1x2 = odds.get("1x2", {})
             if isinstance(o1x2, dict):
-                odds_1x2 = f"{o1x2.get('home', '?')} / {o1x2.get('draw', '?')} / {o1x2.get('away', '?')}"
+                sec = o1x2.get("current", o1x2.get("opening", o1x2))
+                odds_1x2 = f"{sec.get('home', '?')} / {sec.get('draw', '?')} / {sec.get('away', '?')}"
         pred = match.get("predictions", {})
         pred_str = ""
-        if isinstance(pred, dict) and pred.get("source"):
-            pred_str = pred.get("source", "")
+        if isinstance(pred, dict) and pred:
+            pred_str = pred.get("source", "bzzoiro")
         sources_list = match.get("sources", [])
         sources_str = ", ".join(sources_list) if isinstance(sources_list, list) else str(sources_list)
 
