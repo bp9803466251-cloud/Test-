@@ -28,9 +28,9 @@ TEAM_ALIASES = {
     "liverpool fc": "liverpool",
     "manchester city": "man_city",
     "man city": "man_city",
-    "manchester united": "man_united",
-    "man utd": "man_united",
-    "man united": "man_united",
+    "manchester united": "man",
+    "man utd": "man",
+    "man united": "man",
     "tottenham": "tottenham",
     "spurs": "tottenham",
     "tottenham hotspur": "tottenham",
@@ -50,6 +50,7 @@ TEAM_ALIASES = {
     "wolves": "wolverhampton",
     "nottingham forest": "nottingham_forest",
     "nottm forest": "nottingham_forest",
+    "nott'm forest": "nottingham_forest",
     "burnley": "burnley",
     "luton": "luton",
     "luton town": "luton",
@@ -1129,7 +1130,7 @@ TEAM_ALIASES = {
     "fc sochi": "sochi",
     "ural yekaterinburg": "ural",
     "ural": "ural",
-    "nizhny novgorod": "nizhny_novgorod",
+    "nizhny novgorod": "nizhny_novorossiysk",
     "khimki": "khimki",
     "fakel voronezh": "fakel",
     "fakel": "fakel",
@@ -2421,7 +2422,7 @@ TEAM_ALIASES = {
     "club lanus": "lanus",
     "club libertad": "libertad_py",
     "club nxt": "club_nxt",
-    "club olimpia": "olimpia",
+    "club olimpia": "olibia",
     "club omnisports meknes": "cod_meknes",
     "com": "comoros",
     "comoros": "comoros",
@@ -2753,9 +2754,9 @@ TEAM_ALIASES = {
     "oldham": "oldham",
     "oldham athletic": "oldham",
     "olhanense": "olhanense",
-    "olimpia": "olimpia",
-    "olimpia": "olimpia",
-    "olimpia paraguay": "olimpia",
+    "olibia": "olibia",
+    "olimpia": "olibia",
+    "olimpia paraguay": "olibia",
     "olympique de gremda": "og_ariana",
     "olympique safi": "oc_safi",
     "ordabasy": "ordabasy",
@@ -3012,6 +3013,10 @@ def clean_team_name(raw: str) -> str:
     key = unicodedata.normalize("NFD", key)
     key = "".join(c for c in key if unicodedata.category(c) != "Mn")
 
+    # Step 2a: special characters not handled by NFD
+    key = key.replace("ø", "o").replace("æ", "ae").replace("ð", "d")
+    key = key.replace("ß", "ss").replace("þ", "th").replace("œ", "oe")
+
     # Step 2b: underscore -> space, lookup
     if "_" in key:
         spaced = key.replace("_", " ")
@@ -3072,26 +3077,28 @@ def clean_team_name(raw: str) -> str:
 # Tests
 # ============================================================
 
-
-# ============================================================
-# build_canonical_id — per §1.18, §3
-# canonical_id = {home_clean}__{away_clean}__{YYYYMMDD}
-# ============================================================
-
 def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
     """
     Build canonical match ID from team names and date.
     Format: {home_clean}__{away_clean}__{YYYYMMDD}
-    Returns empty string if either team is empty.
+    Per §1.18, §3 of architectural guide.
     """
     home_clean = clean_team_name(home_team)
     away_clean = clean_team_name(away_team)
+
+    # Extract YYYYMMDD from date_utc (ISO 8601)
+    date_str = ""
+    if date_utc:
+        # Handle formats: "2026-09-21T18:00:00Z", "2026-09-21", "2026-01-15T20:00:00Z"
+        date_part = date_utc.strip()[:10]  # Take first 10 chars (YYYY-MM-DD)
+        if len(date_part) >= 10 and date_part[4] == "-" and date_part[7] == "-":
+            date_str = date_part[:4] + date_part[5:7] + date_part[8:10]
+
     if not home_clean or not away_clean:
         return ""
-    # Extract YYYYMMDD from date_utc (ISO 8601)
-    if not date_utc:
+    if not date_str:
         return ""
-    date_str = date_utc[:10].replace("-", "")
+
     return f"{home_clean}__{away_clean}__{date_str}"
 
 
