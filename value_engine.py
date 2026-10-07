@@ -109,6 +109,63 @@ def _implied_probs(odds_tuple):
     return hp, dp, ap, margin
 
 
+# ---- Canonical 1x2 helpers (§1.21, §3) ----
+
+def _extract_from_1x2(odds_1x2: Dict[str, Any], prefer: str = "current") -> Optional[Tuple[float, float, float]]:
+    """Извлекает odds из канонического 1x2 блока.
+    Формат: match["odds"]["1x2"]["current"]["home"|"draw"|"away"]
+    Также: opening, best, sources[]
+    """
+    if not isinstance(odds_1x2, dict):
+        return None
+    # Priority: current > best > opening
+    for level in (prefer, "current", "best", "opening"):
+        block = odds_1x2.get(level)
+        if isinstance(block, dict):
+            o = _extract_odds_tuple(block)
+            if o:
+                return o
+    # sources[] — массив per-source odds
+    sources = odds_1x2.get("sources")
+    if isinstance(sources, list):
+        best_o = None
+        best_rank = 99
+        for s in sources:
+            if not isinstance(s, dict):
+                continue
+            o = _extract_odds_tuple(s)
+            if o:
+                rank = _PRIORITY_MAP.get(s.get("source", s.get("upstream", "")), 99)
+                if rank < best_rank:
+                    best_rank = rank
+                    best_o = o
+        if best_o:
+            return best_o
+    # Flat: home/draw/away directly in 1x2
+    o = _extract_odds_tuple(odds_1x2)
+    if o:
+        return o
+    return None
+
+
+def _extract_1x2_sources(odds_1x2: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Извлекает список sources[] из 1x2 блока."""
+    if not isinstance(odds_1x2, dict):
+        return []
+    sources = odds_1x2.get("sources")
+    if isinstance(sources, list):
+        return [s for s in sources if isinstance(s, dict)]
+    return []
+
+    h, d, a = odds_tuple
+    hp = 1.0 / h
+    dp = 1.0 / d
+    ap = 1.0 / a
+    total = hp + dp + ap
+    margin = total - 1.0
+    return hp, dp, ap, margin
+
+
 def _normalize_probs(p):
     h, d, a = p
     total = h + d + a
@@ -126,13 +183,33 @@ def calculate_margin(odds: Dict[str, Any]) -> Optional[float]:
 
 
 def extract_odds_pair(all_odds: Dict[str, Any]):
-    """Извлекает (open_odds, closing_odds) из all_odds dict."""
+    """Извлекает (open_odds, closing_odds) из all_odds dict.
+    Сначала пробует канонический 1x2 формат, затем legacy per-source.
+    """
     if not isinstance(all_odds, dict):
         return None, None
+
+    # ── Canonical 1x2 format (§1.21) ──
+    block_1x2 = all_odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        # opening
+        open_odds = _extract_from_1x2(block_1x2, "opening")
+        # current / closing
+        close_odds = _extract_from_1x2(block_1x2, "current")
+        if not close_odds:
+            close_odds = _extract_from_1x2(block_1x2, "best")
+        if open_odds or close_odds:
+            if open_odds and not close_odds:
+                close_odds = open_odds
+            if close_odds and not open_odds:
+                open_odds = close_odds
+            return open_odds, close_odds
+
+    # ── Legacy per-source format ──
     open_odds = None
     close_odds = None
     for source, block in all_odds.items():
-        if not isinstance(block, dict):
+        if not isinstance(block, dict) or source == "1x2":
             continue
         odds_1x2 = block.get("odds", {})
         if isinstance(odds_1x2, dict):
@@ -158,13 +235,38 @@ def extract_odds_pair(all_odds: Dict[str, Any]):
 # ============================================================================
 
 def _extract_best_source(all_odds: Dict[str, Any], prefer: str = "current"):
-    """Извлекает лучший источник по priority map."""
+    """Извлекает лучший источник по priority map.
+    Сначала пробует канонический 1x2 формат (§1.21), затем legacy per-source.
+    """
     if not isinstance(all_odds, dict):
         return None
+
+    # ── Canonical 1x2 format (§1.21) ──
+    block_1x2 = all_odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        o = _extract_from_1x2(block_1x2, prefer)
+        if o:
+            return o
+        # sources[] с priority
+        sources = _extract_1x2_sources(block_1x2)
+        if sources:
+            best = None
+            best_rank = 99
+            for s in sources:
+                o_s = _extract_odds_tuple(s)
+                if o_s:
+                    rank = _PRIORITY_MAP.get(s.get("source", s.get("upstream", "")), 99)
+                    if rank < best_rank:
+                        best_rank = rank
+                        best = o_s
+            if best:
+                return best
+
+    # ── Legacy per-source format ──
     best = None
     best_rank = 99
     for source_name, block in all_odds.items():
-        if not isinstance(block, dict):
+        if not isinstance(block, dict) or source_name == "1x2":
             continue
         rank = _PRIORITY_MAP.get(source_name, 99)
         odds_1x2 = block.get("odds", {})
@@ -281,6 +383,18 @@ def _dqs_od(match: Dict) -> float:
     if not isinstance(odds, dict):
         return 0.0
     score = 0.0
+    # ── Canonical 1x2 format ──
+    block_1x2 = odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        for level in ("current", "opening", "closing", "best"):
+            if isinstance(block_1x2.get(level), dict):
+                if _extract_odds_tuple(block_1x2[level]):
+                    score += 25
+        # sources[]
+        if isinstance(block_1x2.get("sources"), list) and len(block_1x2["sources"]) > 0:
+            score += 25
+        return min(score, 100)
+    # ── Legacy per-source ──
     for level in ("current", "opening", "closing", "best"):
         if any(level in str(k).lower() for k in odds):
             score += 25
@@ -292,6 +406,25 @@ def _dqs_oh(match: Dict) -> float:
     odds = match.get("odds", {})
     if not isinstance(odds, dict):
         return 0.0
+    # ── Canonical 1x2 format ──
+    block_1x2 = odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        src_list = _extract_1x2_sources(block_1x2)
+        count = len(src_list)
+        # Also count current/opening/best as sources
+        for level in ("current", "opening", "best"):
+            if isinstance(block_1x2.get(level), dict) and _extract_odds_tuple(block_1x2[level]):
+                count += 1
+        if count >= 4:
+            return 100
+        if count >= 3:
+            return 80
+        if count >= 2:
+            return 60
+        if count >= 1:
+            return 40
+        return 0
+    # ── Legacy per-source ──
     sources = sum(1 for v in odds.values() if isinstance(v, dict) and v.get("odds"))
     if sources >= 4:
         return 100
@@ -337,8 +470,23 @@ def _dqs_ss(match: Dict) -> float:
     if not isinstance(odds, dict):
         return 0.0
     upstreams = set()
+    # ── Canonical 1x2 format ──
+    block_1x2 = odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        for s in _extract_1x2_sources(block_1x2):
+            up = s.get("upstream") or s.get("source")
+            if up:
+                upstreams.add(up)
+        if upstreams:
+            if len(upstreams) >= 3:
+                return 100
+            if len(upstreams) >= 2:
+                return 70
+            if len(upstreams) >= 1:
+                return 40
+    # ── Legacy per-source ──
     for v in odds.values():
-        if isinstance(v, dict):
+        if isinstance(v, dict) and not (isinstance(v, dict) and v == block_1x2):
             up = v.get("upstream") or v.get("source")
             if up:
                 upstreams.add(up)
@@ -390,6 +538,20 @@ def _dqs_si(match: Dict) -> float:
     if not isinstance(odds, dict):
         return 0.0
     upstreams = set()
+    # ── Canonical 1x2 format ──
+    block_1x2 = odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        for s in _extract_1x2_sources(block_1x2):
+            up = s.get("upstream") or s.get("source")
+            if up:
+                upstreams.add(up)
+        if upstreams:
+            n = len(upstreams)
+            if n >= 4: return 100
+            if n >= 3: return 80
+            if n >= 2: return 50
+            if n >= 1: return 25
+    # ── Legacy per-source ──
     for v in odds.values():
         if isinstance(v, dict):
             up = v.get("upstream") or v.get("source")
@@ -610,8 +772,25 @@ def _calc_source_independence(match: Dict) -> Dict[str, Any]:
     if not isinstance(odds, dict):
         return {"independent_sources": 0, "conflicts": []}
     upstreams = {}
+    # ── Canonical 1x2 format ──
+    block_1x2 = odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        for s in _extract_1x2_sources(block_1x2):
+            up = s.get("upstream") or s.get("source", "unknown")
+            o = _extract_odds_tuple(s)
+            if o:
+                upstreams.setdefault(up, []).append(o)
+        # Also add level-based odds
+        for level in ("current", "opening", "best"):
+            lvl_block = block_1x2.get(level)
+            if isinstance(lvl_block, dict):
+                o = _extract_odds_tuple(lvl_block)
+                if o:
+                    up = lvl_block.get("upstream") or lvl_block.get("source", level)
+                    upstreams.setdefault(up, []).append(o)
+    # ── Legacy per-source ──
     for src, block in odds.items():
-        if isinstance(block, dict):
+        if isinstance(block, dict) and src != "1x2":
             up = block.get("upstream") or block.get("source", src)
             o = _extract_odds_tuple(block.get("odds", {})) if isinstance(block.get("odds"), dict) else None
             if o:
@@ -633,6 +812,23 @@ def _resolve_conflicts(match: Dict) -> Dict[str, Any]:
     if not isinstance(odds, dict):
         return {}
     priority = ["propline", "sharpapi", "odds_api", "bzzoiro", "football_data"]
+    # ── Canonical 1x2 format ──
+    block_1x2 = odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        sources = _extract_1x2_sources(block_1x2)
+        for src in priority:
+            for s in sources:
+                src_name = s.get("source", s.get("upstream", ""))
+                if src_name == src:
+                    o = _extract_odds_tuple(s)
+                    if o:
+                        return {"resolved_source": src, "odds": {"home": o[0], "draw": o[1], "away": o[2]}}
+        # levels as fallback
+        for level in ("current", "best", "opening"):
+            o = _extract_from_1x2(block_1x2, level)
+            if o:
+                return {"resolved_source": level, "odds": {"home": o[0], "draw": o[1], "away": o[2]}}
+    # ── Legacy per-source ──
     for src in priority:
         block = odds.get(src)
         if isinstance(block, dict) and block.get("odds"):
@@ -672,8 +868,23 @@ def _calc_odds_snapshot(match: Dict) -> Dict[str, Any]:
         return {"levels": [], "median": None, "line_dispersion": {}, "snapshot_version": 0}
     sources = []
     levels = []
+    # ── Canonical 1x2 format ──
+    block_1x2 = odds.get("1x2")
+    if isinstance(block_1x2, dict):
+        for level in ("current", "opening", "best"):
+            o = _extract_from_1x2(block_1x2, level)
+            if o:
+                sources.append(o)
+                levels.append(level)
+        for s in _extract_1x2_sources(block_1x2):
+            o = _extract_odds_tuple(s)
+            if o:
+                sources.append(o)
+                src_name = s.get("source", s.get("upstream", "unknown"))
+                levels.append(src_name)
+    # ── Legacy per-source ──
     for src, block in odds.items():
-        if isinstance(block, dict) and isinstance(block.get("odds"), dict):
+        if isinstance(block, dict) and src != "1x2" and isinstance(block.get("odds"), dict):
             o = _extract_odds_tuple(block["odds"])
             if o:
                 sources.append(o)
@@ -1531,6 +1742,10 @@ def run_pipeline(matches: List[Dict[str, Any]],
                   history_map: Optional[Dict[str, List]] = None,
                   value_threshold: Optional[float] = None) -> Dict[str, Any]:
     """Пайплайн для main.py. Возвращает {hot, warm, stats, results}."""
+    # FIX: dict→list нормализация (get_matches_by_date_range возвращает dict)
+    if isinstance(matches, dict):
+        matches = list(matches.values())
+
     if value_threshold is None:
         if _get_threshold:
             try:
@@ -1544,17 +1759,12 @@ def run_pipeline(matches: List[Dict[str, Any]],
     warm = []
     results = []
     errors = 0
-
-    # FIX: dict→list normalization — main.py passes dict from get_matches_by_date_range()
-    if isinstance(matches, dict):
-        matches = list(matches.values())
-
-    # Stats counters (main.py expects these keys)
-    value_bets = 0
+    # Stats counters (для main.py дашборда)
     with_odds = 0
     with_pred = 0
     with_h2h = 0
     with_stats = 0
+    value_bets = 0
 
     for match in matches:
         if is_shutdown_requested():
@@ -1563,29 +1773,32 @@ def run_pipeline(matches: List[Dict[str, Any]],
         try:
             cid = match.get("canonical_id", "")
             history = history_map.get(cid, []) if history_map else None
+            # Count stats
+            best_odds = _extract_best_source(match.get("odds", {})) if isinstance(match.get("odds"), dict) else None
+            if best_odds:
+                with_odds += 1
+            pred = match.get("predictions") or match.get("bzzoiro_predictions")
+            if isinstance(pred, dict) and pred.get("home_win") is not None:
+                with_pred += 1
+            if match.get("h2h") or history:
+                with_h2h += 1
+            if isinstance(match.get("stats"), dict) and match.get("stats"):
+                with_stats += 1
+
             analysis = analyze_match(match, history, value_threshold)
             if analysis.get("error"):
                 errors += 1
                 continue
-            # Attach original match for dashboard transform in main.py
+            # Attach original match for dashboard
             analysis["_match"] = match
             results.append(analysis)
-            # Count stats
-            if analysis.get("odds"):
-                with_odds += 1
-            if analysis.get("value_pct", 0) >= value_threshold:
-                value_bets += 1
-            if analysis.get("consensus", {}).get("probs"):
-                with_pred += 1
-            if match.get("h2h"):
-                with_h2h += 1
-            if match.get("stats"):
-                with_stats += 1
             cls = analysis.get("classification", "SKIP")
             if cls == "HOT":
                 hot.append(analysis)
+                value_bets += 1
             elif cls == "WARM":
                 warm.append(analysis)
+                value_bets += 1
         except Exception as e:
             errors += 1
             logger.warning("pipeline error: %s", e)
@@ -1601,12 +1814,12 @@ def run_pipeline(matches: List[Dict[str, Any]],
         "warm": len(warm),
         "errors": errors,
         "value_threshold": value_threshold,
-        # Keys expected by main.py (§28)
-        "value_bets": value_bets,
+        # v9.3-audited: keys для main.py дашборда
         "with_odds": with_odds,
         "with_pred": with_pred,
         "with_h2h": with_h2h,
         "with_stats": with_stats,
+        "value_bets": value_bets,
     }
 
     return {"hot": hot, "warm": warm, "stats": stats, "results": results}
