@@ -1,11 +1,10 @@
 """
-team_registry.py — v9.5-full
+team_registry.py — v9.4-bulk
 Canonical team name registry + normalization for GatekeeperAI
 ~2850 aliases / ~1500 unique teams / 58 countries
 """
 
-__version__ = "9.5-full"
-
+__version__ = "9.4-bulk"
 
 import re
 import unicodedata
@@ -2422,7 +2421,7 @@ TEAM_ALIASES = {
     "club lanus": "lanus",
     "club libertad": "libertad_py",
     "club nxt": "club_nxt",
-    "club olimpia": "olibia",
+    "club olimpia": "olimpia",
     "club omnisports meknes": "cod_meknes",
     "com": "comoros",
     "comoros": "comoros",
@@ -2754,9 +2753,9 @@ TEAM_ALIASES = {
     "oldham": "oldham",
     "oldham athletic": "oldham",
     "olhanense": "olhanense",
-    "olibia": "olibia",
-    "olimpia": "olibia",
-    "olimpia paraguay": "olibia",
+    "olimpia": "olimpia",
+    "olimpia": "olimpia",
+    "olimpia paraguay": "olimpia",
     "olympique de gremda": "og_ariana",
     "olympique safi": "oc_safi",
     "ordabasy": "ordabasy",
@@ -2981,23 +2980,6 @@ TEAM_ALIASES = {
     "zepceljak sarajevo": "sarajevo",
     "zulte waregem": "zulte_waregem",
 
-    # === SharpAPI compatibility aliases ===
-    "bayern munchen": "bayern_munich",
-    "fc bayern munchen": "bayern_munich",
-    "feyenoord rotterdam": "feyenoord",
-    "benfica sl": "benfica",
-    "real madrid cf": "real_madrid",
-    "atletico madrid sa": "atletico_madrid",
-    "sevilla fc": "sevilla",
-    "valencia cf": "valencia",
-    "villarreal cf": "villarreal",
-    "real betis balompie": "betis",
-    "porto fc": "porto",
-    "sporting cp": "sporting_br",
-    "celtic glasgow": "celtic",
-    "ferencvarosi": "ferencvaros",
-    "nfc volos": "volos",
-
 }
 
 # ============================================================
@@ -3086,22 +3068,32 @@ def clean_team_name(raw: str) -> str:
     return fallback
 
 
-
-# ============================================================
-# Public API: build_canonical_id
-# ============================================================
-
-def build_canonical_id(raw_name: str) -> str:
-    """
-    Public API: convert raw team name to canonical ID.
-    Alias for clean_team_name(), used by collectors and pipeline.
-    """
-    return clean_team_name(raw_name)
-
-
 # ============================================================
 # Tests
 # ============================================================
+
+
+# ============================================================
+# build_canonical_id — per §1.18, §3
+# canonical_id = {home_clean}__{away_clean}__{YYYYMMDD}
+# ============================================================
+
+def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
+    """
+    Build canonical match ID from team names and date.
+    Format: {home_clean}__{away_clean}__{YYYYMMDD}
+    Returns empty string if either team is empty.
+    """
+    home_clean = clean_team_name(home_team)
+    away_clean = clean_team_name(away_team)
+    if not home_clean or not away_clean:
+        return ""
+    # Extract YYYYMMDD from date_utc (ISO 8601)
+    if not date_utc:
+        return ""
+    date_str = date_utc[:10].replace("-", "")
+    return f"{home_clean}__{away_clean}__{date_str}"
+
 
 if __name__ == "__main__":
     # Test pairs from match dump
