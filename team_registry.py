@@ -1,10 +1,10 @@
 """
-team_registry.py — v9.4-bulk
+team_registry.py — v9.3-audited
 Canonical team name registry + normalization for GatekeeperAI
 ~2850 aliases / ~1500 unique teams / 58 countries
 """
 
-__version__ = "9.4-bulk"
+__version__ = "9.3-audited"
 
 import re
 import unicodedata
@@ -26,8 +26,8 @@ TEAM_ALIASES = {
     "chelsea fc": "chelsea",
     "liverpool": "liverpool",
     "liverpool fc": "liverpool",
-    "manchester city": "man_city",
-    "man city": "man_city",
+    "manchester city": "city",
+    "man city": "city",
     "manchester united": "man",
     "man utd": "man",
     "man united": "man",
@@ -1130,7 +1130,7 @@ TEAM_ALIASES = {
     "fc sochi": "sochi",
     "ural yekaterinburg": "ural",
     "ural": "ural",
-    "nizhny novgorod": "nizhny_novorossiysk",
+    "nizhny novgorod": "nizhny_novgorod",
     "khimki": "khimki",
     "fakel voronezh": "fakel",
     "fakel": "fakel",
