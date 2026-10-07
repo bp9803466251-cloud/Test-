@@ -397,6 +397,46 @@ TEAM_ALIASES = {
     "america mineiro": "america_mineiro",
     "america mg": "america_mineiro",
 
+    # Brazil — state suffixes (Propline uses -RJ, -MG, -BA, etc.)
+    "botafogo rj": "botafogo",
+    "botafogo-rj": "botafogo",
+    "vasco da gama rj": "vasco",
+    "vasco da gama-rj": "vasco",
+    "vasco_da_gama-rj": "vasco",
+    "cruzeiro mg": "cruzeiro",
+    "cruzeiro-mg": "cruzeiro",
+    "vitoria ba": "vitoria_ba",
+    "vitoria-ba": "vitoria_ba",
+    "vitoria salvador": "vitoria_ba",
+    "internacional rs": "internacional",
+    "internacional-rs": "internacional",
+    "bragantino sp": "bragantino",
+    "bragantino-sp": "bragantino",
+    "red bull bragantino": "bragantino",
+    "fortaleza ce": "fortaleza",
+    "fortaleza-ce": "fortaleza",
+    "chapecoense sc": "chapecoense",
+    "chapecoense-sc": "chapecoense",
+    "vila nova go": "vila_nova",
+    "vila nova-go": "vila_nova",
+    "remo pa": "remo",
+    "remo-pa": "remo",
+    "cuiaba mt": "cuiaba",
+    "cuiaba-mt": "cuiaba",
+    "operario pr": "operario_pr",
+    "operario-pr": "operario_pr",
+    "operario ferroviario": "operario_pr",
+    "botafogo sp": "botafogo_sp",
+    "botafogo-sp": "botafogo_sp",
+    "america mineiro mg": "america_mineiro",
+    "atletico goianiense go": "atletico_goianiense",
+    "atletico go": "atletico_goianiense",
+
+    # Brazil — Serie C / full names
+    "clube de regatas brasil": "crb",
+    "crb": "crb",
+    "regatas": "crb",
+
     # Argentina
     "river plate": "river_plate",
     "boca juniors": "boca_juniors",
@@ -700,37 +740,6 @@ TEAM_ALIASES = {
     "ai stockholm": "ai",
     "aik": "ai",
 
-
-    # Finland — Veikkausliiga
-    "fc inter turku": "inter_turku",
-    "inter turku": "inter_turku",
-    "fc lahti": "lahti",
-    "lahti": "lahti",
-    "fc honka": "honka",
-    "honka": "honka",
-    "hjk": "hjk",
-    "hjk helsinki": "hjk",
-    "vps": "vps",
-    "vps vaasa": "vps",
-    "kuopion palloseura": "kuopion_palloseura",
-    "kups": "kuopion_palloseura",
-    "ac oulu": "ac_oulu",
-    "oulu": "ac_oulu",
-    "if gnistan": "if_gnistan",
-    "gnistan": "if_gnistan",
-    "ilves": "ilves",
-    "ilves tampere": "ilves",
-    "sjk": "sjk",
-    "seinjaen jalkapallokerho": "sjk",
-    "rops": "rops",
-    "rovanmen palloseura": "rops",
-    "ktp": "ktp",
-    "kotka": "ktp",
-    "fc ktp": "ktp",
-    "elpo": "elpo",
-    "elpo viitasaari": "elpo",
-
-
     # Norway
     "molde": "molde",
     "molde fk": "molde",
@@ -983,54 +992,32 @@ TEAM_ALIASES = {
     "waasland-beveren": "waasland_beveren",
     "waasland beveren": "waasland_beveren",
     "sebastien"  : "sebastien",
-    # Brazil — Serie C extras
-    "clube de regatas brasil": "crb",
-    "crb": "crb",
-    "atletico goianiense": "atletico_goianiense",
-    "atletico go": "atletico_goianiense",
-    "atletico-go": "atletico_goianiense",
-    # Brazil — state suffixes (state codes as suffixes)
-    "botafogo rj": "botafogo",
-    "vasco da gama rj": "vasco",
-    "red bull bragantino": "bragantino",
-    "bragantino sp": "bragantino",
-    "vitoria salvador": "vitoria_ba",
-    "vitoria ba": "vitoria_ba",
-    "internacional rs": "internacional",
-    "fortaleza ce": "fortaleza",
-    "cruzeiro mg": "cruzeiro",
-    "operario ferroviario": "operario_pr",
-    "operario pr": "operario_pr",
-    "botafogo sp": "botafogo_sp",
-    "vila nova go": "vila_nova",
-    "vila nova": "vila_nova",
-    "cuiaba mt": "cuiaba",
-    "remo pa": "remo",
-    "chapecoense sc": "chapecoense",
-    "gremio rs": "gremio",
-    "sao paulo sp": "sao_paulo",
-    "corinthians sp": "corinthians",
-    "america mineiro mg": "america_mineiro",
-    "atletico mineiro mg": "atletico_mineiro",
-    "flamengo rj": "flamengo",
-    "fluminense rj": "fluminense",
-    "palmeiras sp": "palmeiras",
-    "santos sp": "santos",
-    "atletico paranaense pr": "atletico_paranaense",
-    "athletico paranaense pr": "atletico_paranaense",
-    "goias go": "goias",
-    "bahia ba": "bahia",
-    "ceara ce": "ceara",
-    "juventude rs": "juventude",
-    "sport recife pe": "sport_recife",
-    "criciuma sc": "criciuma",
-    "coritiba pr": "coritiba",
-    "avai sc": "avai",
-    "londrina pr": "londrina",
-    "crb": "crb",
-    "clube de regatas brasil": "crb",
-    "atletico goianiense": "atletico_goianiense",
-    "atletico go": "atletico_goianiense",
+    # Finland — Veikkausliiga
+    "hjk": "hjk",
+    "helsinkin jalkapalloklubi": "hjk",
+    "vps": "vps",
+    "vaasan palloseura": "vps",
+    "inter turku": "inter_turku",
+    "fc inter turku": "inter_turku",
+    "if gnistan": "if_gnistan",
+    "gnistan": "if_gnistan",
+    "kuopion palloseura": "kups",
+    "kups": "kups",
+    "kuPS": "kups",
+    "ilves": "ilves",
+    "lahti": "lahti",
+    "fc lahti": "lahti",
+    "sJK": "sjk",
+    "sjk": "sjk",
+    "seinjaeki jalkapallokerho": "sjk",
+    "haka": "haka",
+    "valkeakosken haka": "haka",
+    "ac oulu": "ac_oulu",
+    "oulu": "ac_oulu",
+    "rops": "rops",
+    "rovanian palloseura": "rops",
+    "mariehamn": "mariehamn",
+    "ifk mariehamn": "mariehamn",
 
 }
 
@@ -1093,7 +1080,7 @@ def clean_team_name(name: str) -> str:
             return TEAM_ALIASES[slash_key2]
 
         # Шаг 5: Fallback — заменяем пробелы на подчёркивания
-        return stripped.replace(" ", "_")
+        return stripped.replace(" ", "_").replace("-", "_")
     except Exception as e:
         logger.warning("clean_team_name error for %r: %s", name, e)
         return ""
@@ -1134,6 +1121,6 @@ def normalize_team_name(name: str) -> str:
     """
     return clean_team_name(name)
 
-__version__ = "9.4-alias"
+__version__ = "9.3-audited"
 
 # __all__ moved to top
