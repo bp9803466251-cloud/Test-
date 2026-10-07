@@ -1,8 +1,11 @@
 """
 team_registry.py — v9.5-full
 Canonical team name registry + normalization for GatekeeperAI
-~2900 aliases / ~1520 unique teams / 58 countries
+~2850 aliases / ~1500 unique teams / 58 countries
 """
+
+__version__ = "9.5-full"
+
 
 import re
 import unicodedata
@@ -313,21 +316,15 @@ TEAM_ALIASES = {
     "bolzano": "south_tyrol",
     "sudtirol": "south_tyrol",
     "el verona": "hellas_verona",
-        "lecco": "lecco",
-    "catanzaro": "catanzaro",
-    "catanzaro fc": "catanzaro",
+    "lecco": "lecco",
 
     # === GERMANY — Bundesliga + 2. Bundesliga + Liga 3 ===
-        "bayern munich": "bayern_munich",
-    "bayern munchen": "bayern_munich",
+    "bayern munich": "bayern_munich",
     "bayern": "bayern_munich",
     "fc bayern": "bayern_munich",
-    "fcb": "bayern_munich",
     "borussia dortmund": "dortmund",
-    "borussia dortmund gmbh": "dortmund",
     "dortmund": "dortmund",
     "bvb": "dortmund",
-    "ballspielverein borussia 09": "dortmund",
     "rb leipzig": "rb_leipzig",
     "leipzig": "rb_leipzig",
     "leverkusen": "leverkusen",
@@ -510,8 +507,6 @@ TEAM_ALIASES = {
     "psv eindhoven": "psv",
     "eindhoven": "psv",
     "feyenoord": "feyenoord",
-    "feyenoord rotterdam": "feyenoord",
-    "feyenoord 1908": "feyenoord",
     "az alkmaar": "az_alkmaar",
     "az": "az_alkmaar",
     "twente": "twente",
@@ -581,7 +576,6 @@ TEAM_ALIASES = {
     # === PORTUGAL — Primeira Liga ===
     "benfica": "benfica",
     "sl benfica": "benfica",
-    "benfica sl": "benfica",
     "porto": "porto",
     "fc porto": "porto",
     "sporting": "sporting_cp",
@@ -1835,7 +1829,7 @@ TEAM_ALIASES = {
     "cod meknes": "cod_meknes",
     "ittihad tanger": "ittihad_tanger",
     "difaa el jadida": "difaa_el_jadida",
-    "difaa hassani el jadidi": "difaa_el_jadida",
+    "difaâ hassani el-jadidi": "difaa_el_jadida",
     "union touarga sport": "union_touarga_sport",
     "union touarga": "union_touarga_sport",
     "touarga": "union_touarga_sport",
@@ -2428,7 +2422,7 @@ TEAM_ALIASES = {
     "club lanus": "lanus",
     "club libertad": "libertad_py",
     "club nxt": "club_nxt",
-    "club olimpia": "olimpia",
+    "club olimpia": "olibia",
     "club omnisports meknes": "cod_meknes",
     "com": "comoros",
     "comoros": "comoros",
@@ -2760,9 +2754,9 @@ TEAM_ALIASES = {
     "oldham": "oldham",
     "oldham athletic": "oldham",
     "olhanense": "olhanense",
-    "olimpia": "olimpia",
-    "olimpia": "olimpia",
-    "olimpia paraguay": "olimpia",
+    "olibia": "olibia",
+    "olimpia": "olibia",
+    "olimpia paraguay": "olibia",
     "olympique de gremda": "og_ariana",
     "olympique safi": "oc_safi",
     "ordabasy": "ordabasy",
@@ -2987,150 +2981,22 @@ TEAM_ALIASES = {
     "zepceljak sarajevo": "sarajevo",
     "zulte waregem": "zulte_waregem",
 
-    # === FIFA CLUB WORLD CUP ===
-    "club world cup": "club_world_cup",
-    "fifa club world cup": "club_world_cup",
-    "cwc": "club_world_cup",
-    "inter miami cwc": "inter_miami",
-    "al hilal cwc": "al_hilal",
-    "al ain cwc": "al_ain",
-    "auckland city": "auckland_city",
-    "wydad ac cwc": "wydad",
-    "mamelodi sundowns cwc": "sundowns",
-    "palmeiras cwc": "palmeiras",
-    "flamengo cwc": "flamengo",
-    "fluminense cwc": "fluminense",
-    "botafogo cwc": "botafogo",
-    "river plate cwc": "river_plate",
-    "boca juniors cwc": "boca_juniors",
-    "atletico madrid cwc": "atletico_madrid",
-    "real madrid cwc": "real_madrid",
-    "man city cwc": "man_city",
-    "bayern munich cwc": "bayern_munich",
-    "dortmund cwc": "dortmund",
-    "psg cwc": "psg",
-    "inter milan cwc": "inter_milan",
-    "juventus cwc": "juventus",
-    "porto cwc": "porto",
-    "benfica cwc": "benfica",
-    "chelsea cwc": "chelsea",
-    "salzburg cwc": "salzburg",
-    "al ahly cwc": "al_ahly",
-    "es tunis cwc": "es_tunis",
-    "monterrey cwc": "monterrey",
-    "tigres cwc": "tigres",
-    "pachuca cwc": "pachuca",
-    "seattle sounders cwc": "seattle_sounders",
-    "leon cwc": "leon",
-    "ulsan cwc": "ulsan_hyundai",
-    "urawa reds": "urawa_reds",
-    "urawa red diamonds": "urawa_reds",
-
-    # === WOMEN'S WORLD CUP ===
-    "womens world cup": "womens_world_cup",
-    "wwc": "womens_world_cup",
-    "usa w": "usa_w",
-    "usa womens": "usa_w",
-    "england w": "england_w",
-    "lionesses": "england_w",
-    "germany w": "germany_w",
-    "france w": "france_w",
-    "spain w": "spain_w",
-    "sweden w": "sweden_w",
-    "netherlands w": "netherlands_w",
-    "japan w": "japan_w",
-    "nadeshiko": "japan_w",
-    "australia w": "australia_w",
-    "matildas": "australia_w",
-    "canada w": "canada_w",
-    "brazil w": "brazil_w",
-    "norway w": "norway_w",
-    "italy w": "italy_w",
-    "denmark w": "denmark_w",
-    "china w": "china_w",
-    "south korea w": "south_korea_w",
-    "switzerland w": "switzerland_w",
-    "colombia w": "colombia_w",
-    "morocco w": "morocco_w",
-    "nigeria w": "nigeria_w",
-    "south africa w": "south_africa_w",
-    "zambia w": "zambia_w",
-    "ireland w": "ireland_w",
-    "new zealand w": "new_zealand_w",
-    "argentina w": "argentina_w",
-    "portugal w": "portugal_w",
-    "haiti w": "haiti_w",
-    "panama w": "panama_w",
-    "philippines w": "philippines_w",
-    "vietnam w": "vietnam_w",
-    "costa rica w": "costa_rica_w",
-    "jamaica w": "jamaica_w",
-
-    # === FRAUEN-BUNDESLIGA ===
-    "bayern munich w": "bayern_w",
-    "bayern womens": "bayern_w",
-    "wolfsburg w": "wolfsburg_w",
-    "frankfurt w": "frankfurt_w",
-    "hoffenheim w": "hoffenheim_w",
-    "leverkusen w": "leverkusen_w",
-    "freiburg w": "freiburg_w",
-    "potsdam": "potsdam",
-    "turbinen potsdam": "potsdam",
-    "essen w": "essen_w",
-    "werder bremen w": "werder_bremen_w",
-    "meppen w": "meppen_w",
-    "koln w": "koln_w",
-    "sand w": "sand_w",
-    "jena w": "jena_w",
-    "rb leipzig w": "rb_leipzig_w",
-
-    # === UEFA WOMEN'S CHAMPIONS LEAGUE ===
-    "lyon w": "lyon_w",
-    "lyon femmes": "lyon_w",
-    "ol lyonnes": "lyon_w",
-    "barcelona w": "barcelona_w",
-    "chelsea w": "chelsea_w",
-    "wolfsburg w cl": "wolfsburg_w",
-    "arsenal w": "arsenal_w",
-    "psg w": "psg_w",
-    "bayern w cl": "bayern_w",
-    "rosengard": "rosengard",
-    "hacken w": "hacken_w",
-    "juventus w": "juventus_w",
-    "roma w": "roma_w",
-    "fiorentina w": "fiorentina_w",
-    "inter w": "inter_w",
-    "real madrid w": "real_madrid_w",
-    "real madrid fem": "real_madrid_w",
-    "atletico madrid w": "atletico_w",
-    "benfica w": "benfica_w",
-    "brann w": "brann_w",
-    "valerenga w": "valerenga_w",
-    "sparta prague w": "sparta_prague_w",
-    "st polten": "st_polten",
-    "celtic w": "celtic_w",
-    "glasgow city": "glasgow_city",
-    "breidablik w": "breidablik_w",
-    "ajax w": "ajax_w",
-    "twente w": "twente_w",
-    "fortuna hjorring": "fortuna_hjorring",
-    "koge w": "koge_w",
-
-    # === NPL QUEENSLAND ===
-    "brisbane city": "brisbane_city_qld",
-    "brisbane strikers": "brisbane_strikers",
-    "gold coast united": "gold_coast_united",
-    "logan lightning": "logan_lightning",
-    "western pride": "western_pride_qld",
-    "redlands united": "redlands_united",
-    "moreton bay united": "moreton_bay_united",
-    "olympic fc": "olympic_fc_qld",
-    "lions fc": "lions_fc_qld",
-    "magpies crusaders": "magpies_crusaders",
-    "edge hill united": "edge_hill_united",
-    "fnq heat": "fnq_heat",
-    "souths united": "souths_united_qld",
-    "qas": "qas",
+    # === SharpAPI compatibility aliases ===
+    "bayern munchen": "bayern_munich",
+    "fc bayern munchen": "bayern_munich",
+    "feyenoord rotterdam": "feyenoord",
+    "benfica sl": "benfica",
+    "real madrid cf": "real_madrid",
+    "atletico madrid sa": "atletico_madrid",
+    "sevilla fc": "sevilla",
+    "valencia cf": "valencia",
+    "villarreal cf": "villarreal",
+    "real betis balompie": "betis",
+    "porto fc": "porto",
+    "sporting cp": "sporting_br",
+    "celtic glasgow": "celtic",
+    "ferencvarosi": "ferencvaros",
+    "nfc volos": "volos",
 
 }
 
@@ -3151,7 +3017,7 @@ _STRIP_SUFFIXES = (
 def clean_team_name(raw: str) -> str:
     """
     Normalize a raw team name to a canonical key.
-    10 steps: lowercase -> diacritics -> special chars -> underscore/hyphen lookups ->
+    9 steps: lowercase -> diacritics -> underscore/hyphen lookups ->
     suffix strip -> combined -> brackets -> fallback.
     """
     if not raw:
@@ -3163,18 +3029,6 @@ def clean_team_name(raw: str) -> str:
     # Step 2: strip diacritics (NFD)
     key = unicodedata.normalize("NFD", key)
     key = "".join(c for c in key if unicodedata.category(c) != "Mn")
-
-    # Step 2a: replace special chars not handled by NFD
-    _SPECIAL_CHARS = {
-        "ø": "o", "Ø": "o",
-        "æ": "ae", "Æ": "ae",
-        "ð": "d", "Ð": "d",
-        "ß": "ss",
-        "þ": "th", "Þ": "th",
-        "œ": "oe", "Œ": "oe",
-    }
-    for old, new in _SPECIAL_CHARS.items():
-        key = key.replace(old, new)
 
     # Step 2b: underscore -> space, lookup
     if "_" in key:
@@ -3191,16 +3045,6 @@ def clean_team_name(raw: str) -> str:
     # Direct lookup
     if key in TEAM_ALIASES:
         return TEAM_ALIASES[key]
-
-    # Step 3a: underscore -> space, then suffix strip
-    spaced_key = key.replace("_", " ")
-    if spaced_key != key:
-        for suffix in _STRIP_SUFFIXES:
-            if spaced_key.endswith(suffix) and len(spaced_key) > len(suffix) + 2:
-                stripped = spaced_key[:-len(suffix)]
-                if stripped in TEAM_ALIASES:
-                    return TEAM_ALIASES[stripped]
-                break
 
     # Step 3: strip suffixes (fc, cf, afc, sc, etc.)
     for suffix in _STRIP_SUFFIXES:
@@ -3240,6 +3084,19 @@ def clean_team_name(raw: str) -> str:
     while "__" in fallback:
         fallback = fallback.replace("__", "_")
     return fallback
+
+
+
+# ============================================================
+# Public API: build_canonical_id
+# ============================================================
+
+def build_canonical_id(raw_name: str) -> str:
+    """
+    Public API: convert raw team name to canonical ID.
+    Alias for clean_team_name(), used by collectors and pipeline.
+    """
+    return clean_team_name(raw_name)
 
 
 # ============================================================
@@ -3315,7 +3172,4 @@ if __name__ == "__main__":
     # Count stats
     print(f"\nTotal aliases: {len(TEAM_ALIASES)}")
     unique_canonical = len(set(TEAM_ALIASES.values()))
-
-
-
     print(f"Unique canonical names: {unique_canonical}")
