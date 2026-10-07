@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Collector Bzzoiro v8.12-bulk (API v2 — bulk odds + predictions + per-event H2H/stats)
+Collector Bzzoiro v8.14-fix (API v2 — bulk odds + predictions + per-event H2H/stats)
 GatekeeperAI v9.3-audited
+
+Изменения v8.14-fix (поверх v8.12-bulk):
+  - FIX-1: Per-event predictions URL /events/{id}/prediction (ед.ч.) вместо /predictions (мн.ч.) → 404
+  - FIX-2: Bulk predictions event_id извлечение из event.id (вложенный) вместо item.id (prediction ID)
+  - FIX-3: 404 handling — except HTTPError возвращает _NOT_FOUND (urlopen бросает HTTPError)
+  - FIX-4: Prediction parsing — markets.match_result → {home_win, draw, away_win, confidence}
 
 Изменения v8.12-bulk:
   - Bulk odds: GET /odds/?date_from=&date_to= (2-3 запроса вместо 140 per-event)
@@ -91,7 +97,7 @@ HTTP_TIMEOUT = int(os.environ.get("BZZOIRO_HTTP_TIMEOUT", "10"))
 
 BZZOIRO_UPSTREAM = "opta"
 
-__version__ = "8.12-bulk"
+__version__ = "8.14-fix"
 __all__ = [
     "collect_bzzoiro",
     "collect_and_process",
@@ -120,9 +126,6 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
             req = urllib.request.Request(url, headers=headers)
             resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
 
-            if resp.status == 404:
-                _cache_response(url, _NOT_FOUND)
-                return _NOT_FOUND
             if resp.status == 429:
                 wait = 2 ** (attempt + 2)
                 logger.warning(f"Rate limit. Waiting {wait}s")
@@ -140,6 +143,20 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
             time.sleep(RATE_DELAY)
             return data
 
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                _cache_response(url, _NOT_FOUND)
+                return _NOT_FOUND
+            if e.code == 429:
+                wait = 2 ** (attempt + 2)
+                logger.warning(f"Rate limit (429). Waiting {wait}s")
+                time.sleep(wait)
+                continue
+            if attempt < max_retries:
+                time.sleep(RATE_DELAY * 2)
+                continue
+            logger.error(f"HTTP {e.code}: {e.reason} — {url}")
+            return None
         except (urllib.error.URLError, json.JSONDecodeError) as e:
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
@@ -345,7 +362,11 @@ def _fetch_bulk_predictions(headers: dict, date_from: str, date_to: str) -> dict
             break
         
         for item in items:
-            eid = str(item.get("event_id", item.get("id", "")))
+            # BSD prediction shape: { "id": 88123, "event": { "id": 223510, ... } }
+            # event_id is nested in event.id, not top-level
+            eid = str(item.get("event_id") or
+                      (item.get("event", {}) or {}).get("id") or
+                      item.get("id", ""))
             if eid and eid != "None":
                 result[eid] = item
         
@@ -641,13 +662,28 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 if bulk_used and bid_str in bulk_preds:
                     pred_data = bulk_preds[bid_str]
                 else:
-                    pred_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/predictions"
+                    pred_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/prediction"
                     pred_data = _fetch_bzzoiro(pred_url, headers, max_retries=MAX_RETRIES)
 
                 if pred_data is _NOT_FOUND:
                     not_found += 1
                 elif pred_data and isinstance(pred_data, dict):
-                    inner_pred = pred_data.get("prediction", pred_data)
+                    # BSD prediction: { "id":..., "event":..., "markets": {"match_result": {...}}, "model": {...} }
+                    markets = pred_data.get("markets", {})
+                    match_result = markets.get("match_result", {})
+                    model = pred_data.get("model", {})
+                    inner_pred = {
+                        "home_win": match_result.get("prob_home"),
+                        "draw": match_result.get("prob_draw"),
+                        "away_win": match_result.get("prob_away"),
+                        "predicted": match_result.get("predicted"),
+                        "confidence": model.get("confidence"),
+                        "model_version": model.get("version"),
+                        "expected_goals": markets.get("expected_goals", {}),
+                        "over_under": markets.get("over_under", {}),
+                        "btts": markets.get("btts", {}),
+                    }
+                    inner_pred = {k: v for k, v in inner_pred.items() if v is not None}
                     if isinstance(inner_pred, dict) and inner_pred:
                         idem_key = f"{run_id}:{cid}:predictions:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:predictions:{bzzoiro_id}"
                         try:
