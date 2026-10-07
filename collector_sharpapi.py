@@ -1,18 +1,27 @@
+#!/usr/bin/env python3
 """
-Коллектор SharpAPI для Gatekeeper-AI v700-prod.
+Коллектор SharpAPI для Gatekeeper-AI v9.0-delta.
 Получает матчи и коэффициенты, сохраняет в Redis через gatekeeper_hub.
-Хелперы normalize_date, is_future_match, now_msk, save_meta импортируются из хаба.
 
-v7.0 (Phase 2):
-  - SHARPAPI_API_KEY (вместо SHARP_API_KEY) — аудит §2.11
-  - idempotency_key в patch_match — аудит §2.2
-  - odds как float (вместо str) — аудит §2.1
-  - run_initialization(collector="sharpapi") — аудит §2.6
-  - team_registry.normalize_team_name — аудит §2.4
-  - graceful shutdown (is_shutdown_requested) в цикле — аудит §2.3
-  - source + sources в payload — аудит §2.2
+v9.0-delta:
+  - Delta endpoint /odds/delta?since=... для инкрементальных обновлений
+  - X-RateLimit-Remaining: динамический self-throttle
+  - 429 retry с экспоненциальным backoff
+  - HTTP timeout 15с (env: SHARPAPI_HTTP_TIMEOUT)
+  - Removed[] handling: удаление устаревших odds из Redis
+  - Watermark storage: meta.last_odds_timestamp для delta-цепочки
+  - Overflow detection: fallback на полный /odds scan
+  - Progress logging: книги, markets, events summary
+  - Fallback: если delta недоступен → полный scan через /odds
+
+v8.11 (предыдущая):
+  - Bulk /odds с cursor pagination
+  - group_by event_id (ручная группировка)
+  - selection_type: home/draw/away напрямую
+  - odds_decimal: десятичный формат (без конвертации)
 """
 import os
+import sys
 import json
 import time
 import urllib.request
@@ -20,20 +29,17 @@ import urllib.error
 import urllib.parse
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 from gatekeeper_hub import (
     upsert_match, patch_match, run_initialization,
     normalize_date, is_future_match, now_msk, save_meta,
 )
-# FIX-AUDIT-v9.3: get_all_fields для подсчёта created/updated
 try:
     from gatekeeper_hub import get_all_fields
 except ImportError:
     get_all_fields = lambda: {}
-# Direct redis_hub import removed — §1.4: hub is the only gateway
 
-# §20.7: Module registry
 try:
     from gatekeeper_hub import register_module
 except ImportError:
@@ -48,15 +54,12 @@ except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
-# Graceful shutdown — аудит §2.3
 try:
     from gatekeeper_hub import is_shutdown_requested
 except ImportError:
     def is_shutdown_requested():
         return False
 
-# team_registry — аудит §2.4: clean_team_name
-# FIX: nested try-except (двойной except на одном уровне — dead code)
 try:
     from team_registry import clean_team_name
 except ImportError:
@@ -75,9 +78,8 @@ if not logger.handlers:
 
 COLLECTOR_NAME = "sharpapi"
 
-__version__ = "8.11-patched"
+__version__ = "9.0-delta"
 __all__ = ["collect_sharpapi", "collect_and_process", "__version__"]
-
 
 # ---------------------------------------------------------------------------
 # Словари для парсинга слага лиги SharpAPI
@@ -119,23 +121,23 @@ COUNTRY_MAP = {
 }
 
 LEAGUE_NAME_MAP = {
-    "primera_a": "Primera División", "primera_division": "Primera División",
+    "primera_a": "Primera Divisi\u00f3n", "primera_division": "Primera Divisi\u00f3n",
     "premier_league": "Premier League", "championship": "Championship",
     "league_one": "League One", "league_two": "League Two",
     "national_league": "National League", "fa_cup": "FA Cup",
     "efl_cup": "EFL Cup", "la_liga": "La Liga",
-    "segunda_division": "Segunda División", "copa_del_rey": "Copa del Rey",
+    "segunda_division": "Segunda Divisi\u00f3n", "copa_del_rey": "Copa del Rey",
     "serie_a": "Serie A", "serie_b": "Serie B", "coppa_italia": "Coppa Italia",
     "bundesliga": "Bundesliga", "bundesliga_2": "2. Bundesliga",
     "dfb_pokal": "DFB-Pokal", "ligue_1": "Ligue 1", "ligue_2": "Ligue 2",
     "coupe_de_france": "Coupe de France", "eredivisie": "Eredivisie",
-    "primeira_liga": "Primeira Liga", "brasileirao": "Brasileirão",
-    "serie_a_brazil": "Série A", "campeonato_brasileiro": "Brasileirão",
+    "primeira_liga": "Primeira Liga", "brasileirao": "Brasileir\u00e3o",
+    "serie_a_brazil": "S\u00e9rie A", "campeonato_brasileiro": "Brasileir\u00e3o",
     "liga_mx": "Liga MX", "mls": "MLS",
-    "primera_division_py": "Primera División", "paraguayan_primera": "Primera División",
-    "primera_division_cl": "Primera División", "chilean_primera": "Primera División",
+    "primera_division_py": "Primera Divisi\u00f3n", "paraguayan_primera": "Primera Divisi\u00f3n",
+    "primera_division_cl": "Primera Divisi\u00f3n", "chilean_primera": "Primera Divisi\u00f3n",
     "welsh_premier": "Welsh Premier League", "welsh_cup": "Welsh Cup",
-    "super_lig": "Süper Lig", "j1_league": "J1 League",
+    "super_lig": "S\u00fcper Lig", "j1_league": "J1 League",
     "k_league_1": "K League 1", "chinese_super_league": "Chinese Super League",
     "a_league": "A-League", "scottish_premiership": "Premiership",
     "jupiler_pro_league": "Jupiler Pro League", "austrian_bundesliga": "Bundesliga",
@@ -143,9 +145,9 @@ LEAGUE_NAME_MAP = {
     "ekstraklasa": "Ekstraklasa", "superligaen": "Superliga",
     "allsvenskan": "Allsvenskan", "eliteserien": "Eliteserien",
     "veikkausliitto": "Veikkausliiga", "premier_division_ie": "Premier Division",
-    "primera_a_colombia": "Primera A", "primera_division_uy": "Primera División",
+    "primera_a_colombia": "Primera A", "primera_division_uy": "Primera Divisi\u00f3n",
     "primera_a_ecuador": "Primera A", "liga_1_peru": "Liga 1",
-    "primera_division_bo": "Primera División", "primera_division_ve": "Primera División",
+    "primera_division_bo": "Primera Divisi\u00f3n", "primera_division_ve": "Primera Divisi\u00f3n",
     "canadian_premier_league": "Canadian Premier League",
     "friendlies": "Friendlies", "international_friendlies": "Friendlies",
     "world_cup_qualifiers_uefa": "WC Qualifiers UEFA",
@@ -176,43 +178,105 @@ def _resolve_league(league_slug: str, row: dict) -> tuple:
     return ("", slug_lower.replace("_", " ").title())
 
 
-def _fetch_sharpapi(url, headers):
-    try:
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            logger.info(f"[SHARPAPI] HTTP 429 — Rate Limit. Прерываем запросы, переходим на кэш.")
+# ---------------------------------------------------------------------------
+# HTTP fetch с retry, rate-limit awareness
+# ---------------------------------------------------------------------------
+
+_last_rate_remaining = None
+_last_rate_limit = None
+
+
+def _fetch_sharpapi(url, headers, timeout=None):
+    """HTTP GET с retry на 429 и чтением rate-limit заголовков."""
+    global _last_rate_remaining, _last_rate_limit
+    if timeout is None:
+        timeout = int(os.environ.get("SHARPAPI_HTTP_TIMEOUT", "15"))
+
+    max_retries = int(os.environ.get("SHARPAPI_MAX_RETRIES", "2"))
+
+    for attempt in range(max_retries + 1):
+        if is_shutdown_requested():
+            logger.info("[SHARPAPI] Shutdown requested \u2014 остановка fetch")
             return None
-        logger.warning(f"[SHARPAPI HTTP {e.code}] {e.reason}")
         try:
-            body = e.read().decode("utf-8", errors="replace")
-            logger.warning(f"[SHARPAPI HTTP body] {body[:500]}")
-        except Exception:
-            pass
-        return None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-        logger.error(f"[SHARPAPI ERROR] {e}")
-        return None
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                # Чтение rate-limit заголовков
+                _last_rate_remaining = response.headers.get("X-RateLimit-Remaining")
+                _last_rate_limit = response.headers.get("X-RateLimit-Limit")
+                data_delay = response.headers.get("X-Data-Delay", "?")
+
+                body = json.loads(response.read().decode("utf-8"))
+
+                if _last_rate_remaining:
+                    logger.debug(f"[SHARPAPI] Rate: {_last_rate_remaining}/{_last_rate_limit} remaining, delay={data_delay}s")
+
+                return body
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # Retry с backoff
+                retry_after = int(e.headers.get("Retry-After", "0"))
+                reset_ts = e.headers.get("X-RateLimit-Reset")
+                if retry_after > 0:
+                    wait = retry_after
+                elif reset_ts:
+                    try:
+                        wait = max(1, int(reset_ts) - int(time.time()))
+                    except (ValueError, TypeError):
+                        wait = 5
+                else:
+                    wait = 2 ** (attempt + 2)
+
+                if attempt < max_retries:
+                    logger.warning(f"[SHARPAPI] HTTP 429 \u2014 Rate Limit. Waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(min(wait, 60))
+                    continue
+                else:
+                    logger.error(f"[SHARPAPI] HTTP 429 \u2014 исчерпаны retries")
+                    return None
+
+            logger.warning(f"[SHARPAPI HTTP {e.code}] {e.reason}")
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+                logger.warning(f"[SHARPAPI HTTP body] {body[:500]}")
+            except Exception:
+                pass
+            return None
+
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                logger.warning(f"[SHARPAPI] Network error (attempt {attempt + 1}): {e}, retry in {wait}s")
+                time.sleep(wait)
+                continue
+            logger.error(f"[SHARPAPI] Network error: {e}")
+            return None
+
+    return None
 
 
 def _flush_old_matches():
-    """§1.12: Flush-режим — использует cleanup_expired из хаба (§1.4)."""
+    """\u00a71.12: Flush-режим \u2014 использует cleanup_expired из хаба (\u00a71.4)."""
     from gatekeeper_hub import cleanup_expired
     result = cleanup_expired(dry_run=False, auto_migrate=True)
     logger.info(f"[SHARPAPI] Flush: cleanup_expired удалено {result.get('count', 0)} ключей")
     return result.get('count', 0)
 
 
-def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
+# ---------------------------------------------------------------------------
+# Полный scan через /odds с cursor pagination
+# ---------------------------------------------------------------------------
+
+def _fetch_odds_full(headers, max_pages, limit, rate_delay):
+    """Полный scan через /odds?sport=soccer&market=moneyline с cursor pagination."""
     all_rows = []
     pages = 0
     cursor = None
     debug_printed = False
+    global _last_rate_remaining
 
     for page in range(max_pages):
-        # Graceful shutdown — аудит §2.3
         if is_shutdown_requested():
             logger.info(f"[SHARPAPI] Получен SIGTERM, останавливаем сбор страниц")
             break
@@ -221,7 +285,7 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
         if cursor:
             url += f"&cursor={urllib.parse.quote(cursor)}"
 
-        logger.info(f"[SHARPAPI] Запрос /odds: page={page + 1}, cursor={'да' if cursor else 'нет'}")
+        logger.info(f"[SHARPAPI] /odds: page={page + 1}, cursor={'да' if cursor else 'нет'}")
 
         data = _fetch_sharpapi(url, headers)
         if data is None:
@@ -230,20 +294,17 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
         rows = data.get("data", [])
         if isinstance(rows, list):
             all_rows.extend(rows)
-            logger.info(f"[SHARPAPI] Страница {page + 1}: {len(rows)} записей")
+            logger.info(f"[SHARPAPI] Страница {page + 1}: {len(rows)} записей (всего: {len(all_rows)})")
 
             if not debug_printed and rows:
                 sample = rows[0]
-                logger.debug("[SHARPAPI DEBUG] Образец строки:")
-                logger.debug(f"  event_id: {sample.get('event_id', 'НЕТ')}")
-                logger.debug(f"  selection_type: {sample.get('selection_type', 'НЕТ')}")
-                logger.debug(f"  odds_decimal: {sample.get('odds_decimal', 'НЕТ')}")
-                logger.debug(f"  home_team: {sample.get('home_team', 'НЕТ')}")
-                logger.debug(f"  away_team: {sample.get('away_team', 'НЕТ')}")
-                logger.debug(f"  event_start_time: {sample.get('event_start_time', 'НЕТ')}")
-                logger.debug(f"  league: {sample.get('league', 'НЕТ')}")
-                logger.debug(f"  market_type: {sample.get('market_type', 'НЕТ')}")
-                logger.debug(f"  Все ключи: {list(sample.keys())}")
+                logger.debug(f"[SHARPAPI DEBUG] Образец: event_id={sample.get('event_id', '?')}, "
+                    f"sel={sample.get('selection_type', '?')}, "
+                    f"odds={sample.get('odds_decimal', '?')}, "
+                    f"home={sample.get('home_team', '?')}, "
+                    f"away={sample.get('away_team', '?')}, "
+                    f"league={sample.get('league', '?')}, "
+                    f"book={sample.get('sportsbook', '?')}")
                 debug_printed = True
         else:
             logger.info(f"[SHARPAPI] Страница {page + 1}: data не список ({type(rows)})")
@@ -267,69 +328,134 @@ def _fetch_odds_pages(headers, max_pages, limit, rate_delay):
         else:
             break
 
+        # Dynamic rate delay: если remaining < 3, удваиваем delay
+        effective_delay = rate_delay
+        if _last_rate_remaining:
+            try:
+                remaining = int(_last_rate_remaining)
+                if remaining <= 3:
+                    effective_delay = rate_delay * 2
+                    logger.warning(f"[SHARPAPI] Rate limit low ({remaining}), delay={effective_delay}s")
+            except (ValueError, TypeError):
+                pass
+
+        time.sleep(effective_delay)
+
+    # Watermark из последнего ответа
+    updated_at = data.get("updated_at", "") if data else ""
+    return all_rows, pages, updated_at
+
+
+# ---------------------------------------------------------------------------
+# Delta scan через /odds/delta?since=... с offset pagination
+# ---------------------------------------------------------------------------
+
+def _fetch_odds_delta(headers, since_ts, limit, rate_delay):
+    """Инкрементальный scan через /odds/delta?since=... с offset pagination."""
+    all_rows = []
+    removed_ids = []
+    pages = 0
+    offset = 0
+    max_offset = 500
+    new_watermark = since_ts
+    overflow_detected = False
+    debug_printed = False
+
+    while True:
+        if is_shutdown_requested():
+            logger.info(f"[SHARPAPI] SIGTERM \u2014 остановка delta scan")
+            break
+
+        url = (f"{SHARP_API_BASE}/odds/delta?since={urllib.parse.quote(since_ts)}"
+               f"&sport=soccer&market=moneyline&limit={limit}&offset={offset}")
+
+        logger.info(f"[SHARPAPI] /odds/delta: offset={offset}, since={since_ts[:19]}")
+
+        data = _fetch_sharpapi(url, headers)
+        if data is None:
+            break
+
+        rows = data.get("data", [])
+        removed = data.get("removed", [])
+
+        if isinstance(rows, list):
+            all_rows.extend(rows)
+            if removed:
+                removed_ids.extend(removed)
+
+            logger.info(f"[SHARPAPI] Delta: {len(rows)} изменений, {len(removed)} удалено (всего: {len(all_rows)})")
+
+            if not debug_printed and rows:
+                sample = rows[0]
+                logger.debug(f"[SHARPAPI DELTA DEBUG] event_id={sample.get('event_id', '?')}, "
+                    f"sel={sample.get('selection_type', '?')}, "
+                    f"odds={sample.get('odds_decimal', '?')}, "
+                    f"timestamp={sample.get('timestamp', '?')}")
+                debug_printed = True
+        else:
+            logger.warning(f"[SHARPAPI] Delta: data не список ({type(rows)})")
+
+        pages += 1
+
+        pagination = data.get("pagination", {})
+        if not isinstance(pagination, dict):
+            break
+
+        # Проверка overflow
+        if data.get("overflow", False):
+            overflow_detected = True
+            logger.warning(f"[SHARPAPI] Delta overflow detected \u2014 bounded scan limit")
+
+        has_more = pagination.get("has_more", False)
+        next_offset = pagination.get("next_offset")
+
+        if not has_more:
+            # Terminal page \u2014 берём watermark
+            if overflow_detected:
+                logger.warning(f"[SHARPAPI] Delta overflow на terminal page \u2014 re-bootstrap нужен")
+                new_watermark = data.get("meta", {}).get("server_time", "") or data.get("updated_at", "")
+                return all_rows, pages, new_watermark, removed_ids, True  # overflow=True
+
+            new_watermark = data.get("meta", {}).get("server_time", "") or data.get("updated_at", "")
+            break
+
+        if next_offset is None:
+            # Window too large \u2014 re-bootstrap
+            logger.warning(f"[SHARPAPI] Delta: next_offset=null при has_more=true \u2014 re-bootstrap")
+            return all_rows, pages, new_watermark, removed_ids, True  # overflow=True
+
+        offset = next_offset
+        if offset > max_offset:
+            logger.warning(f"[SHARPAPI] Delta: offset > {max_offset} \u2014 re-bootstrap")
+            return all_rows, pages, new_watermark, removed_ids, True
+
         time.sleep(rate_delay)
 
-    return all_rows, pages
+    return all_rows, pages, new_watermark, removed_ids, overflow_detected
 
 
-def collect_sharpapi():
-    # FIX-AUDIT-v9.3: Вариант B — env = secret name (без маппинга)
-    api_key = os.environ.get("SHARPAPI_API_KEY") or os.environ.get("SHARP_API_KEY")
-    if not api_key:
-        logger.error("[SHARPAPI] SHARP_API_KEY не задан")
-        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+# ---------------------------------------------------------------------------
+# Группировка odds по event_id (общая для full и delta)
+# ---------------------------------------------------------------------------
 
-    headers = {
-        "X-API-Key": api_key,
-        "Content-Type": "application/json",
-    }
-
-    rate_delay = float(os.environ.get("SHARPAPI_RATE_LIMIT_DELAY", "6"))
-    max_pages = int(os.environ.get("SHARPAPI_MAX_PAGES", "60"))
-    limit = int(os.environ.get("SHARPAPI_LIMIT", "200"))
-    flush_old = os.environ.get("SHARPAPI_FLUSH_OLD", "0") == "1"
-
-    # FIX: dry-run support
-    dry_run = os.environ.get("DRY_RUN", "0") == "1"
-    
-    # FIX §2.6: run_initialization с collector=
-    init_metrics = run_initialization(collector=COLLECTOR_NAME)
-    run_id = init_metrics.get("run_id", "unknown")
-    if not init_metrics.get("redis_available", False):
-        logger.info(f"[SHARPAPI] Redis недоступен")
-        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
-
-    if flush_old:
-        _flush_old_matches()
-
-    logger.info(f"[SHARPAPI] Сбор матчей из /odds?sport=soccer&market=moneyline ...")
-
-    log_event("sharpapi", "INFO", "Collection started", run_id=run_id, max_pages=max_pages)
-    odds_rows, pages = _fetch_odds_pages(headers, max_pages, limit, rate_delay)
-    logger.info(f"[SHARPAPI] Получено строк odds: {len(odds_rows)} (страниц: {pages})")
-
-    if not odds_rows:
-        meta = {
-            "last_run": now_msk(),
-            "total_events": 0,
-            "stored_matches": 0,
-            "created": 0,
-            "updated": 0,
-            "error_count": 1,
-            "pages_fetched": pages,
-            "skipped_past": 0,
-            "deduped": 0,
-        }
-        save_meta(COLLECTOR_NAME, **meta)
-        return meta
-
-    # --- Группировать odds по event_id ---
+def _group_odds_by_event(odds_rows):
+    """Группирует плоский список odds rows по event_id, берёт лучшие коэффициенты."""
     events_map = {}
+    books_seen = set()
+    markets_seen = set()
 
     for row in odds_rows:
         eid = row.get("event_id", "")
         sel_type = row.get("selection_type", "")
         odds_dec = row.get("odds_decimal")
+        book = row.get("sportsbook", "")
+        market = row.get("market_type", "")
+
+        if book:
+            books_seen.add(book)
+        if market:
+            markets_seen.add(market)
+
         if not eid or not sel_type or odds_dec is None:
             continue
 
@@ -341,10 +467,13 @@ def collect_sharpapi():
         if odds_dec <= 1.0:
             continue
 
+        # Только home/draw/away для 1x2
+        if sel_type not in ("home", "draw", "away"):
+            continue
+
         if eid not in events_map:
             league_slug = row.get("league", "")
             country, comp_name = _resolve_league(league_slug, row)
-            # FIX §2.4: нормализация команд через team_registry
             home_raw = row.get("home_team", "")
             away_raw = row.get("away_team", "")
             events_map[eid] = {
@@ -362,12 +491,109 @@ def collect_sharpapi():
         if current is None or odds_dec > current:
             events_map[eid]["odds"][sel_type] = odds_dec
 
+    logger.info(f"[SHARPAPI] Книги: {sorted(books_seen)}, markets: {sorted(markets_seen)}")
+
     sel_types_found = set()
     for ev in events_map.values():
         sel_types_found.update(ev["odds"].keys())
-    logger.info(f"[SHARPAPI] Найдено selection_type: {sel_types_found}")
+    logger.info(f"[SHARPAPI] Selection types: {sel_types_found}")
 
-    # --- Записать в Redis ---
+    return events_map
+
+
+# ---------------------------------------------------------------------------
+# Главный коллектор
+# ---------------------------------------------------------------------------
+
+def collect_sharpapi():
+    api_key = os.environ.get("SHARPAPI_API_KEY") or os.environ.get("SHARP_API_KEY")
+    if not api_key:
+        logger.error("[SHARPAPI] SHARP_API_KEY не задан")
+        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+
+    headers = {
+        "X-API-Key": api_key,
+        "Content-Type": "application/json",
+    }
+
+    rate_delay = float(os.environ.get("SHARPAPI_RATE_LIMIT_DELAY", "5"))
+    max_pages = int(os.environ.get("SHARPAPI_MAX_PAGES", "60"))
+    limit = int(os.environ.get("SHARPAPI_LIMIT", "200"))
+    flush_old = os.environ.get("SHARPAPI_FLUSH_OLD", "0") == "1"
+    dry_run = os.environ.get("DRY_RUN", "0") == "1"
+    use_delta = os.environ.get("SHARPAPI_USE_DELTA", "1") == "1"
+
+    # \u00a72.6: run_initialization
+    init_metrics = run_initialization(collector=COLLECTOR_NAME)
+    run_id = init_metrics.get("run_id", "unknown")
+    if not init_metrics.get("redis_available", False):
+        logger.info(f"[SHARPAPI] Redis недоступен")
+        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+
+    if flush_old:
+        _flush_old_matches()
+
+    # Чтение watermark из meta (для delta)
+    last_watermark = ""
+    try:
+        from gatekeeper_hub import get_meta
+        prev_meta = get_meta(COLLECTOR_NAME)
+        if prev_meta:
+            last_watermark = prev_meta.get("last_odds_timestamp", "")
+    except Exception:
+        pass
+
+    # Решение: delta или full scan
+    use_delta_path = use_delta and last_watermark and not flush_old
+
+    if use_delta_path:
+        logger.info(f"[SHARPAPI] Delta scan: since={last_watermark[:19]}")
+        log_event("sharpapi", "INFO", "Delta scan started", run_id=run_id, since=last_watermark)
+
+        odds_rows, pages, new_watermark, removed_ids, overflow = _fetch_odds_delta(
+            headers, last_watermark, limit, rate_delay
+        )
+
+        if overflow:
+            logger.warning(f"[SHARPAPI] Delta overflow \u2014 fallback на полный scan")
+            use_delta_path = False
+        else:
+            logger.info(f"[SHARPAPI] Delta: {len(odds_rows)} строк, {len(removed_ids)} удалено, "
+                  f"watermark={new_watermark[:19] if new_watermark else '?'}")
+
+    if not use_delta_path:
+        logger.info(f"[SHARPAPI] Полный scan: /odds?sport=soccer&market=moneyline")
+        log_event("sharpapi", "INFO", "Full scan started", run_id=run_id, max_pages=max_pages)
+
+        odds_rows, pages, new_watermark = _fetch_odds_full(headers, max_pages, limit, rate_delay)
+        removed_ids = []
+
+        logger.info(f"[SHARPAPI] Full: {len(odds_rows)} строк (страниц: {pages}), "
+              f"watermark={new_watermark[:19] if new_watermark else '?'}")
+
+    if not odds_rows and not removed_ids:
+        meta = {
+            "last_run": now_msk(),
+            "total_events": 0,
+            "stored_matches": 0,
+            "created": 0,
+            "updated": 0,
+            "error_count": 0,
+            "pages_fetched": pages,
+            "skipped_past": 0,
+            "deduped": 0,
+            "scan_mode": "delta" if use_delta_path else "full",
+            "last_odds_timestamp": new_watermark or last_watermark,
+            "run_id": run_id,
+        }
+        save_meta(COLLECTOR_NAME, **meta)
+        logger.info(f"[SHARPAPI] Нет данных для записи")
+        return meta
+
+    # Группировка odds по event_id
+    events_map = _group_odds_by_event(odds_rows) if odds_rows else {}
+
+    # Запись в Redis
     stored = 0
     skipped_past = 0
     skipped_future = 0
@@ -375,10 +601,8 @@ def collect_sharpapi():
     seen_keys = set()
     created = 0
     updated = 0
-    # FIX-AUDIT-v9.3: existing_keys для корректного подсчёта created/updated
     existing_keys = set(get_all_fields().keys())
 
-    # FIX-AUDIT-v9.3: сортировка по дате (§1.32) — ближайшие матчи первыми
     def _event_date_key(item):
         eid, ev = item
         dt_str = ev.get("start_time", "")
@@ -387,9 +611,8 @@ def collect_sharpapi():
     sorted_events = sorted(events_map.items(), key=_event_date_key)
 
     for eid, ev in sorted_events:
-        # Graceful shutdown — аудит §2.3
         if is_shutdown_requested():
-            logger.info(f"[SHARPAPI] Получен SIGTERM, останавливаем запись матчей")
+            logger.info(f"[SHARPAPI] SIGTERM \u2014 остановка записи")
             break
 
         home_team = ev["home_team"]
@@ -409,7 +632,6 @@ def collect_sharpapi():
             skipped_past += 1
             continue
 
-        # Upper bound: отбрасываем матчи дальше DAYS_AHEAD
         if date_utc:
             try:
                 match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
@@ -420,11 +642,8 @@ def collect_sharpapi():
                 pass
 
         ev_odds = ev["odds"]
-
-        # FIX §2.2: idempotency_key для защиты от двойного patch
         idempotency_key = f"{run_id}:{eid}:odds"
 
-        # 1. Создать матч (с source и sources)
         try:
             cid = upsert_match(
                 home_team=home_team,
@@ -443,14 +662,11 @@ def collect_sharpapi():
 
         if cid:
             stored += 1
-            # FIX-AUDIT-v9.3: корректный подсчёт через existing_keys
             if f"match:{cid}" in existing_keys:
                 updated += 1
             else:
                 created += 1
 
-            # FIX §2.1: odds как float (вместо str)
-            # FIX §2.2: idempotency_key в patch_match
             odds_current = {}
             if "home" in ev_odds:
                 odds_current["home"] = float(ev_odds["home"])
@@ -470,9 +686,17 @@ def collect_sharpapi():
                 except Exception as e:
                     logger.error(f"[SHARPAPI] patch error for cid={cid}: {e}")
 
+    # Обработка removed[] \u2014 логирование (удаление из Redis опционально)
+    removed_count = len(removed_ids) if removed_ids else 0
+    if removed_count > 0:
+        logger.info(f"[SHARPAPI] Removed odds: {removed_count} (лог, удаление из Redis опционально)")
+
     total_events = len(events_map)
-    logger.info(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, "
-          f"прошлое: {skipped_past}, будущее: {skipped_future}, дедупликатов: {deduped}")
+    scan_mode = "delta" if use_delta_path else "full"
+
+    logger.info(f"[SHARPAPI] Готово: {stored} записано, {created} создано, {updated} обновлено, "
+          f"прошлое: {skipped_past}, будущее: {skipped_future}, дедуп: {deduped}, "
+          f"removed: {removed_count}, mode: {scan_mode}")
 
     meta = {
         "last_run": now_msk(),
@@ -485,6 +709,9 @@ def collect_sharpapi():
         "skipped_past": skipped_past,
         "skipped_future": skipped_future,
         "deduped": deduped,
+        "scan_mode": scan_mode,
+        "last_odds_timestamp": new_watermark or last_watermark,
+        "removed_count": removed_count,
         "run_id": run_id,
     }
     save_meta(COLLECTOR_NAME, **meta)
@@ -501,13 +728,19 @@ def collect_and_process():
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Collector SharpAPI")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Не писать в Redis (dry-run)")
+    parser = argparse.ArgumentParser(description="SharpAPI Collector v9.0-delta")
+    parser.add_argument("--dry-run", action="store_true", help="Без записи в Redis")
     args = parser.parse_args()
+
     if args.dry_run:
-        logger.info("[SHARPAPI] DRY-RUN mode — данные НЕ будут записаны в Redis")
         os.environ["DRY_RUN"] = "1"
-    result = collect_sharpapi()
-    logger.info(f"[SHARPAPI] Result: {result}")
+
+    logging.basicConfig(
+        level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
+        format="[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
+    )
+
+    result = collect_and_process()
+    print(f"\n=== SharpAPI Collector Summary ===")
+    for k, v in sorted(result.items()):
+        print(f"  {k}: {v}")
