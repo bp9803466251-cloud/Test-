@@ -32,7 +32,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
+  group: redis-flush
   cancel-in-progress: false
 
 env:
@@ -90,27 +90,7 @@ jobs:
           MODE="${FLUSH_MODE}"
           echo "=== Redis Flush — Dry Run ==="
           echo "Mode: $MODE"
-          case "$MODE" in
-            history-only)
-              HISTORY_FLUSH_CONFIRM=1 python redis_diagnostics.py --dry-run --history-only --yes
-              ;;
-            soft)
-              python redis_diagnostics.py --dry-run --flush --yes
-              ;;
-            hard)
-              python redis_diagnostics.py --dry-run --flush --hard --yes
-              ;;
-            purge)
-              python redis_diagnostics.py --dry-run --purge --yes
-              ;;
-            reset-breaker)
-              echo "Reset breaker — dry run not applicable"
-              ;;
-            *)
-              echo "ERROR: Unknown mode '$MODE'"
-              exit 1
-              ;;
-          esac
+          python redis_flush.py --dry-run --mode "$MODE" --yes
 
       - name: Stop if dry-run-only
         if: success() && env.FLUSH_DRY_RUN == 'true'
@@ -125,34 +105,14 @@ jobs:
           MODE="${FLUSH_MODE}"
           echo "=== Redis Flush — Execute ==="
           echo "Mode: $MODE"
-          case "$MODE" in
-            history-only)
-              HISTORY_FLUSH_CONFIRM=1 python redis_diagnostics.py --history-only --yes
-              ;;
-            soft)
-              python redis_diagnostics.py --flush --yes
-              ;;
-            hard)
-              python redis_diagnostics.py --flush --hard --yes
-              ;;
-            purge)
-              python redis_diagnostics.py --purge --yes
-              ;;
-            reset-breaker)
-              python redis_diagnostics.py --reset-breaker
-              ;;
-            *)
-              echo "ERROR: Unknown mode '$MODE'"
-              exit 1
-              ;;
-          esac
+          python redis_flush.py --mode "$MODE" --yes
 
       - name: Verify after flush
         if: always() && env.FLUSH_MODE != 'reset-breaker'
         timeout-minutes: 10
         run: |
           echo "=== Post-Flush Verify ==="
-          python redis_diagnostics.py
+          python redis_flush.py --dry-run --mode soft --yes
 
       - name: Summary
         if: always()
