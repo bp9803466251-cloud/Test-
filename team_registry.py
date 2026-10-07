@@ -397,6 +397,77 @@ TEAM_ALIASES = {
     "america mineiro": "america_mineiro",
     "america mg": "america_mineiro",
 
+    # Brazil — cross-source state suffix aliases (TR-FIX v9.4)
+    # Problem: Bzzoiro uses full names, Propline adds state suffixes (-RJ, -MG, -BA...),
+    # OddsAPI uses short names. Without these aliases, same team gets different canonical_id.
+    # Step 4 of clean_team_name replaces "-" with " ", so "Botafogo-RJ" → "botafogo rj" → lookup
+
+    # -RJ (Rio de Janeiro)
+    "botafogo rj": "botafogo",              # Propline: Botafogo-RJ
+    "vasco da gama rj": "vasco",            # Propline: Vasco da Gama-RJ
+    "flamengo rj": "flamengo",             # Propline: Flamengo-RJ
+    "fluminense rj": "fluminense",         # Propline: Fluminense-RJ
+
+    # -SP (São Paulo) — NOTE: botafogo sp ≠ botafogo (different teams!)
+    "bragantino sp": "bragantino",          # Propline/OddsAPI: Bragantino-SP
+    "botafogo sp": "botafogo_sp",           # OddsAPI: Botafogo-SP (different team from Botafogo-RJ!)
+    "corinthians sp": "corinthians",        # Propline: Corinthians-SP
+    "palmeiras sp": "palmeiras",            # Propline: Palmeiras-SP
+    "santos sp": "santos",                  # Propline: Santos-SP
+    "sao paulo sp": "sao_paulo",            # Propline: Sao Paulo-SP
+    "mirassol sp": "mirassol",             # Propline: Mirassol-SP
+    "mirassol": "mirassol",                 # base alias
+
+    # -MG (Minas Gerais)
+    "cruzeiro mg": "cruzeiro",              # Propline: Cruzeiro-MG
+    "atletico mg": "atletico_mineiro",      # Propline: Atletico-MG
+
+    # -BA (Bahia)
+    "vitoria ba": "vitoria_ba",             # OddsAPI/Propline: Vitória-BA
+    "vitoria salvador": "vitoria_ba",       # Bzzoiro: Vitória Salvador
+    "bahia ba": "bahia",                    # Propline: Bahia-BA
+
+    # -CE (Ceará)
+    "fortaleza ce": "fortaleza",           # Bzzoiro: Fortaleza CE
+
+    # -RS (Rio Grande do Sul)
+    "gremio rs": "gremio",                  # Propline: Gremio-RS
+    "internacional rs": "internacional",    # Bzzoiro: Internacional RS
+    "juventude rs": "juventude",            # Propline: Juventude-RS
+
+    # -PR (Paraná)
+    "operario ferroviario": "operario_pr",  # SharpAPI: Operário Ferroviário → standard: operario_pr
+    "operario pr": "operario_pr",           # base alias
+    "coritiba pr": "coritiba",              # Propline: Coritiba-PR
+    "londrina pr": "londrina",              # Propline: Londrina-PR
+    "athletico pr": "athletico_paranaense", # Propline: Athletico-PR
+
+    # -SC (Santa Catarina)
+    "chapecoense sc": "chapecoense",        # Propline: Chapecoense-SC
+    "avai sc": "avai",                      # Propline: Avai-SC
+    "avai": "avai",                         # base alias
+    "criciuma sc": "criciuma",              # Propline: Criciuma-SC
+
+    # -GO (Goiás)
+    "atletico go": "atletico_goianiense",   # Propline: Atletico-GO
+    "goias go": "goias",                    # Propline: Goias-GO
+    "vila nova go": "vila_nova",            # Propline: Vila Nova-GO
+    "vila nova": "vila_nova",               # base alias
+
+    # -PA (Pará)
+    "remo pa": "remo",                      # Propline: Remo-PA
+    "remo": "remo",                         # base alias
+
+    # -MT (Mato Grosso)
+    "cuiaba mt": "cuiaba",                  # Propline: Cuiaba-MT
+
+    # Full names → standard
+    "red bull bragantino": "bragantino",    # Bzzoiro: Red Bull Bragantino
+    "clube de regatas brasil": "crb",       # OddsAPI: Clube de Regatas Brasil
+    "crb": "crb",                           # base alias
+    "londrina": "londrina",                 # base alias
+
+
     # Argentina
     "river plate": "river_plate",
     "boca juniors": "boca_juniors",
@@ -1054,6 +1125,6 @@ def normalize_team_name(name: str) -> str:
     """
     return clean_team_name(name)
 
-__version__ = "9.3-audited"
+__version__ = "9.4-alias"
 
 # __all__ moved to top
