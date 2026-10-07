@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Коллектор SharpAPI для Gatekeeper-AI v9.0-delta.
+Коллектор SharpAPI для Gatekeeper-AI v9.1-argparse.
 Получает матчи и коэффициенты, сохраняет в Redis через gatekeeper_hub.
 
 v9.0-delta:
@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import time
+import argparse
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -78,7 +79,7 @@ if not logger.handlers:
 
 COLLECTOR_NAME = "sharpapi"
 
-__version__ = "9.0-delta"
+__version__ = "9.1-argparse"
 __all__ = ["collect_sharpapi", "collect_and_process", "__version__"]
 
 # ---------------------------------------------------------------------------
