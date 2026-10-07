@@ -8,13 +8,17 @@ on:
         required: false
         default: '3'
       max_pages:
-        description: 'Макс. страниц API'
+        description: 'Макс. страниц API (full scan)'
         required: false
         default: '60'
       limit:
         description: 'Лимит матчей на страницу'
         required: false
         default: '200'
+      use_delta:
+        description: 'Использовать delta endpoint (1=да, 0=нет)'
+        required: false
+        default: '1'
 
 permissions:
   contents: read
@@ -54,10 +58,13 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
-          SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '6' }}
+          SHARPAPI_RATE_LIMIT_DELAY: '5'
           SHARPAPI_MAX_PAGES: ${{ github.event.inputs.max_pages || '60' }}
           SHARPAPI_LIMIT: ${{ github.event.inputs.limit || '200' }}
           SHARPAPI_DAYS_AHEAD: ${{ github.event.inputs.days_ahead || '3' }}
+          SHARPAPI_USE_DELTA: ${{ github.event.inputs.use_delta || '1' }}
+          SHARPAPI_HTTP_TIMEOUT: '15'
+          SHARPAPI_MAX_RETRIES: '2'
           GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
 
       - name: Summary
@@ -66,6 +73,7 @@ jobs:
           echo "=== SharpAPI Collector Summary ==="
           echo "Days ahead: ${{ github.event.inputs.days_ahead || '3' }}"
           echo "Max pages: ${{ github.event.inputs.max_pages || '60' }}"
+          echo "Delta: ${{ github.event.inputs.use_delta || '1' }}"
           echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Telegram alert on failure
@@ -75,4 +83,6 @@ jobs:
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
           MSG="❌ SharpAPI Collector FAILED%0A%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="${MSG}" || true
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
+            -d text="${MSG}" || true
