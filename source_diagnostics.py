@@ -1,13 +1,8 @@
 # source_diagnostics.py
 """
-Единый модуль диагностики Gatekeeper-AI v9.4-source.
+Единый модуль диагностики Gatekeeper-AI v9.3-audited.
 Заменяет debug_inspect.py и debug_odds.py.
 Объединяет диагностику всех источников, Redis и матчей в одном файле.
-
-v9.4-source:
-  SD-9: diagnose_sample — odds.1x2.current вместо odds.1x2 (фикс ? / ? / ?)
-  SD-10: diagnose_matches — predictions/h2h проверяются без требования "source"
-  SD-11: diagnose_sample — prediction source проверяется через .get("source", "")
 
 v9.3-audited:
   SD-1: Версия 9.3-audited
@@ -18,6 +13,14 @@ v9.3-audited:
   SD-6: diagnose_sample() — первые 5 матчей для ручной проверки (§16)
   SD-7: Сигнатуры функций принимают all_fields: dict (§18.4)
   SD-8: history:match:* ключи учитываются в Redis-диагностике (§8.7)
+
+  v9.4-source:
+  SD-9: _read_meta() → get_from_cache() из gatekeeper_hub (вместо get_key из redis_hub)
+        FIX STALE: хаб пишет meta через save_to_cache, а get_key не читает эти ключи
+  SD-10: Predictions check — relaxed (непустой dict, без требования "source")
+  SD-11: H2H check — relaxed (непустой dict, без требования "source")
+  SD-12: Odds sample — чтение через current/opening уровень (§1.21)
+  SD-13: Pred source display — fallback на "bzzoiro" если нет "source"
 
 Запуск:
   python source_diagnostics.py            — полная диагностика (7 секций)
@@ -55,6 +58,7 @@ from gatekeeper_hub import (
     run_initialization,
     get_matches_by_date_range,
     get_all_matches,
+    get_from_cache,
 )
 from redis_hub import get_all_fields, is_redis_available, get_key
 
@@ -70,11 +74,19 @@ def _now_msk() -> str:
 
 
 def _read_meta(key: str) -> Optional[dict]:
-    """Читает meta-ключ через get_key() + json.loads (§18.4).
-    Fallback: если get_key вернёт dict (hash), возвращаем как есть.
+    """Читает meta-ключ через get_from_cache() из gatekeeper_hub (§18.4).
+    FIX-9.4: get_key() из redis_hub не читает ключи, записанные через save_to_cache().
+    Хаб пишет meta через rh.save_to_cache(), а get_module_status() читает через
+    rh.get_from_cache() — используем тот же метод.
+    Fallback: если get_from_cache недоступен, пробуем get_key из redis_hub.
     """
     try:
-        raw = get_key(key)
+        raw = get_from_cache(key)
+        if raw is None:
+            try:
+                raw = get_key(key)
+            except Exception:
+                return None
         if raw is None:
             return None
         if isinstance(raw, dict):
@@ -716,8 +728,10 @@ def diagnose_sample(all_fields: dict = None) -> dict:
         if isinstance(odds, dict):
             o1x2 = odds.get("1x2", {})
             if isinstance(o1x2, dict):
-                sec = o1x2.get("current", o1x2.get("opening", o1x2))
-                odds_1x2 = f"{sec.get('home', '?')} / {sec.get('draw', '?')} / {sec.get('away', '?')}"
+                # FIX-9.4: odds nested under current/opening (§1.21)
+                _sub = o1x2.get("current") or o1x2.get("opening") or o1x2.get("open") or o1x2
+                if isinstance(_sub, dict):
+                    odds_1x2 = f"{_sub.get('home', '?')} / {_sub.get('draw', '?')} / {_sub.get('away', '?')}"
         pred = match.get("predictions", {})
         pred_str = ""
         if isinstance(pred, dict) and pred:
