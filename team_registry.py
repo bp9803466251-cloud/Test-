@@ -372,6 +372,7 @@ TEAM_ALIASES = {
     "botafogo": "botafogo",
     "vasco": "vasco",
     "vasco da gama": "vasco",
+    "vasco da gama rj": "vasco",
     "atletico paranaense": "athletico_paranaense",
     "athletico": "athletico_paranaense",
     "bahia": "bahia",
@@ -397,51 +398,55 @@ TEAM_ALIASES = {
     "america mineiro": "america_mineiro",
     "america mg": "america_mineiro",
 
-        # ── Brazil state-suffix aliases (v9.4-alias) ──
+    # ── Brazil: state suffixes (v9.4-alias) ──
     "botafogo rj": "botafogo",
-    "botafogo-rj": "botafogo",
     "vasco da gama rj": "vasco",
-    "vasco da gama-rj": "vasco",
     "cruzeiro mg": "cruzeiro",
-    "cruzeiro-mg": "cruzeiro",
     "internacional rs": "internacional",
-    "internacional-rs": "internacional",
     "vitoria salvador": "vitoria_ba",
     "vitoria ba": "vitoria_ba",
-    "vitoria-ba": "vitoria_ba",
-    "bragantino sp": "bragantino",
-    "bragantino-sp": "bragantino",
-    "red bull bragantino": "bragantino",
     "fortaleza ce": "fortaleza",
     "fortaleza ec": "fortaleza",
+    "bragantino sp": "bragantino",
+    "operario pr": "operario_pr",
+    "operario ferroviario": "operario_pr",
     "cuiaba mt": "cuiaba",
-    "cuiaba-mt": "cuiaba",
+    "chapecoense sc": "chapecoense",
     "vila nova go": "vila_nova",
-    "vila nova-go": "vila_nova",
     "remo pa": "remo",
-    "remo-pa": "remo",
     "remo belem": "remo",
     "gremio porto alegre": "gremio",
-    "operario pr": "operario_pr",
-    "operario-pr": "operario_pr",
-    "operario ferroviario": "operario_pr",
-    "botafogo sp": "botafogo_sp",
-    "botafogo-sp": "botafogo_sp",
     "atletico go": "atletico_goianiense",
-    "atletico-go": "atletico_goianiense",
-    "crb": "crb",
     "crb maceio": "crb",
     "clube de regatas brasil": "crb",
-    "avai": "avai",
+    "red bull bragantino": "bragantino",
+    "botafogo sp": "botafogo_sp",
     "avai fc": "avai",
-    "mirassol": "mirassol",
-    "sao paulo fc": "sao_paulo",
-    "atletico mg": "atletico_mineiro",
-    "atletico-mg": "atletico_mineiro",
-    "chapecoense sc": "chapecoense",
-    "chapecoense-sc": "chapecoense",
+    "nautico pe": "nautico",
+    "ceara ec": "ceara",
 
-# Argentina
+    # ── Finland: Veikkausliiga (v9.4-alias) ──
+    "hjk": "hjk",
+    "hjk helsinki": "hjk",
+    "vps": "vps",
+    "vps vaasa": "vps",
+    "if gnistan": "if_gnistan",
+    "gnistan": "if_gnistan",
+    "inter turku": "inter_turku",
+    "fc inter turku": "inter_turku",
+    "kuopion palloseura": "kups",
+    "kups": "kups",
+    "ac oulu": "ac_oulu",
+    "oulu": "ac_oulu",
+    "kups akatemia": "kups_akatemia",
+    "fc inter turku ii": "inter_turku_ii",
+    "inter turku ii": "inter_turku_ii",
+
+    # ── Vietnam (v9.4-alias) ──
+    "clb viettel": "viettel",
+
+
+    # Argentina
     "river plate": "river_plate",
     "boca juniors": "boca_juniors",
     "boca": "boca_juniors",
@@ -996,34 +1001,8 @@ TEAM_ALIASES = {
     "waasland-beveren": "waasland_beveren",
     "waasland beveren": "waasland_beveren",
     "sebastien"  : "sebastien",
-    # Finland — Veikkausliiga (v9.4-alias)
-    "if gnistan": "if_gnistan",
-    "gnistan": "if_gnistan",
-    "fc inter turku": "inter_turku",
-    "inter turku": "inter_turku",
-    "hjk": "hjk",
-    "hjk helsinki": "hjk",
-    "kuopion palloseura": "kups",
-    "kups": "kups",
-    "vps": "vps",
-    "vaasan palloseura": "vps",
-    "ilves": "ilves",
-    "ilves tampere": "ilves",
-    "lahti": "lahti",
-    "fc lahti": "lahti",
-    "ac oulu": "ac_oulu",
-    "oulu": "ac_oulu",
-    "sjk": "sjk",
-    "haka": "haka",
-    "fc haka": "haka",
-    "mariehamn": "mariehamn",
-    "ifk mariehamn": "mariehamn",
-
-    # Vietnam (v9.4-alias)
-    "clb viettel": "viettel",
-    "viettel": "viettel",
-
 }
+
 
 def clean_team_name(name: str) -> str:
     """
@@ -1050,8 +1029,9 @@ def clean_team_name(name: str) -> str:
         normalized = unicodedata.normalize("NFD", name_fixed)
         key = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
         key = key.strip().lower()
-        # FIX-v9.4: Нормализация скобок для женских команд (w) <-> [w]
-        key = key.replace("[w]", "(w)").replace("[", "(").replace("]", ")")
+
+        # FIX-v9.4: Нормализация скобок [w] → (w) для женских команд
+        key = key.replace("[", "(").replace("]", ")")
 
         # Шаг 1: Прямой lookup (оригинальный ключ с апострофами)
         if key in TEAM_ALIASES:
@@ -1062,12 +1042,12 @@ def clean_team_name(name: str) -> str:
         clean_key = clean_key.replace("  ", " ").strip()
         if clean_key in TEAM_ALIASES:
             return TEAM_ALIASES[clean_key]
+        # Шаг 2b: underscore-to-space lookup (v9.4-alias)
+        # "botafogo_rj" → "botafogo rj" → lookup → "botafogo"
+        us_key = clean_key.replace("_", " ").strip()
+        if us_key in TEAM_ALIASES:
+            return TEAM_ALIASES[us_key]
 
-        # Шаг 2b: Замена подчёркиваний на пробелы + lookup
-        # FIX-v9.4: "botafogo_rj" -> "botafogo rj" -> lookup
-        underscore_key = clean_key.replace("_", " ").strip()
-        if underscore_key in TEAM_ALIASES:
-            return TEAM_ALIASES[underscore_key]
 
         # Шаг 3: Удаление суффиксов (только с конца) + lookup
         # FIX-AUDIT: добавлены " bk", " if", " ac", " as" для скандинавских и латинских команд
@@ -1089,6 +1069,15 @@ def clean_team_name(name: str) -> str:
         slash_key2 = slash_key.replace(" ", "")
         if slash_key2 in TEAM_ALIASES:
             return TEAM_ALIASES[slash_key2]
+
+        # Шаг 4b: Combined underscore+hyphen to space (v9.4-alias)
+        # "vasco_da_gama-rj" → "vasco da gama rj" → lookup
+        combined_key = clean_key.replace("_", " ").replace("-", " ").strip()
+        if combined_key in TEAM_ALIASES:
+            return TEAM_ALIASES[combined_key]
+        combined_key2 = combined_key.replace(" ", "")
+        if combined_key2 in TEAM_ALIASES:
+            return TEAM_ALIASES[combined_key2]
 
         # Шаг 5: Fallback — заменяем пробелы на подчёркивания
         return stripped.replace(" ", "_").replace("-", "_")
