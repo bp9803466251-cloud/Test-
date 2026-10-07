@@ -3,6 +3,11 @@
 Collector Propline v9.0-bulk для Gatekeeper-AI v9.3-audited.
 Получает матчи и коэффициенты через PropLine API, сохраняет в Redis через gatekeeper_hub.
 
+Изменения v9.1-listfix:
+  - FIX: _process_league — The Odds API v4 возвращает list, не {"events": [...]}
+    data.get("events", []) → AttributeError на list → 28 errors, 0 stored
+    Добавлен isinstance(data, list) check (как в _fetch_sports)
+
 Изменения v9.0-bulk:
   - Динамические лиги: GET /sports → все soccer_* (31+ вместо 6 хардкод)
   - Параллельный fetch: ThreadPoolExecutor, пул 8 (вместо последовательного)
@@ -113,7 +118,7 @@ FALLBACK_LEAGUES = [
     "soccer_sweden_allsvenskan",
 ]
 
-__version__ = "9.0-bulk"
+__version__ = "9.1-listfix"
 __all__ = ["collect_propline", "collect_and_process", "__version__"]
 
 # Quota tracking
@@ -318,7 +323,11 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
     if not data:
         return results
 
-    events = data.get("events", [])
+    # The Odds API v4 возвращает list напрямую, не {"events": [...]}
+    if isinstance(data, list):
+        events = data
+    else:
+        events = data.get("events", [])
     if not events:
         logger.info(f"No events for {sport_key}")
         return (sport_key, 0, 0, 0, 0, 0)
