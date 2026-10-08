@@ -158,6 +158,7 @@ def _extract_1x2_sources(odds_1x2: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+
 def _normalize_probs(p):
     h, d, a = p
     total = h + d + a
@@ -430,17 +431,23 @@ def _dqs_oh(match: Dict) -> float:
 
 
 
-
-# ---- Prediction probability extraction (fallback keys) ----
-
 def _extract_pred_probs(pred: Dict) -> Optional[Tuple[float, float, float]]:
     """Extract (home, draw, away) probabilities from prediction dict.
-    Supports multiple key naming conventions."""
+    Supports multiple key naming conventions + nested dict search."""
     if not isinstance(pred, dict):
         return None
-    home_keys = ("home_win", "home", "1", "p1", "home_prob", "h")
-    draw_keys = ("draw", "X", "x", "pX", "pdraw", "d")
-    away_keys = ("away_win", "away", "2", "p2", "away_prob", "a")
+    home_keys = ("home_win", "home", "1", "p1", "home_prob", "h",
+                 "home_team_win", "prob_home", "home_pct", "prob_1", "p_home",
+                 "winner_home", "home_probability", "home_win_prob", "win_home",
+                 "home_win_pct", "1x2_home", "h_prob")
+    draw_keys = ("draw", "X", "x", "pX", "pdraw", "d",
+                 "prob_draw", "draw_pct", "prob_x", "p_draw", "p_x",
+                 "draw_probability", "draw_prob", "draw_win_prob",
+                 "1x2_draw", "d_prob", "tie")
+    away_keys = ("away_win", "away", "2", "p2", "away_prob", "a",
+                 "away_team_win", "prob_away", "away_pct", "prob_2", "p_away",
+                 "winner_away", "away_probability", "away_win_prob", "win_away",
+                 "away_win_pct", "1x2_away", "a_prob")
     ph = None
     for k in home_keys:
         v = pred.get(k)
@@ -460,11 +467,18 @@ def _extract_pred_probs(pred: Dict) -> Optional[Tuple[float, float, float]]:
             try: pa = float(v); break
             except: continue
     if ph is None or pd is None or pa is None:
+        # Try nested dicts (Bzzoiro may wrap probs inside)
+        for nested_key in ("probabilities", "pred", "outcome", "prediction", "result", "1x2", "odds"):
+            nested = pred.get(nested_key)
+            if isinstance(nested, dict):
+                nested_result = _extract_pred_probs(nested)
+                if nested_result is not None:
+                    return nested_result
         return None
     total = ph + pd + pa
     if total <= 0:
         return None
-    return ph / total, pd / total, pa / total
+    return (ph / total, pd / total, pa / total)
 
 
 def _dqs_pi(match: Dict) -> float:
@@ -1298,12 +1312,11 @@ def _layer_form(match: Dict, history: Optional[List] = None, prior: Tuple = (0.4
 
 def _calc_q_weights(layers: List[Dict]) -> List[float]:
     """OOS Brier → inverse weighting.
-    FIX: confidence (0-1, higher=better) → brier = 1 - confidence (lower=better)."""
+    FIX: confidence (0-1) → brier = 1 - confidence (higher confidence = higher weight)."""
     briers = []
     for layer in layers:
-        b = layer.get("brier")
-        if b is None:
-            b = 1.0 - layer.get("confidence", 0.5)
+        conf = layer.get("confidence", 0.5)
+        b = layer.get("brier", 1.0 - conf)
         briers.append(max(b, 0.01))
     inv = [1.0 / b for b in briers]
     total = sum(inv)
@@ -1643,10 +1656,9 @@ def _check_game_state(match: Dict) -> Optional[Dict]:
 # MAIN: analyze_match (§21.1, §21.5)
 # ============================================================================
 
-
-
 def _adapt_history(history: Optional[List]) -> Optional[List]:
-    """Convert history format to internal format for Poisson/Elo/Form layers."""
+    """Convert history format to internal format for Poisson/Elo/Form layers.
+    FootballData stores score: {home, away} — layers expect result: 'W'/'D'/'L' + goals_for/against."""
     if not history or not isinstance(history, list):
         return history
     adapted = []
@@ -1665,11 +1677,19 @@ def _adapt_history(history: Optional[List]) -> Optional[List]:
                 gf = ga = 0
             item["goals_for"] = gf
             item["goals_against"] = ga
-            if gf > ga: item["result"] = "win"
-            elif gf < ga: item["result"] = "loss"
-            else: item["result"] = "draw"
+            if gf > ga: item["result"] = "W"
+            elif gf < ga: item["result"] = "L"
+            else: item["result"] = "D"
+        elif "result" not in item and "goals_for" in item and "goals_against" in item:
+            gf = item.get("goals_for", 0)
+            ga = item.get("goals_against", 0)
+            if gf > ga: item["result"] = "W"
+            elif gf < ga: item["result"] = "L"
+            else: item["result"] = "D"
         adapted.append(item)
     return adapted
+
+
 
 def analyze_match(match: Dict, history: Optional[List] = None,
                    value_threshold: Optional[float] = None) -> Dict[str, Any]:
@@ -1710,8 +1730,10 @@ def analyze_match(match: Dict, history: Optional[List] = None,
         # FIX: Use _extract_pred_probs for fallback key support
         pred_probs = _extract_pred_probs(pred) if isinstance(pred, dict) else None
         if pred_probs is not None:
-            layer_bzzoiro = {"probs": list(pred_probs),
-                            "sample_size": 1, "confidence": 0.6}
+            layer_bzzoiro = {"probs": list(pred_probs), "sample_size": 1, "confidence": 0.6}
+        elif isinstance(pred, dict) and pred:
+            logger.debug("analyze_match: pred keys not found in cid=%s, keys=%s",
+                        cid, list(pred.keys())[:10])
 
         # Consensus — layer_market is the BENCHMARK, not a model layer.
         # Including it in consensus makes EV ≈ -margin/(1+margin), always ≤ 0.
