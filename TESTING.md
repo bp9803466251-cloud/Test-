@@ -4,7 +4,7 @@
 
 | File | Purpose |
 |------|---------|
-| `team_registry_final.py` | Registry + `clean_team_name()` function |
+| `team_registry.py` | Registry + `clean_team_name()` function |
 | `test_gluing.py` | Automated test suite (~3000 checks) |
 | `Makefile` | Short commands for common tasks |
 | `.github/workflows/test_gluing_ci.yml` | CI/CD via GitHub Actions |
@@ -97,7 +97,7 @@ make pipeline
 
 ## CI/CD
 
-GitHub Actions runs `test_gluing.py` on every push/PR that touches `team_registry_final.py` or `test_gluing.py`. Tests run on Python 3.10, 3.11, and 3.12.
+GitHub Actions runs `test_gluing.py` on every push/PR that touches `team_registry.py` or `test_gluing.py`. Tests run on Python 3.10, 3.11, and 3.12.
 
 **Exit code 0** = tests passed, PR can merge.
 **Exit code 1** = tests failed, PR is blocked.
