@@ -439,11 +439,17 @@ def _dqs_oh(match: Dict) -> float:
 
 def _dqs_pi(match: Dict) -> float:
     """PI — Prediction integrity (Bzzoiro)."""
-    pred = match.get("predictions") or match.get("bzzoiro_predictions")
+    pred = match.get("predictions") or match.get("bzzoiro_predictions") or match.get("prediction")
     if not pred:
         return 0.0
     if isinstance(pred, dict):
-        keys = sum(1 for k in ("home_win", "draw", "away_win", "score_pred") if k in pred)
+        # FIX: support multiple key formats
+        all_keys = set(pred.keys())
+        known_keys = {"home_win", "draw", "away_win", "score_pred",
+                      "prob_home", "prob_draw", "prob_away",
+                      "p_home", "p_draw", "p_away",
+                      "home", "away", "h", "a"}
+        keys = sum(1 for k in known_keys if k in all_keys)
         return min(keys * 25, 100)
     return 50
 
@@ -1261,14 +1267,19 @@ def _layer_form(match: Dict, history: Optional[List] = None, prior: Tuple = (0.4
 # ============================================================================
 
 def _calc_q_weights(layers: List[Dict]) -> List[float]:
-    """OOS Brier → inverse weighting."""
-    briers = []
+    """OOS Brier → inverse weighting. FIX: confidence (higher=better) vs brier (lower=better)."""
+    weights = []
     for layer in layers:
-        b = layer.get("brier", layer.get("confidence", 0.5))
-        briers.append(max(b, 0.01))
-    inv = [1.0 / b for b in briers]
-    total = sum(inv)
-    return [i / total for i in inv]
+        if "brier" in layer:
+            # Brier: lower is better → inverse weighting
+            weights.append(1.0 / max(layer["brier"], 0.01))
+        elif "confidence" in layer:
+            # Confidence: higher is better → direct weighting
+            weights.append(max(layer["confidence"], 0.01))
+        else:
+            weights.append(0.5)
+    total = sum(weights)
+    return [w / total for w in weights] if total > 0 else [1.0 / len(weights)] * len(layers)
 
 
 def _layer_consensus(layers: List[Dict]) -> Dict[str, Any]:
@@ -1636,18 +1647,40 @@ def analyze_match(match: Dict, history: Optional[List] = None,
         # Early-season override
         early = _check_early_season_override(history)
         # Bzzoiro predictions as layer
-        pred = match.get("predictions") or match.get("bzzoiro_predictions")
+        # FIX: support multiple key formats from Bzzoiro
+        pred = match.get("predictions") or match.get("bzzoiro_predictions") or match.get("prediction")
         layer_bzzoiro = {"probs": None, "sample_size": 0, "confidence": 0}
-        if isinstance(pred, dict) and pred.get("home_win") is not None:
-            ph = pred.get("home_win", 0.33)
-            pd = pred.get("draw", 0.33)
-            pa = pred.get("away_win", 0.34)
-            total = ph + pd + pa
-            if total > 0:
-                layer_bzzoiro = {"probs": [ph/total, pd/total, pa/total], "sample_size": 1, "confidence": 0.6}
+        if isinstance(pred, dict):
+            # Try multiple key formats: home_win / prob_home / p_home / home / h
+            ph = (pred.get("home_win") or pred.get("prob_home") or pred.get("p_home")
+                  or pred.get("home") or pred.get("h") or pred.get("1"))
+            pd = (pred.get("draw") or pred.get("prob_draw") or pred.get("p_draw")
+                  or pred.get("x") or pred.get("d") or pred.get("2"))
+            pa = (pred.get("away_win") or pred.get("prob_away") or pred.get("p_away")
+                  or pred.get("away") or pred.get("a") or pred.get("3"))
+            if ph is not None or pa is not None:
+                ph = float(ph) if ph is not None else 0.33
+                pd = float(pd) if pd is not None else 0.33
+                pa = float(pa) if pa is not None else 0.34
+                total = ph + pd + pa
+                if total > 0:
+                    # Auto-detect percentage format (48.2 instead of 0.482)
+                    if total > 1.5:
+                        ph, pd, pa = ph/100, pd/100, pa/100
+                        total = total/100
+                    layer_bzzoiro = {"probs": [ph/total, pd/total, pa/total],
+                                    "sample_size": 1, "confidence": 0.6}
 
         # Consensus
-        layers = [layer_market, layer_poisson, layer_elo, layer_form, layer_bzzoiro]
+        # FIX: layer_market excluded from consensus — market probs used only for EV calculation
+        # If included, consensus ≈ market → EV = 1/margin - 1 ≈ -5% (always negative)
+        model_layers = [layer_poisson, layer_elo, layer_form, layer_bzzoiro]
+        # Fallback: if no model layers have probs, use market with confidence=0
+        if not any(l.get("probs") for l in model_layers):
+            model_layers = [layer_market] if layer_market.get("probs") else []
+            if model_layers:
+                model_layers[0]["confidence"] = 0  # signal: market-only, no edge expected
+        consensus = _layer_consensus(model_layers)
         consensus = _layer_consensus(layers)
 
         # Calibration
@@ -1777,9 +1810,12 @@ def run_pipeline(matches: List[Dict[str, Any]],
             best_odds = _extract_best_source(match.get("odds", {})) if isinstance(match.get("odds"), dict) else None
             if best_odds:
                 with_odds += 1
-            pred = match.get("predictions") or match.get("bzzoiro_predictions")
-            if isinstance(pred, dict) and pred.get("home_win") is not None:
-                with_pred += 1
+            pred = match.get("predictions") or match.get("bzzoiro_predictions") or match.get("prediction")
+            if isinstance(pred, dict):
+                _ph = (pred.get("home_win") or pred.get("prob_home") or pred.get("p_home")
+                       or pred.get("home") or pred.get("h"))
+                if _ph is not None:
+                    with_pred += 1
             if match.get("h2h") or history:
                 with_h2h += 1
             if isinstance(match.get("stats"), dict) and match.get("stats"):
