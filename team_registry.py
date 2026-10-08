@@ -4,9 +4,7 @@ Canonical team name registry + normalization for GatekeeperAI
 ~2850 aliases / ~1500 unique teams / 58 countries
 """
 
-__version__ = "9.4-glued"
-
-import unicodedata
+__version__ = "9.3-audited"
 
 
 # ============================================================
@@ -3016,58 +3014,70 @@ TEAM_ALIASES = {
     "vasco_da_gama-rj": "vasco",
     "vitoria_salvador": "vitoria_ba",
 
-    # === CROSS-SOURCE ALIASES v9.4 (Bzzoiro ↔ SharpAPI gluing) ===
+    # === CROSS-SOURCE GLUING v9.3-patch (Bzzoiro <-> SharpAPI) ===
     "ceara_sc_fortaleza": "ceara",
-    "ceara sc fortaleza": "ceara",
     "ceara_ce": "ceara",
-    "ceara ce": "ceara",
     "atletico_nacional_medellin": "atletico_nacional",
-    "atletico nacional medellin": "atletico_nacional",
     "viettel_fc": "viettel",
-    "viettel fc": "viettel",
     "kups_kuopio": "kups",
-    "kups kuopio": "kups",
     "asu_politehnica_timisoara": "politehnica_timisoara",
-    "asu politehnica timisoara": "politehnica_timisoara",
     "csa_steaua": "csa_steaua_bucuresti",
-    "csa steaua": "csa_steaua_bucuresti",
     "nautico_pe": "nautico",
-    "nautico pe": "nautico",
     "gremio_novorizontino": "novorizontino",
     "gangwon_fc": "gangwon",
-
-    # === WOMEN'S TEAMS — bracket normalization [w] ↔ (w) → _w ===
-    "montenegro [w]": "montenegro_w",
     "montenegro_[w]": "montenegro_w",
-    "montenegro (w)": "montenegro_w",
     "montenegro_(w)": "montenegro_w",
-    "bosnia [w]": "bosnia_w",
     "bosnia_[w]": "bosnia_w",
-    "bosnia (w)": "bosnia_w",
     "bosnia_(w)": "bosnia_w",
+
 }
 
 # ============================================================
 # clean_team_name — simple normalization per §19.2
 # ============================================================
 
+def _strip_accents(text: str) -> str:
+    """Remove accents/diacritics from text, handling chars that NFD can't decompose."""
+    import unicodedata
+    # Manual replacements for chars NFD doesn't decompose
+    manual = {
+        "\u0142": "l",  # ł
+        "\u0141": "l",  # Ł
+        "\u00f8": "o",  # ø
+        "\u00d8": "o",  # Ø
+        "\u00f0": "d",  # ð
+        "\u00d0": "d",  # Ð
+        "\u00fe": "th", # þ
+        "\u00de": "th", # Þ
+        "\u00df": "ss", # ß
+        "\u0111": "d",  # đ
+        "\u0110": "d",  # Đ
+        "\u0131": "i",  # ı
+        "\u0130": "i",  # İ
+    }
+    for orig, repl in manual.items():
+        text = text.replace(orig, repl)
+    # NFD decomposition + remove combining marks
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
 def clean_team_name(name: str) -> str:
     """Нормализация названия команды."""
     if not name:
         return ""
     key = name.strip().lower()
-    # Manual replacements for non-decomposable characters
-    key = key.replace("\u0142", "l").replace("\u0141", "l")  # ł → l
-    key = key.replace("\u00f8", "o").replace("\u00d8", "o")  # ø → o
-    key = key.replace("\u00f0", "d").replace("\u00d0", "d")  # ð → d
-    key = key.replace("\u00fe", "th")                          # þ → th
-    key = key.replace("\u00df", "ss")                           # ß → ss
-    key = key.replace("\u0111", "d").replace("\u0110", "d")  # đ → d
-    key = key.replace("\u0131", "i")                           # ı → i
-    # Strip accents: NFD normalization + remove combining marks
-    key = unicodedata.normalize("NFD", key)
-    key = "".join(c for c in key if unicodedata.category(c) != "Mn")
-    return TEAM_ALIASES.get(key, key.replace(" ", "_"))
+    # Step 1: try alias lookup with original accents
+    if key in TEAM_ALIASES:
+        return TEAM_ALIASES[key]
+    # Step 2: try accent-stripped version
+    stripped = _strip_accents(key)
+    if stripped != key:
+        if stripped in TEAM_ALIASES:
+            return TEAM_ALIASES[stripped]
+        return stripped.replace(" ", "_")
+    # Step 3: no accents, just underscore
+    return key.replace(" ", "_")
 
 def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
     """
