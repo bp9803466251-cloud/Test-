@@ -55,6 +55,7 @@ from gatekeeper_hub import (
     get_from_cache,
     now_msk,
     is_shutdown_requested,
+    get_history_by_league,
 )
 # FIX-11: run_pipeline вместо batch_evaluate — возвращает структурированный результат
 from value_engine import run_pipeline
@@ -590,9 +591,33 @@ def main():
 
     # === ШАГ 3: Value-анализ ===
     logger.info(f"Value-анализ через value_engine.run_pipeline (threshold={VALUE_THRESHOLD})...")
+
+    # FIX: Build history_map from league history for model layers (Poisson/Elo/Form)
+    history_map = {}
+    _league_hist_cache = {}
+    _hist_loaded = 0
+    for cid, m in matches.items():
+        if not isinstance(m, dict):
+            continue
+        league = m.get("competition", "") or m.get("league", "")
+        if not league:
+            continue
+        if league not in _league_hist_cache:
+            try:
+                _league_hist_cache[league] = get_history_by_league(league, limit=100)
+            except Exception:
+                _league_hist_cache[league] = []
+        if _league_hist_cache[league]:
+            history_map[cid] = _league_hist_cache[league]
+            _hist_loaded += 1
+    logger.info(f"History map: {_hist_loaded} matches with history, "
+                 f"{len(_league_hist_cache)} leagues queried")
+
     try:
         # FIX-11: run_pipeline вместо batch_evaluate
-        result = run_pipeline(matches, value_threshold=VALUE_THRESHOLD)
+        # FIX: Pass history_map for Poisson/Elo/Form layers
+        result = run_pipeline(matches, history_map=history_map,
+                               value_threshold=VALUE_THRESHOLD)
     except Exception as e:
         logger.error(f"run_pipeline failed: {e}")
         dashboard = (
