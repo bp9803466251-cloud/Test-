@@ -6,8 +6,6 @@ Canonical team name registry + normalization for GatekeeperAI
 
 __version__ = "9.3-audited"
 
-import re
-import unicodedata
 
 # ============================================================
 # TEAM_ALIASES — alias -> canonical
@@ -2998,84 +2996,9 @@ _STRIP_SUFFIXES = (
 # ============================================================
 
 def clean_team_name(name: str) -> str:
-    """
-    Normalize a raw team name to a canonical key.
-    9 steps: lowercase -> diacritics -> underscore/hyphen lookups ->
-    suffix strip -> combined -> brackets -> fallback.
-    """
-    if not name:
-        return ""
-
-    # Step 1: lowercase + strip
+    """Нормализация названия команды."""
     key = name.strip().lower()
-
-    # Step 2: strip diacritics (NFD)
-    key = unicodedata.normalize("NFD", key)
-    key = "".join(c for c in key if unicodedata.category(c) != "Mn")
-
-    # Step 2a: special characters not handled by NFD
-    key = key.replace("ø", "o").replace("æ", "ae").replace("ð", "d")
-    key = key.replace("ß", "ss").replace("þ", "th").replace("œ", "oe")
-
-    # Step 2b: underscore -> space, lookup
-    if "_" in key:
-        spaced = key.replace("_", " ")
-        if spaced in TEAM_ALIASES:
-            return TEAM_ALIASES[spaced]
-
-    # Step 2c: hyphen -> space, lookup
-    if "-" in key:
-        spaced = key.replace("-", " ")
-        if spaced in TEAM_ALIASES:
-            return TEAM_ALIASES[spaced]
-
-    # Direct lookup
-    if key in TEAM_ALIASES:
-        return TEAM_ALIASES[key]
-
-    # Step 3: strip suffixes (fc, cf, afc, sc, etc.)
-    for suffix in _STRIP_SUFFIXES:
-        if key.endswith(suffix) and len(key) > len(suffix) + 2:
-            stripped = key[: -len(suffix)]
-            if stripped in TEAM_ALIASES:
-                return TEAM_ALIASES[stripped]
-
-            # Step 3b: underscore -> space after strip
-            if "_" in stripped:
-                spaced = stripped.replace("_", " ")
-                if spaced in TEAM_ALIASES:
-                    return TEAM_ALIASES[spaced]
-
-            # Step 3c: hyphen -> space after strip
-            if "-" in stripped:
-                spaced = stripped.replace("-", " ")
-                if spaced in TEAM_ALIASES:
-                    return TEAM_ALIASES[spaced]
-            break
-
-    # Step 4: combined underscore + hyphen -> space
-    if "_" in key or "-" in key:
-        spaced = key.replace("_", " ").replace("-", " ")
-        if spaced in TEAM_ALIASES:
-            return TEAM_ALIASES[spaced]
-
-    # Step 4c: bracket normalization [w] -> (w)
-    if "[" in key:
-        key = key.replace("[", "(").replace("]", ")")
-        if key in TEAM_ALIASES:
-            return TEAM_ALIASES[key]
-
-    # Step 5: fallback — normalize separators to underscore
-    fallback = key.replace(" ", "_").replace("-", "_")
-    # Collapse double underscores
-    while "__" in fallback:
-        fallback = fallback.replace("__", "_")
-    return fallback
-
-
-# ============================================================
-# Tests
-# ============================================================
+    return TEAM_ALIASES.get(key, key.replace(" ", "_"))
 
 def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
     """
