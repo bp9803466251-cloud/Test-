@@ -318,7 +318,6 @@ def evaluate_match_full(match: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if open_odds and close_odds and open_odds != close_odds:
         market_probs, model_probs = _evaluate_dual(open_odds, close_odds)
     elif best_odds:
-        # Single source — no independent model, EV is always -margin
         model_probs = _evaluate_single(best_odds)
         market_probs = model_probs
     else:
@@ -1273,10 +1272,10 @@ def _calc_q_weights(layers: List[Dict]) -> List[float]:
 
 
 def _layer_consensus(layers: List[Dict]) -> Dict[str, Any]:
-    """Weighted ensemble of all model layers (NOT market)."""
+    """Weighted ensemble of all model layers."""
     valid = [l for l in layers if l.get("probs")]
     if not valid:
-        return {"probs": None, "sample_size": 0, "confidence": 0}
+        return {"probs": None, "sample_size": 0, "confidence": 0, "has_model": False}
     weights = _calc_q_weights(valid)
     probs = [0.0, 0.0, 0.0]
     for i, layer in enumerate(valid):
@@ -1287,7 +1286,7 @@ def _layer_consensus(layers: List[Dict]) -> Dict[str, Any]:
     probs = [p / total for p in probs] if total > 0 else [0.33, 0.33, 0.34]
     avg_conf = sum(l.get("confidence", 0) * weights[i] for i, l in enumerate(valid))
     max_sample = max(l.get("sample_size", 0) for l in valid)
-    return {"probs": probs, "sample_size": max_sample, "confidence": avg_conf}
+    return {"probs": probs, "sample_size": max_sample, "confidence": avg_conf, "has_model": True}
 
 
 # ============================================================================
@@ -1647,16 +1646,13 @@ def analyze_match(match: Dict, history: Optional[List] = None,
             if total > 0:
                 layer_bzzoiro = {"probs": [ph/total, pd/total, pa/total], "sample_size": 1, "confidence": 0.6}
 
-        # Consensus — model layers only (NOT market; market is the benchmark)
-        model_layers = [layer_poisson, layer_elo, layer_form, layer_bzzoiro]
-        consensus = _layer_consensus(model_layers)
+        # Consensus — layer_market is the BENCHMARK, not a model layer.
+        # Including it in consensus makes EV ≈ -margin/(1+margin), always ≤ 0.
+        layers = [layer_poisson, layer_elo, layer_form, layer_bzzoiro]
+        consensus = _layer_consensus(layers)
 
-        # If no model layers produced probs, value = 0 (can't beat market without a model)
-        if not consensus.get("probs"):
-            consensus["probs"] = None
-
-        # Calibration (only if we have model probs)
-        if consensus.get("probs"):
+        # Calibration (passthrough if no model)
+        if consensus.get("probs") is not None:
             consensus["probs"] = _layer_calibration(consensus["probs"])["probs"]
 
         # ── Quality metrics ──
@@ -1665,15 +1661,13 @@ def analyze_match(match: Dict, history: Optional[List] = None,
         risk_flags = _calc_risk_flags(match, history)
         u = _calc_u(match, dqs, mc, risk_flags)
         source_indep = _calc_source_independence(match)
-        _eq_val = 0.0
-        if consensus.get("probs") and best_odds:
-            _eq_val = max(consensus["probs"][i] * best_odds[i] - 1.0 for i in range(3))
+        _consensus_probs = consensus.get("probs") or [0.33, 0.33, 0.34]
         edge_quality = _calc_edge_quality(
-            _eq_val,
+            max(_consensus_probs[i] * (best_odds[i] if best_odds else 0) - 1.0 for i in range(3)) if best_odds else 0,
             match, dqs, mc, u, source_indep)
 
-        # ── Value ── (consensus probs may be None if no model layers)
-        if consensus.get("probs") and best_odds:
+        # ── Value ──
+        if consensus.get("probs") is not None:
             value = _layer_value(consensus["probs"], best_odds)
         else:
             value = {"ev": [0, 0, 0], "value_pct": 0, "value_side": "none"}
