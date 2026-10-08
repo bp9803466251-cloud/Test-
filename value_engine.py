@@ -430,27 +430,35 @@ def _dqs_oh(match: Dict) -> float:
 
 
 
+
+# ---- Prediction probability extraction (fallback keys) ----
+
 def _extract_pred_probs(pred: Dict) -> Optional[Tuple[float, float, float]]:
-    """Extract (home, draw, away) probabilities from Bzzoiro prediction dict.
-    Handles multiple key formats: home_win/home, 1/X/2, p1/pX/p2, home_prob, etc.
-    Returns None if no valid probabilities found.
-    """
+    """Extract (home, draw, away) probabilities from prediction dict.
+    Supports multiple key naming conventions."""
     if not isinstance(pred, dict):
         return None
-    # Try multiple key formats
-    ph = (pred.get("home_win") or pred.get("home") or pred.get("1")
-          or pred.get("p1") or pred.get("home_prob") or pred.get("h"))
-    pd = (pred.get("draw") or pred.get("X") or pred.get("x")
-          or pred.get("pX") or pred.get("pD") or pred.get("draw_prob") or pred.get("d"))
-    pa = (pred.get("away_win") or pred.get("away") or pred.get("2")
-          or pred.get("p2") or pred.get("away_prob") or pred.get("a"))
-    # Convert to float
-    try:
-        ph = float(ph) if ph is not None else None
-        pd = float(pd) if pd is not None else None
-        pa = float(pa) if pa is not None else None
-    except (TypeError, ValueError):
-        return None
+    home_keys = ("home_win", "home", "1", "p1", "home_prob", "h")
+    draw_keys = ("draw", "X", "x", "pX", "pdraw", "d")
+    away_keys = ("away_win", "away", "2", "p2", "away_prob", "a")
+    ph = None
+    for k in home_keys:
+        v = pred.get(k)
+        if v is not None:
+            try: ph = float(v); break
+            except: continue
+    pd = None
+    for k in draw_keys:
+        v = pred.get(k)
+        if v is not None:
+            try: pd = float(v); break
+            except: continue
+    pa = None
+    for k in away_keys:
+        v = pred.get(k)
+        if v is not None:
+            try: pa = float(v); break
+            except: continue
     if ph is None or pd is None or pa is None:
         return None
     total = ph + pd + pa
@@ -461,20 +469,18 @@ def _extract_pred_probs(pred: Dict) -> Optional[Tuple[float, float, float]]:
 
 def _dqs_pi(match: Dict) -> float:
     """PI — Prediction integrity (Bzzoiro).
-    FIX: Uses _extract_pred_probs for fallback key support.
-    """
+    FIX: Uses _extract_pred_probs for fallback key support."""
     pred = match.get("predictions") or match.get("bzzoiro_predictions")
     if not pred:
         return 0.0
     if isinstance(pred, dict):
         probs = _extract_pred_probs(pred)
         if probs is not None:
-            keys = 3  # has valid home/draw/away
-        else:
-            keys = 0
-        if "score_pred" in pred or "score" in pred:
-            keys += 1
-        return min(keys * 25, 100)
+            return 75.0
+        all_keys = ("home_win", "home", "1", "p1", "draw", "X",
+                    "away_win", "away", "2", "p2", "score_pred")
+        keys = sum(1 for k in all_keys if k in pred)
+        return min(keys * 20, 100)
     return 50
 
 
@@ -1139,56 +1145,6 @@ def _dixon_coles_rho(home_goals: int, away_goals: int, lam_h: float, lam_a: floa
     return 1.0
 
 
-
-def _adapt_history(history: Optional[List]) -> Optional[List]:
-    """Convert history entries to format expected by Poisson/Elo/Form layers.
-    FootballData stores score: {home, away} — we need {result, goals_for, goals_against}.
-    Also handles Bzzoiro score format.
-    """
-    if not history:
-        return None
-    adapted = []
-    for h in history:
-        if not isinstance(h, dict):
-            continue
-        # Already has result field — no conversion needed
-        if h.get("result") is not None and h.get("goals_for") is not None:
-            adapted.append(h)
-            continue
-        # Try score field (FootballData format: {home: X, away: Y})
-        score = h.get("score", {})
-        if isinstance(score, dict):
-            hg = score.get("home", score.get("full_time_home", 0))
-            ag = score.get("away", score.get("full_time_away", 0))
-        elif isinstance(score, (list, tuple)) and len(score) >= 2:
-            hg, ag = score[0], score[1]
-        else:
-            # Try direct fields
-            hg = h.get("home_goals", h.get("goals_home", 0))
-            ag = h.get("away_goals", h.get("goals_away", 0))
-        try:
-            hg = int(hg) if hg is not None else 0
-            ag = int(ag) if ag is not None else 0
-        except (TypeError, ValueError):
-            hg, ag = 0, 0
-        # Determine result
-        if hg > ag:
-            result = "W"
-        elif hg == ag:
-            result = "D"
-        else:
-            result = "L"
-        adapted.append({
-            "date_utc": h.get("date_utc", h.get("date", "")),
-            "result": result,
-            "goals_for": hg,
-            "goals_against": ag,
-            "goals_total": hg + ag,
-            "score_total": hg + ag,
-        })
-    return adapted if adapted else None
-
-
 def _layer_poisson(match: Dict, history: Optional[List] = None) -> Dict[str, Any]:
     """Layer 2: Poisson + Dixon-Coles."""
     home_stats = _calc_attack_defence(history) if history else None
@@ -1342,19 +1298,12 @@ def _layer_form(match: Dict, history: Optional[List] = None, prior: Tuple = (0.4
 
 def _calc_q_weights(layers: List[Dict]) -> List[float]:
     """OOS Brier → inverse weighting.
-    FIX: confidence (0-1, higher=better) was used as Brier directly,
-    meaning higher confidence → lower weight. Now: brier = 1 - confidence.
-    """
+    FIX: confidence (0-1, higher=better) → brier = 1 - confidence (lower=better)."""
     briers = []
     for layer in layers:
-        conf = layer.get("brier")
-        if conf is None:
-            conf = layer.get("confidence", 0.5)
-        # If it looks like confidence (0-1 range), convert to Brier
-        if 0 <= conf <= 1:
-            b = 1.0 - conf  # confidence 0.9 → brier 0.1 (good)
-        else:
-            b = conf  # already a Brier score
+        b = layer.get("brier")
+        if b is None:
+            b = 1.0 - layer.get("confidence", 0.5)
         briers.append(max(b, 0.01))
     inv = [1.0 / b for b in briers]
     total = sum(inv)
@@ -1694,6 +1643,34 @@ def _check_game_state(match: Dict) -> Optional[Dict]:
 # MAIN: analyze_match (§21.1, §21.5)
 # ============================================================================
 
+
+
+def _adapt_history(history: Optional[List]) -> Optional[List]:
+    """Convert history format to internal format for Poisson/Elo/Form layers."""
+    if not history or not isinstance(history, list):
+        return history
+    adapted = []
+    for m in history:
+        if not isinstance(m, dict):
+            continue
+        item = dict(m)
+        score = item.get("score")
+        if isinstance(score, dict) and "result" not in item:
+            gf = score.get("home", score.get("goals_for", 0))
+            ga = score.get("away", score.get("goals_against", 0))
+            try:
+                gf = int(gf) if gf is not None else 0
+                ga = int(ga) if ga is not None else 0
+            except (TypeError, ValueError):
+                gf = ga = 0
+            item["goals_for"] = gf
+            item["goals_against"] = ga
+            if gf > ga: item["result"] = "win"
+            elif gf < ga: item["result"] = "loss"
+            else: item["result"] = "draw"
+        adapted.append(item)
+    return adapted
+
 def analyze_match(match: Dict, history: Optional[List] = None,
                    value_threshold: Optional[float] = None) -> Dict[str, Any]:
     """Главная функция — оркестрирует все слои. Никогда не падает (§27)."""
@@ -1720,20 +1697,21 @@ def analyze_match(match: Dict, history: Optional[List] = None,
         # ── Layers ──
         layer_market = {"probs": _normalize_probs(_implied_probs(best_odds)[:3]) if best_odds else None,
                         "margin": calculate_margin({"home": best_odds[0], "draw": best_odds[1], "away": best_odds[2]}) if best_odds else None}
-        # FIX: Adapt history format for model layers
-        _history = _adapt_history(history) if history else None
-        layer_poisson = _layer_poisson(match, _history)
-        layer_elo = _layer_elo(match, _history)
-        layer_form = _layer_form(match, _history)
+        # FIX: Adapt history format for Poisson/Elo/Form layers
+        history = _adapt_history(history)
+        layer_poisson = _layer_poisson(match, history)
+        layer_elo = _layer_elo(match, history)
+        layer_form = _layer_form(match, history)
         # Early-season override
         early = _check_early_season_override(history)
         # Bzzoiro predictions as layer
-        # FIX: Uses _extract_pred_probs for fallback key support
         pred = match.get("predictions") or match.get("bzzoiro_predictions")
         layer_bzzoiro = {"probs": None, "sample_size": 0, "confidence": 0}
+        # FIX: Use _extract_pred_probs for fallback key support
         pred_probs = _extract_pred_probs(pred) if isinstance(pred, dict) else None
         if pred_probs is not None:
-            layer_bzzoiro = {"probs": list(pred_probs), "sample_size": 1, "confidence": 0.6}
+            layer_bzzoiro = {"probs": list(pred_probs),
+                            "sample_size": 1, "confidence": 0.6}
 
         # Consensus — layer_market is the BENCHMARK, not a model layer.
         # Including it in consensus makes EV ≈ -margin/(1+margin), always ≤ 0.
@@ -1873,7 +1851,6 @@ def run_pipeline(matches: List[Dict[str, Any]],
             if best_odds:
                 with_odds += 1
             pred = match.get("predictions") or match.get("bzzoiro_predictions")
-            # FIX: Use _extract_pred_probs for fallback key support
             if isinstance(pred, dict) and _extract_pred_probs(pred) is not None:
                 with_pred += 1
             if match.get("h2h") or history:
