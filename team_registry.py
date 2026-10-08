@@ -2982,17 +2982,7 @@ TEAM_ALIASES = {
 }
 
 # ============================================================
-# SUFFIXES — stripped in clean_team_name step 3
-# ============================================================
-
-_STRIP_SUFFIXES = (
-    " fc", " cf", " afc", " sc", " ac", " nk", " bk", " if",
-    " sk", " fk", " tk", " vk", " df", " cl", " ec", " gc",
-    " rs", " sp", " sv", " as", " sd", " ud", " ca",
-)
-
-# ============================================================
-# clean_team_name — 9-step normalization per §4 guide
+# clean_team_name — simple normalization per §19.2
 # ============================================================
 
 def clean_team_name(name: str) -> str:
