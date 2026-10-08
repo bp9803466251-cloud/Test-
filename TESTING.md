@@ -5,7 +5,7 @@
 | File | Purpose |
 |------|---------|
 | `team_registry.py` | Registry + `clean_team_name()` function |
-| `test_gluing.py` | Automated test suite (~17000 checks) |
+| `test_gluing.py` | Automated test suite (~3000 checks) |
 | `Makefile` | Short commands for common tasks |
 | `.github/workflows/test_gluing_ci.yml` | CI/CD via GitHub Actions |
 
@@ -33,7 +33,7 @@ Names from different APIs (OddsAPI, Bzzoiro, SharpAPI, PropLine) must glue to th
 ### 3. Safety (~11 pairs)
 Different teams must NOT glue together. Example: `inter_milan` != `internacional`.
 
-### 4. Normalization (~15 checks)
+### 4. Normalization (~17 checks)
 All 10 steps of `clean_team_name()` work correctly:
 - Step 1: lowercase + strip
 - Step 2: NFD diacritics (a -> a, e -> e, etc.)
@@ -42,20 +42,37 @@ All 10 steps of `clean_team_name()` work correctly:
 - Step 2c: hyphen -> space lookup
 - Step 3: suffix strip (fc, cf, sc, afc, etc.)
 - Step 3b: underscore suffix strip
-- Step 3d: hyphen suffix strip
-- Step 4: slash -> underscore
+- Step 3c: hyphen suffix strip
+- Step 3d: combined suffix strip
+- Step 4: combined separator normalization
 - Step 4c: bracket normalization [w] -> (w)
 - Step 5: fallback (spaces/hyphens -> underscores)
+- None guard: `clean_team_name(None) == ""`
+- Empty string: `clean_team_name("") == ""`
 
-### 5. Structural integrity (~14000 checks)
+### 5. Structural integrity (~7 checks)
 - No empty keys
 - No leading/trailing spaces in keys
 - No empty canonical values
 - No spaces in canonical values
-- No chained aliases
+- No chained aliases (canonical pointing to another canonical)
+- Canonical pattern: `^[a-z0-9_()]+$`
+- No duplicate keys
 
-### 6. Source coverage (4 sources)
+### 6. Source coverage (~4 checks)
 Sample teams from each API resolve to known canonicals.
+
+### 7. Contract tests (~14 checks)
+Assertions from `test_contracts.py`:
+- `__version__ == "9.3-audited"`
+- `len(TEAM_ALIASES) >= 200`
+- `clean_team_name("Manchester United") == "man"`
+- `clean_team_name("Brøndby IF") == "brondby"`
+- `clean_team_name("Köln") == "cologne"`
+- `clean_team_name("Malmö FF") == "malmo_ff"`
+- `clean_team_name("") == ""`
+- `clean_team_name(None) == ""`
+- `build_canonical_id` returns correct format or empty string
 
 ## Deployment Workflow
 
@@ -94,6 +111,7 @@ make pipeline
 | Normalization | Step order or logic bug | Check `clean_team_name()` implementation |
 | Structural | Empty key or space in key | Fix the dict entry |
 | Source coverage | Team from API not in registry | Add team + aliases |
+| Contract | Version or assertion mismatch | Check `test_contracts.py` expectations |
 
 ## CI/CD
 
@@ -104,7 +122,7 @@ GitHub Actions runs `test_gluing.py` on every push/PR that touches `team_registr
 
 ## Stats (v9.3-audited)
 
-- **2885 aliases**
-- **1509 unique canonical names**
+- **~2 880 aliases**
+- **~1 510 unique canonical names**
 - **58 countries/leagues**
 - **10 normalization steps**
