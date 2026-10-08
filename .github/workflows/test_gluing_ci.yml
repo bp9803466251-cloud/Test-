@@ -3,11 +3,11 @@ name: Team Registry Tests
 on:
   push:
     paths:
-      - 'team_registry_final.py'
+      - 'team_registry.py'
       - 'test_gluing.py'
   pull_request:
     paths:
-      - 'team_registry_final.py'
+      - 'team_registry.py'
       - 'test_gluing.py'
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
 
       - name: Check syntax
         run: |
-          python -m py_compile team_registry_final.py
+          python -m py_compile team_registry.py
           echo "✅ Syntax OK"
 
       - name: Run gluing tests
