@@ -77,7 +77,7 @@ def _to_float(v: Any) -> Optional[float]:
     if isinstance(v, (int, float)):
         return float(v) if v > 0 else None
     if isinstance(v, str):
-        s = v.strip().replace(",", ".").rstrip("%")
+        s = v.strip().replace(",", ".")
         if not s or s == "-":
             return None
         try:
@@ -431,54 +431,73 @@ def _dqs_oh(match: Dict) -> float:
 
 
 
+# ---- Prediction probability extraction (fallback keys) ----
+
 def _extract_pred_probs(pred: Dict) -> Optional[Tuple[float, float, float]]:
     """Extract (home, draw, away) probabilities from prediction dict.
-    Supports multiple key naming conventions + nested dict search."""
+    Supports multiple key naming conventions and nested dicts."""
     if not isinstance(pred, dict):
         return None
-    
     home_keys = ("home_win", "home", "1", "p1", "home_prob", "h",
-                 "home_team_win", "prob_home", "home_pct", "prob_1", "p_home",
-                 "winner_home", "home_probability", "home_win_prob", "win_home")
+                 "home_team_win", "prob_home", "home_pct", "prob_1",
+                 "p_home", "winner_home", "home_probability", "home_win_prob")
     draw_keys = ("draw", "X", "x", "pX", "pdraw", "d",
-                 "prob_draw", "draw_pct", "prob_x", "p_draw", "p_x",
+                 "prob_draw", "draw_pct", "prob_x", "p_draw",
                  "draw_probability", "draw_prob")
     away_keys = ("away_win", "away", "2", "p2", "away_prob", "a",
-                 "away_team_win", "prob_away", "away_pct", "prob_2", "p_away",
-                 "winner_away", "away_probability", "away_win_prob", "win_away")
+                 "away_team_win", "prob_away", "away_pct", "prob_2",
+                 "p_away", "winner_away", "away_probability", "away_win_prob")
     
-    def _find_val(d, keys):
-        for k in keys:
-            v = d.get(k)
-            if v is not None:
-                f = _to_float(v)
-                if f is not None:
-                    return f
+    def _safe_float(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip().replace(",", ".").rstrip("%")
+            try:
+                return float(s)
+            except ValueError:
+                return None
         return None
     
-    ph = _find_val(pred, home_keys)
-    pd = _find_val(pred, draw_keys)
-    pa = _find_val(pred, away_keys)
+    ph = None
+    for k in home_keys:
+        v = pred.get(k)
+        if v is not None:
+            f = _safe_float(v)
+            if f is not None:
+                ph = f
+                break
+    pd = None
+    for k in draw_keys:
+        v = pred.get(k)
+        if v is not None:
+            f = _safe_float(v)
+            if f is not None:
+                pd = f
+                break
+    pa = None
+    for k in away_keys:
+        v = pred.get(k)
+        if v is not None:
+            f = _safe_float(v)
+            if f is not None:
+                pa = f
+                break
     
-    # Nested dict search
     if ph is None or pd is None or pa is None:
-        for nested_key in ("probabilities", "pred", "outcome", "prediction", "result", "probs"):
+        # Try nested dicts
+        for nested_key in ("probabilities", "pred", "prediction", "outcome", "result"):
             nested = pred.get(nested_key)
             if isinstance(nested, dict):
-                ph2 = _find_val(nested, home_keys)
-                pd2 = _find_val(nested, draw_keys)
-                pa2 = _find_val(nested, away_keys)
-                if ph2 is not None and pd2 is not None and pa2 is not None:
-                    ph, pd, pa = ph2, pd2, pa2
-                    break
-    
-    if ph is None or pd is None or pa is None:
+                nested_result = _extract_pred_probs(nested)
+                if nested_result is not None:
+                    return nested_result
         return None
     
     total = ph + pd + pa
     if total <= 0:
         return None
-    return ph / total, pd / total, pa / total
+    return (ph / total, pd / total, pa / total)
 
 def _dqs_pi(match: Dict) -> float:
     """PI — Prediction integrity (Bzzoiro).
@@ -1313,7 +1332,9 @@ def _calc_q_weights(layers: List[Dict]) -> List[float]:
     """OOS Brier → inverse weighting."""
     briers = []
     for layer in layers:
-        b = layer.get("brier", 1.0 - layer.get("confidence", 0.5))
+        b = layer.get("brier")
+        if b is None:
+            b = 1.0 - layer.get("confidence", 0.5)
         briers.append(max(b, 0.01))
     inv = [1.0 / b for b in briers]
     total = sum(inv)
@@ -1665,6 +1686,11 @@ def _adapt_history(history: Optional[List]) -> Optional[List]:
         if not isinstance(m, dict):
             continue
         item = dict(m)
+        # If already has result in W/D/L format, keep it
+        if item.get("result") in ("W", "D", "L"):
+            adapted.append(item)
+            continue
+        # Convert from score format
         score = item.get("score")
         if isinstance(score, dict) and "result" not in item:
             gf = score.get("home", score.get("goals_for", 0))
@@ -1682,15 +1708,27 @@ def _adapt_history(history: Optional[List]) -> Optional[List]:
                 item["result"] = "L"
             else:
                 item["result"] = "D"
+        elif "result" not in item:
+            # Try goals_for/goals_against directly
+            gf = item.get("goals_for", 0)
+            ga = item.get("goals_against", 0)
+            try:
+                gf = int(gf) if gf is not None else 0
+                ga = int(ga) if ga is not None else 0
+            except (TypeError, ValueError):
+                gf = ga = 0
+            if gf > ga:
+                item["result"] = "W"
+            elif gf < ga:
+                item["result"] = "L"
+            else:
+                item["result"] = "D"
         adapted.append(item)
     return adapted if adapted else history
-
-_diag_count = 0
 
 def analyze_match(match: Dict, history: Optional[List] = None,
                    value_threshold: Optional[float] = None) -> Dict[str, Any]:
     """Главная функция — оркестрирует все слои. Никогда не падает (§27)."""
-    global _diag_count
     try:
         if not isinstance(match, dict):
             return {"error": "invalid_input", "canonical_id": ""}
@@ -1730,14 +1768,28 @@ def analyze_match(match: Dict, history: Optional[List] = None,
             layer_bzzoiro = {"probs": list(pred_probs),
                             "sample_size": 1, "confidence": 0.6}
         elif isinstance(pred, dict) and pred:
-            if _diag_count < 3:
-                print(f"[DIAG] cid={cid} pred_keys={list(pred.keys())[:10]}", flush=True)
-                _diag_count += 1
+            # DIAGNOSTIC: Log pred keys when extraction fails
+            print(f"[DIAG] cid={cid} pred_keys_not_found: {list(pred.keys())[:15]}", flush=True)
 
-        # Consensus — layer_market is the BENCHMARK, not a model layer.
+                # Consensus — layer_market is the BENCHMARK, not a model layer.
         # Including it in consensus makes EV ≈ -margin/(1+margin), always ≤ 0.
         layers = [layer_poisson, layer_elo, layer_form, layer_bzzoiro]
         consensus = _layer_consensus(layers)
+
+        # DIAGNOSTIC: Print layer status
+        _cprobs = consensus.get("probs")
+        _diag_parts = []
+        _diag_parts.append(f"poisson={'Y' if layer_poisson.get('probs') else 'N'}")
+        _diag_parts.append(f"elo={'Y' if layer_elo.get('probs') else 'N'}")
+        _diag_parts.append(f"form={'Y' if layer_form.get('probs') else 'N'}")
+        _diag_parts.append(f"bzzoiro={'Y' if layer_bzzoiro.get('probs') else 'N'}")
+        _diag_parts.append(f"hist={'Y' if history else 'N'}")
+        if isinstance(pred, dict):
+            _diag_parts.append(f"pred_keys={list(pred.keys())[:8]}")
+        if _cprobs:
+            print(f"[DIAG] cid={cid} layers=[{' '.join(_diag_parts)}] consensus=[{_cprobs[0]:.2f} {_cprobs[1]:.2f} {_cprobs[2]:.2f}]", flush=True)
+        else:
+            print(f"[DIAG] cid={cid} layers=[{' '.join(_diag_parts)}] consensus=None (all layers dead)", flush=True)
 
         # Calibration (passthrough if no model)
         if consensus.get("probs") is not None:
@@ -1757,14 +1809,14 @@ def analyze_match(match: Dict, history: Optional[List] = None,
         # ── Value ──
         if consensus.get("probs") is not None:
             value = _layer_value(consensus["probs"], best_odds)
-            if _diag_count < 5 and value["value_pct"] > 0:
-                print(f"[DIAG] cid={cid} consensus={consensus['probs']} value={value['value_pct']:.4f} side={value['value_side']}", flush=True)
-                _diag_count += 1
         else:
             value = {"ev": [0, 0, 0], "value_pct": 0, "value_side": "none"}
-            if _diag_count < 3:
-                print(f"[DIAG] cid={cid} consensus=None (all layers dead)", flush=True)
-                _diag_count += 1
+        
+        # DIAGNOSTIC: Print value result
+        if best_odds and consensus.get("probs"):
+            print(f"[DIAG] cid={cid} value={value['value_pct']:.4f} side={value['value_side']} "
+                  f"odds=[{best_odds[0]:.2f} {best_odds[1]:.2f} {best_odds[2]:.2f}] "
+                  f"ev=[{value['ev'][0]:.3f} {value['ev'][1]:.3f} {value['ev'][2]:.3f}]", flush=True)
         snapshot = _calc_odds_snapshot(match)
         conflicts = _resolve_conflicts(match)
         scenarios = _calc_scenarios({"value_pct": value["value_pct"], "u": u}, match)
@@ -1827,6 +1879,9 @@ def analyze_match(match: Dict, history: Optional[List] = None,
 
         logger.info("analyze_match: cid=%s, value=%.4f, dqs=%.1f, mc=%.1f, u=%.1f, class=%s",
                      cid, v, dqs_score, mc.get("score", 0), u.get("score", 0), classification)
+        # DIAGNOSTIC: Print classification with details
+        print(f"[DIAG] cid={cid} class={classification} value={v:.4f} dqs={dqs_score:.1f} "
+              f"threshold_hot={hot_threshold:.3f} threshold_warm={warm_threshold:.3f}", flush=True)
         return value_analysis
 
     except Exception as e:
@@ -1866,7 +1921,6 @@ def run_pipeline(matches: List[Dict[str, Any]],
     with_stats = 0
     value_bets = 0
 
-    _diag_pipeline = 0
     for match in matches:
         if is_shutdown_requested():
             logger.info("Shutdown requested — остановка run_pipeline")
@@ -1874,9 +1928,16 @@ def run_pipeline(matches: List[Dict[str, Any]],
         try:
             cid = match.get("canonical_id", "")
             history = history_map.get(cid, []) if history_map else None
-            if _diag_pipeline < 3:
-                print(f"[DIAG] cid={cid} history={'yes' if history else 'no'} pred={'yes' if isinstance(match.get('predictions') or match.get('bzzoiro_predictions'), dict) else 'no'}", flush=True)
-                _diag_pipeline += 1
+            # DIAGNOSTIC: First 3 matches — show what we have
+            if len(results) < 3:
+                _m = match
+                _odds = _m.get("odds", {})
+                _pred = _m.get("predictions") or _m.get("bzzoiro_predictions")
+                _odds_ok = bool(_extract_best_source(_odds) if isinstance(_odds, dict) else None)
+                _pred_ok = bool(_extract_pred_probs(_pred) if isinstance(_pred, dict) else None)
+                print(f"[DIAG] match#{len(results)} cid={cid} odds={'Y' if _odds_ok else 'N'} "
+                      f"pred={'Y' if _pred_ok else 'N'} hist={'Y' if history else 'N'} "
+                      f"pred_keys={list(_pred.keys())[:8] if isinstance(_pred, dict) else 'None'}", flush=True)
             # Count stats
             best_odds = _extract_best_source(match.get("odds", {})) if isinstance(match.get("odds"), dict) else None
             if best_odds:
@@ -1926,7 +1987,26 @@ def run_pipeline(matches: List[Dict[str, Any]],
         "value_bets": value_bets,
     }
 
-    print(f"[DIAG] Pipeline done: matches={len(matches)} hot={len(hot)} warm={len(warm)} "
-          f"with_odds={with_odds} with_pred={with_pred} value_bets={value_bets}", flush=True)
+    # DIAGNOSTIC: Pipeline summary
+    print(f"[DIAG] === PIPELINE SUMMARY ===", flush=True)
+    print(f"[DIAG] matches={len(matches)} analyzed={len(results)} hot={len(hot)} warm={len(warm)} "
+          f"errors={errors} value_bets={value_bets}", flush=True)
+    print(f"[DIAG] with_odds={with_odds} with_pred={with_pred} with_h2h={with_h2h} with_stats={with_stats}", flush=True)
+    print(f"[DIAG] history_map_size={len(history_map) if history_map else 0}", flush=True)
+    if hot:
+        for h in hot[:5]:
+            print(f"[DIAG] HOT: cid={h.get('canonical_id','')} value={h.get('value_pct',0):.4f} "
+                  f"side={h.get('value_side','')} dqs={h.get('dqs',{}).get('score',0):.1f}", flush=True)
+    if warm:
+        for w in warm[:3]:
+            print(f"[DIAG] WARM: cid={w.get('canonical_id','')} value={w.get('value_pct',0):.4f} "
+                  f"side={w.get('value_side','')} dqs={w.get('dqs',{}).get('score',0):.1f}", flush=True)
+    if not hot and not warm:
+        print(f"[DIAG] NO VALUE BETS FOUND — checking first 5 matches for details...", flush=True)
+        for r in results[:5]:
+            cprobs = r.get("model_probs")
+            print(f"[DIAG] SKIP: cid={r.get('canonical_id','')} value={r.get('value_pct',0):.4f} "
+                  f"class={r.get('classification','')} "
+                  f"model_probs={cprobs}", flush=True)
 
     return {"hot": hot, "warm": warm, "stats": stats, "results": results}
