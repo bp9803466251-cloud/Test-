@@ -705,6 +705,8 @@ TEAM_ALIASES = {
     "fc midtjylland": "midtjylland",
     "brondby": "brondby",
     "brondby if": "brondby",
+    "brøndby if": "brondby",
+    "köln": "cologne",
     "agf": "agf",
     "agf aarhus": "agf",
     "aarhus": "agf",
@@ -764,6 +766,7 @@ TEAM_ALIASES = {
     # === SWEDEN — Allsvenskan + Superettan ===
     "malmo": "malmo",
     "malmo ff": "malmo",
+    "malmö ff": "malmo_ff",
     "aik": "aik",
     "aik stockholm": "aik",
     "djurgarden": "djurgarden",
@@ -3010,6 +3013,8 @@ TEAM_ALIASES = {
 
 def clean_team_name(name: str) -> str:
     """Нормализация названия команды."""
+    if not name:
+        return ""
     key = name.strip().lower()
     return TEAM_ALIASES.get(key, key.replace(" ", "_"))
 
