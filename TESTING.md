@@ -5,7 +5,7 @@
 | File | Purpose |
 |------|---------|
 | `team_registry.py` | Registry + `clean_team_name()` function |
-| `test_gluing.py` | Automated test suite (~3000 checks) |
+| `test_gluing.py` | Automated test suite (~17000 checks) |
 | `Makefile` | Short commands for common tasks |
 | `.github/workflows/test_gluing_ci.yml` | CI/CD via GitHub Actions |
 
@@ -24,7 +24,7 @@ make all
 
 ## Test Categories
 
-### 1. Self-consistency (~2990 checks)
+### 1. Self-consistency (~2900 checks)
 Every alias in `TEAM_ALIASES` must resolve to its declared canonical via `clean_team_name()`.
 
 ### 2. Cross-source gluing (~20 pairs)
@@ -42,19 +42,19 @@ All 10 steps of `clean_team_name()` work correctly:
 - Step 2c: hyphen -> space lookup
 - Step 3: suffix strip (fc, cf, sc, afc, etc.)
 - Step 3b: underscore suffix strip
-- Step 3c: hyphen suffix strip
-- Step 3d: combined suffix strip
-- Step 4: combined separator normalization
+- Step 3d: hyphen suffix strip
+- Step 4: slash -> underscore
 - Step 4c: bracket normalization [w] -> (w)
 - Step 5: fallback (spaces/hyphens -> underscores)
 
-### 5. Structural integrity (~4 checks)
+### 5. Structural integrity (~14000 checks)
 - No empty keys
 - No leading/trailing spaces in keys
 - No empty canonical values
 - No spaces in canonical values
+- No chained aliases
 
-### 6. Source coverage (~4 checks)
+### 6. Source coverage (4 sources)
 Sample teams from each API resolve to known canonicals.
 
 ## Deployment Workflow
@@ -102,9 +102,9 @@ GitHub Actions runs `test_gluing.py` on every push/PR that touches `team_registr
 **Exit code 0** = tests passed, PR can merge.
 **Exit code 1** = tests failed, PR is blocked.
 
-## Stats (v9.5-full)
+## Stats (v9.3-audited)
 
-- **2 990 aliases**
-- **1 600 unique canonical names**
+- **2885 aliases**
+- **1509 unique canonical names**
 - **58 countries/leagues**
 - **10 normalization steps**

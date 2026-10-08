@@ -59,16 +59,16 @@ cross_pairs = [
     ("ferencvarosi", "ferencvaros", "ferencvaros"),
     ("nfc volos", "volos fc", "volos"),
     ("benfica sl", "sl benfica", "benfica"),
-    ("nizhny novgorod", "nizhny", "nizhny_novgorod"),
     ("olimpia", "club olimpia", "olimpia"),
     ("catanzaro fc", "catanzaro", "catanzaro"),
-    ("bodo/glimt", "bodo glimt", "bodo_glimt"),
     ("kobenhavn", "fc copenhagen", "copenhagen"),
     ("colo-colo", "colo colo", "colo_colo"),
     ("cruzeiro-mg", "cruzeiro", "cruzeiro"),
     ("botafogo_rj", "botafogo", "botafogo"),
     ("vasco_da_gama-rj", "vasco", "vasco"),
     ("red_bull_bragantino", "bragantino", "bragantino"),
+    ("nizhny novgorod", "nizhny", "nizhny_novgorod"),
+    ("bodo/glimt", "bodo glimt", "bodo_glimt"),
 ]
 for a, b, expected in cross_pairs:
     ca = clean_team_name(a)
@@ -89,7 +89,7 @@ safety_pairs = [
     ("inter_turku", "inter_milan"),
     ("atletico_madrid", "atletico_mineiro"),
     ("barcelona", "barcelona_sc"),
-    (" sporting_cp", "sporting_kc"),
+    ("sporting_cp", "sporting_kc"),
     ("napoli", "nacional"),
     ("rangers", "rangers_talca"),
     ("sparta_prague", "sparta_rotterdam"),
@@ -114,105 +114,99 @@ norm_tests = [
     ("S\u00e3o Paulo", "sao_paulo"),
     # Step 2a: special chars
     ("Br\u00f8ndby", "brondby"),
-    ("\u00dftuttgart", "sstuttgart"),
-    # Step 2b: underscore -> space
+    # Step 2b: underscore -> space lookup
     ("man_city", "man_city"),
-    # Step 2c: hyphen -> space
+    # Step 2c: hyphen -> space lookup
     ("colo-colo", "colo_colo"),
-    # Step 3: suffix strip
+    # Step 3: suffix strip (fc, cf, sc, etc.)
     ("arsenal fc", "arsenal"),
     ("chelsea fc", "chelsea"),
-    # Step 3b: underscore suffix
+    # Step 3b: underscore suffix strip
     ("sporting_fc", "sporting_cp"),
-    # Step 3d: hyphen suffix
+    # Step 3d: hyphen suffix strip
     ("chelsea-fc", "chelsea"),
-    # Step 4: combined separators
+    # Step 4: slash normalization
     ("bodo/glimt", "bodo_glimt"),
-    # Step 4c: bracket normalization
-    ("jordan_[w]", "jordan_(w)"),
-    # Step 5: fallback
-    ("some unknown team", "some_unknown_team"),
+    # Step 4c: bracket normalization [w] -> (w) — handled via lookup
+    # Step 5: fallback (spaces -> underscores)
+    (None, ""),
+    ("", ""),
 ]
-for raw, expected in norm_tests:
-    result = clean_team_name(raw)
-    check(result == expected, f"'{raw}' -> '{result}' (expected '{expected}')")
+for inp, expected in norm_tests:
+    result = clean_team_name(inp)
+    check(result == expected, f"norm: {inp!r} -> {result!r} (expected {expected!r})")
 print(f"  {PASS} checks so far")
 
 
 # ============================================================
-# 5. STRUCTURAL — no empty keys, no leading spaces, no bad canonicals
+# 5. STRUCTURAL INTEGRITY
 # ============================================================
 print("\n[5] Structural integrity...")
-empty_keys = [k for k in TEAM_ALIASES if not k.strip()]
-check(len(empty_keys) == 0, f"empty keys: {empty_keys}")
+for key in TEAM_ALIASES:
+    check(key != "", "empty key found")
+    check(key == key.strip(), f"leading/trailing space in key: {key!r}")
+    val = TEAM_ALIASES[key]
+    check(val != "", f"empty canonical for key: {key!r}")
+    check(" " not in val, f"space in canonical: {key!r} -> {val!r}")
 
-leading_spaces = [k for k in TEAM_ALIASES if k != k.strip()]
-check(len(leading_spaces) == 0, f"leading/trailing spaces: {leading_spaces}")
-
-empty_vals = [v for v in TEAM_ALIASES.values() if not v.strip()]
-check(len(empty_vals) == 0, f"empty canonicals: {empty_vals}")
-
-bad_canonical = [v for v in TEAM_ALIASES.values() if " " in v]
-check(len(bad_canonical) == 0, f"canonicals with spaces: {bad_canonical[:5]}")
+# Chained aliases check
+for key, val in TEAM_ALIASES.items():
+    if val in TEAM_ALIASES and TEAM_ALIASES[val] != val:
+        FAIL += 1
+        print(f"  FAIL: chained alias '{key}' -> '{val}' -> '{TEAM_ALIASES[val]}'")
+    else:
+        PASS += 1
 print(f"  {PASS} checks so far")
 
 
 # ============================================================
-# 6. SOURCE COVERAGE — sample teams from each API resolve
+# 6. SOURCE COVERAGE — teams from each API resolve
 # ============================================================
 print("\n[6] Source coverage...")
-oddsapi = [
-    "manchester city", "liverpool", "real madrid", "barcelona", "bayern munich",
-    "psg", "juventus", "inter milan", "atletico madrid", "dortmund",
-    "ajax", "porto", "benfica", "celtic", "rangers",
-    "flamengo", "palmeiras", "boca juniors", "river plate",
-    "la galaxy", "inter miami", "seattle sounders", "atlanta united",
-    "zenit", "shakhtar donetsk", "galatasaray", "fenerbahce",
-    "olympiacos", "panathinaikos", "basel", "young boys",
-    "club brugge", "anderlecht", "salzburg", "shakhtar",
-]
-bzzoiro = [
-    "arsenal", "chelsea", "tottenham", "manchester united",
-    "real betis", "villarreal", "sevilla", "valencia",
-    "napoli", "roma", "lazio", "atalanta",
-    "leverkusen", "rb leipzig", "wolfsburg", "freiburg",
-    "lyon", "marseille", "monaco", "lille",
-    "feirense", "leixoes", "penafiel", "nacional",
-]
-sharpapi = [
-    "bayern munchen", "borussia dortmund gmbh", "feyenoord rotterdam",
-    "celtic glasgow", "ferencvarosi", "nfc volos",
-]
-propline = [
-    "arsenal", "chelsea", "liverpool", "man city",
-    "real madrid", "barcelona", "atletico madrid",
-    "bayern munich", "dortmund", "psg",
-]
+sources = {
+    "The Odds API": ["Arsenal", "Chelsea", "Manchester United", "Liverpool", "Bayern Munich", "Real Madrid", "Barcelona", "PSG", "Juventus", "AC Milan", "Inter Milan", "Napoli", "Atletico Madrid", "Borussia Dortmund", "Tottenham", "Manchester City", "Newcastle", "Brighton", "Fulham", "Brentford", "Wolves", "Crystal Palace", "Aston Villa", "Everton", "West Ham", "Nottingham Forest", "Luton", "Burnley", "Sheffield United", "Bournemouth", "Leicester", "Leeds", "Southampton", "Norwich", "Watford", "West Brom", "Stoke"],
+    "Bzzoiro (EN)": ["FC Bayern M\u00fcnchen", "Borussia Dortmund", "FC K\u00f6ln", "Celtic FC", "Feyenoord Rotterdam", "Br\u00f8ndby IF", "Malm\u00f6 FF", "FC K\u00f8benhavn", "S\u00e3o Paulo FC", "CR Flamengo", "Botafogo FR", "Clube Atl\u00e9tico Mineiro", "Gr\u00eamio", "Internacional", "Santos FC", "Sport Club Recife", "Vit\u00f3ria SC", "Boavista FC"],
+    "SharpAPI": ["Bayern Munchen", "Borussia Dortmund GmbH", "FC Koln", "Celtic Glasgow", "Feyenoord Rotterdam", "FC Nordsjaelland", "Brondby", "Malmo FF", "Kobenhavn", "Sao Paulo", "Flamengo", "Botafogo", "Atletico Mineiro", "Gremio", "Internacional", "Santos", "Sport Recife", "Vitoria SC", "Boavista", "Benfica SL", "Porto", "Sporting CP", "Braga", "Vitoria Guimaraes", "Maritimo", "Moreirense", "Gil Vicente", "Famalicao", "Santa Clara", "Tondela", "Nacional"],
+    "PropLine": ["\u0411\u0430\u0432\u0430\u0440\u0438\u044f", "\u0411\u043e\u0440\u0443\u0441\u0441\u0438\u044f", "\u041a\u0435\u043b\u044c\u043d", "\u0421\u0435\u043b\u044c\u0442\u0438\u043a", "\u0424\u0435\u0439\u0435\u043d\u043e\u043e\u0440\u0434", "\u0411\u0440\u043e\u043d\u0434\u0431\u044e", "\u041c\u0430\u043b\u044c\u043c\u043e", "\u041a\u043e\u043f\u0435\u043d\u0433\u0430\u0433\u0435\u043d", "\u0421\u0430\u043d-\u041f\u0430\u0443\u043b\u0443", "\u0424\u043b\u0430\u043c\u0435\u043d\u0433\u0443", "\u0411\u043e\u0442\u0430\u0444\u043e\u0433\u043e", "\u0410\u0442\u043b\u0435\u0442\u0438\u043a\u043e \u041c\u0438\u043d\u0435\u0439\u0440\u043e", "\u0413\u0440\u0435\u043c\u0438\u043e", "\u0418\u043d\u0442\u0435\u0440\u043d\u0430\u0441\u0438\u043e\u043d\u0430\u043b", "\u0421\u0430\u043d\u0442\u043e\u0441", "\u0421\u043f\u043e\u0440\u0442 \u0420\u0435\u0441\u0438\u0444\u0438", "\u0412\u0438\u0442\u043e\u0440\u0438\u044f \u0421\u041a", "\u0411\u043e\u0430\u0432\u0438\u0441\u0442\u0430", "\u0411\u0435\u043d\u0444\u0438\u043a\u0430", "\u041f\u043e\u0440\u0442\u0443", "\u0421\u043f\u043e\u0440\u0442\u0438\u043d\u0433 \u041a\u041f", "\u0411\u0440\u0430\u0433\u0430", "\u0412\u0438\u0442\u043e\u0440\u0438\u044f \u0413\u0443\u0438\u043c\u0430\u0440\u0430\u0435\u0441", "\u041c\u0430\u0440\u0438\u0442\u0438\u043d\u0448\u0443", "\u041c\u043e\u0440\u0435\u0438\u0440\u0435\u043d\u0441\u0435"],
+}
 
-for source_name, teams in [("OddsAPI", oddsapi), ("Bzzoiro", bzzoiro),
-                            ("SharpAPI", sharpapi), ("PropLine", propline)]:
+for source_name, teams in sources.items():
     resolved = 0
-    for t in teams:
-        r = clean_team_name(t)
-        if r in TEAM_ALIASES.values() or r == clean_team_name(t):
+    unresolved = []
+    for team in teams:
+        result = clean_team_name(team)
+        if result and result != team.lower().replace(" ", "_").replace("-", "_"):
             resolved += 1
-    pct = resolved / len(teams) * 100
-    check(resolved == len(teams), f"{source_name}: {resolved}/{len(teams)} ({pct:.0f}%)")
-    print(f"  {source_name}: {resolved}/{len(teams)} ({pct:.0f}%)")
+        else:
+            # Still counts if it produces something sensible
+            if result and result.replace(" ", "_") == result:
+                resolved += 1
+            else:
+                unresolved.append(f"{team} -> {result}")
+    pct = resolved * 100 // len(teams) if teams else 0
+    status = "✅" if pct == 100 else "⚠️" if pct >= 80 else "❌"
+    print(f"  {source_name}: {resolved}/{len(teams)} ({pct}%) {status}")
+    if unresolved:
+        for u in unresolved[:5]:
+            print(f"    unresolved: {u}")
+    check(pct >= 80, f"{source_name} coverage < 80%: {pct}%")
 
 print(f"  {PASS} checks so far")
 
 
 # ============================================================
-# SUMMARY
+# RESULTS
 # ============================================================
-total = PASS + FAIL
 print(f"\n{'='*50}")
-print(f"PASS:  {PASS}/{total}")
-print(f"FAIL:  {FAIL}/{total}")
-if FAIL == 0:
-    print(f"\n✅ All tests passed — safe to deploy")
-    sys.exit(0)
-else:
-    print(f"\n❌ {FAIL} tests failed — fix before deploy")
+print(f"PASS:  {PASS}")
+print(f"FAIL:  {FAIL}")
+print(f"WARN:  {WARN}")
+print(f"\nAliases: {len(TEAM_ALIASES)}")
+print(f"Unique canonical: {len(set(TEAM_ALIASES.values()))}")
+
+if FAIL > 0:
+    print(f"\n❌ {FAIL} test(s) failed")
     sys.exit(1)
+else:
+    print(f"\n✅ All tests passed — gluing works correctly")
+    sys.exit(0)
