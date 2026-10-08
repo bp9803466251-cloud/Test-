@@ -1130,7 +1130,7 @@ TEAM_ALIASES = {
     "fc sochi": "sochi",
     "ural yekaterinburg": "ural",
     "ural": "ural",
-    "nizhny novgorod": "nizhny_novorossiysk",
+    "nizhny novgorod": "nizhny_novgorod",
     "khimki": "khimki",
     "fakel voronezh": "fakel",
     "fakel": "fakel",
@@ -2997,17 +2997,17 @@ _STRIP_SUFFIXES = (
 # clean_team_name — 9-step normalization per §4 guide
 # ============================================================
 
-def clean_team_name(raw: str) -> str:
+def clean_team_name(name: str) -> str:
     """
     Normalize a raw team name to a canonical key.
     9 steps: lowercase -> diacritics -> underscore/hyphen lookups ->
     suffix strip -> combined -> brackets -> fallback.
     """
-    if not raw:
+    if not name:
         return ""
 
     # Step 1: lowercase + strip
-    key = raw.strip().lower()
+    key = name.strip().lower()
 
     # Step 2: strip diacritics (NFD)
     key = unicodedata.normalize("NFD", key)
