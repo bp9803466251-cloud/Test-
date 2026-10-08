@@ -1,11 +1,11 @@
 """
-team_registry.py — v9.3-audited
+team_registry.py — v9.5-full
 Canonical team name registry + normalization for GatekeeperAI
-~2850 aliases / ~1500 unique teams / 58 countries
+~2900 aliases / ~1520 unique teams / 58 countries
 """
 
-__version__ = "9.3-audited"
-
+import re
+import unicodedata
 
 # ============================================================
 # TEAM_ALIASES — alias -> canonical
@@ -24,11 +24,11 @@ TEAM_ALIASES = {
     "chelsea fc": "chelsea",
     "liverpool": "liverpool",
     "liverpool fc": "liverpool",
-    "manchester city": "city",
-    "man city": "city",
-    "manchester united": "man",
-    "man utd": "man",
-    "man united": "man",
+    "manchester city": "man_city",
+    "man city": "man_city",
+    "manchester united": "man_united",
+    "man utd": "man_united",
+    "man united": "man_united",
     "tottenham": "tottenham",
     "spurs": "tottenham",
     "tottenham hotspur": "tottenham",
@@ -48,7 +48,6 @@ TEAM_ALIASES = {
     "wolves": "wolverhampton",
     "nottingham forest": "nottingham_forest",
     "nottm forest": "nottingham_forest",
-    "nott'm forest": "nottingham_forest",
     "burnley": "burnley",
     "luton": "luton",
     "luton town": "luton",
@@ -314,15 +313,21 @@ TEAM_ALIASES = {
     "bolzano": "south_tyrol",
     "sudtirol": "south_tyrol",
     "el verona": "hellas_verona",
-    "lecco": "lecco",
+        "lecco": "lecco",
+    "catanzaro": "catanzaro",
+    "catanzaro fc": "catanzaro",
 
     # === GERMANY — Bundesliga + 2. Bundesliga + Liga 3 ===
-    "bayern munich": "bayern_munich",
+        "bayern munich": "bayern_munich",
+    "bayern munchen": "bayern_munich",
     "bayern": "bayern_munich",
     "fc bayern": "bayern_munich",
+    "fcb": "bayern_munich",
     "borussia dortmund": "dortmund",
+    "borussia dortmund gmbh": "dortmund",
     "dortmund": "dortmund",
     "bvb": "dortmund",
+    "ballspielverein borussia 09": "dortmund",
     "rb leipzig": "rb_leipzig",
     "leipzig": "rb_leipzig",
     "leverkusen": "leverkusen",
@@ -505,6 +510,8 @@ TEAM_ALIASES = {
     "psv eindhoven": "psv",
     "eindhoven": "psv",
     "feyenoord": "feyenoord",
+    "feyenoord rotterdam": "feyenoord",
+    "feyenoord 1908": "feyenoord",
     "az alkmaar": "az_alkmaar",
     "az": "az_alkmaar",
     "twente": "twente",
@@ -574,6 +581,7 @@ TEAM_ALIASES = {
     # === PORTUGAL — Primeira Liga ===
     "benfica": "benfica",
     "sl benfica": "benfica",
+    "benfica sl": "benfica",
     "porto": "porto",
     "fc porto": "porto",
     "sporting": "sporting_cp",
@@ -705,8 +713,6 @@ TEAM_ALIASES = {
     "fc midtjylland": "midtjylland",
     "brondby": "brondby",
     "brondby if": "brondby",
-    "brøndby if": "brondby",
-    "köln": "cologne",
     "agf": "agf",
     "agf aarhus": "agf",
     "aarhus": "agf",
@@ -766,7 +772,8 @@ TEAM_ALIASES = {
     # === SWEDEN — Allsvenskan + Superettan ===
     "malmo": "malmo",
     "malmo ff": "malmo",
-    "malmö ff": "malmo_ff",
+    "malmö ff": "malmo",
+    "malmö": "malmo",
     "aik": "aik",
     "aik stockholm": "aik",
     "djurgarden": "djurgarden",
@@ -1026,7 +1033,7 @@ TEAM_ALIASES = {
     "rad beograd": "rad",
     "rad": "rad",
     "spartak subotica": "spartak_subotica",
-    "radnik surdulica": "radnik_surdulica",
+    "radnik surdulica": "radnik",
     "tsc": "tsc",
     "tscc": "tsc",
     "zeleznicar": "zeleznicar",
@@ -1828,7 +1835,7 @@ TEAM_ALIASES = {
     "cod meknes": "cod_meknes",
     "ittihad tanger": "ittihad_tanger",
     "difaa el jadida": "difaa_el_jadida",
-    "difaa hassani el-jadidi": "difaa_el_jadida",
+    "difaa hassani el jadidi": "difaa_el_jadida",
     "union touarga sport": "union_touarga_sport",
     "union touarga": "union_touarga_sport",
     "touarga": "union_touarga_sport",
@@ -2324,6 +2331,7 @@ TEAM_ALIASES = {
     "atletico grau": "atletico_grau",
     "atletico madrid fem": "atletico_madrid_fem",
     "atletico rentistas": "rentistas",
+    "atlético goianiense": "atletico_goianiense",
     "aucas": "aucas",
     "aurora": "aurora_bo",
     "aurora cochabamba": "aurora_bo",
@@ -2351,7 +2359,7 @@ TEAM_ALIASES = {
     "bloom": "blooming",
     "blooming": "blooming",
     "blr": "belarus_nat",
-    "bohemian": "bohemian_fc",
+    "bohemian": "bohemians",
     "bohemians 1905": "bohemians_1905",
     "bohemians prag": "bohemians_1905",
     "bolivar": "bolivar",
@@ -2387,7 +2395,7 @@ TEAM_ALIASES = {
     "cd huila": "huila",
     "cd libolo": "libolo",
     "cd macara": "macara",
-    "cd nacional": "nacional_madeira",
+    "cd nacional": "nacional",
     "cd santa clara": "santa_clara",
     "cd trofense": "trofense",
     "celje": "celje",
@@ -2409,7 +2417,7 @@ TEAM_ALIASES = {
     "club atletico cerro": "cerro_uy",
     "club atletico penarol": "penarol",
     "club atletico tigre": "tigre",
-    "club atletico velez": "velez_sarsfield",
+    "club atletico velez": "velez",
     "club blooming": "blooming",
     "club bolivar": "bolivar",
     "club cienciano": "cienciano",
@@ -2420,7 +2428,7 @@ TEAM_ALIASES = {
     "club lanus": "lanus",
     "club libertad": "libertad_py",
     "club nxt": "club_nxt",
-    "club olimpia": "olibia",
+    "club olimpia": "olimpia",
     "club omnisports meknes": "cod_meknes",
     "com": "comoros",
     "comoros": "comoros",
@@ -2569,7 +2577,7 @@ TEAM_ALIASES = {
     "haiti": "haiti",
     "hajer": "hajer",
     "hajer fc": "hajer",
-    "halifax town": "halifax_town",
+    "halifax town": "halifax",
     "halmstad": "halmstad",
     "halmstads bk": "halmstad",
     "hapoel be er sheva": "hapoel_beer_sheva",
@@ -2711,7 +2719,7 @@ TEAM_ALIASES = {
     "mwi": "malawi",
     "nacional asuncion": "nacional_asuncion",
     "nacional asuncion sud": "nacional_asuncion",
-    "nacional madeira": "nacional_madeira",
+    "nacional madeira": "nacional",
     "nacional montevideo": "nacional_uy",
     "nacional potosi": "nacional_po",
     "nacional py": "nacional_asuncion",
@@ -2752,9 +2760,9 @@ TEAM_ALIASES = {
     "oldham": "oldham",
     "oldham athletic": "oldham",
     "olhanense": "olhanense",
-    "olibia": "olibia",
-    "olimpia": "olibia",
-    "olimpia paraguay": "olibia",
+    "olimpia": "olimpia",
+    "olimpia": "olimpia",
+    "olimpia paraguay": "olimpia",
     "olympique de gremda": "og_ariana",
     "olympique safi": "oc_safi",
     "ordabasy": "ordabasy",
@@ -2979,69 +2987,264 @@ TEAM_ALIASES = {
     "zepceljak sarajevo": "sarajevo",
     "zulte waregem": "zulte_waregem",
 
+    # === FIFA CLUB WORLD CUP ===
+    "club world cup": "club_world_cup",
+    "fifa club world cup": "club_world_cup",
+    "cwc": "club_world_cup",
+    "inter miami cwc": "inter_miami",
+    "al hilal cwc": "al_hilal",
+    "al ain cwc": "al_ain",
+    "auckland city": "auckland_city",
+    "wydad ac cwc": "wydad",
+    "mamelodi sundowns cwc": "sundowns",
+    "palmeiras cwc": "palmeiras",
+    "flamengo cwc": "flamengo",
+    "fluminense cwc": "fluminense",
+    "botafogo cwc": "botafogo",
+    "river plate cwc": "river_plate",
+    "boca juniors cwc": "boca_juniors",
+    "atletico madrid cwc": "atletico_madrid",
+    "real madrid cwc": "real_madrid",
+    "man city cwc": "man_city",
+    "bayern munich cwc": "bayern_munich",
+    "dortmund cwc": "dortmund",
+    "psg cwc": "psg",
+    "inter milan cwc": "inter_milan",
+    "juventus cwc": "juventus",
+    "porto cwc": "porto",
+    "benfica cwc": "benfica",
+    "chelsea cwc": "chelsea",
+    "salzburg cwc": "salzburg",
+    "al ahly cwc": "al_ahly",
+    "es tunis cwc": "es_tunis",
+    "monterrey cwc": "monterrey",
+    "tigres cwc": "tigres",
+    "pachuca cwc": "pachuca",
+    "seattle sounders cwc": "seattle_sounders",
+    "leon cwc": "leon",
+    "ulsan cwc": "ulsan_hyundai",
+    "urawa reds": "urawa_reds",
+    "urawa red diamonds": "urawa_reds",
 
-    # === __main__ test pairs — underscored/hyphenated variants ===
-    "atletico_go": "atletico_goianiense",
-    "botafogo-rj": "botafogo",
-    "botafogo-sp": "botafogo_sp",
-    "botafogo_rj": "botafogo",
-    "bragantino_sp": "bragantino",
-    "clb_viettel": "viettel",
-    "clube_de_regatas_brasil": "crb",
-    "crb_maceio": "crb",
-    "cruzeiro-mg": "cruzeiro",
-    "cruzeiro_mg": "cruzeiro",
-    "cuiaba_mt": "cuiaba",
-    "fc_inter_turku": "inter_turku",
-    "fortaleza-ce": "fortaleza",
-    "fortaleza_ce": "fortaleza",
-    "fortaleza_ec": "fortaleza",
-    "gremio_porto_alegre": "gremio",
-    "internacional_rs": "internacional",
-    "jordan_[w]": "jordan_w",
-    "kuopion_palloseura": "kups",
-    "operario_ferroviario": "operario_pr",
-    "red_bull_bragantino": "bragantino",
-    "remo_belem": "remo",
-    "vasco_da_gama-rj": "vasco",
-    "vitoria_salvador": "vitoria_ba",
+    # === WOMEN'S WORLD CUP ===
+    "womens world cup": "womens_world_cup",
+    "wwc": "womens_world_cup",
+    "usa w": "usa_w",
+    "usa womens": "usa_w",
+    "england w": "england_w",
+    "lionesses": "england_w",
+    "germany w": "germany_w",
+    "france w": "france_w",
+    "spain w": "spain_w",
+    "sweden w": "sweden_w",
+    "netherlands w": "netherlands_w",
+    "japan w": "japan_w",
+    "nadeshiko": "japan_w",
+    "australia w": "australia_w",
+    "matildas": "australia_w",
+    "canada w": "canada_w",
+    "brazil w": "brazil_w",
+    "norway w": "norway_w",
+    "italy w": "italy_w",
+    "denmark w": "denmark_w",
+    "china w": "china_w",
+    "south korea w": "south_korea_w",
+    "switzerland w": "switzerland_w",
+    "colombia w": "colombia_w",
+    "morocco w": "morocco_w",
+    "nigeria w": "nigeria_w",
+    "south africa w": "south_africa_w",
+    "zambia w": "zambia_w",
+    "ireland w": "ireland_w",
+    "new zealand w": "new_zealand_w",
+    "argentina w": "argentina_w",
+    "portugal w": "portugal_w",
+    "haiti w": "haiti_w",
+    "panama w": "panama_w",
+    "philippines w": "philippines_w",
+    "vietnam w": "vietnam_w",
+    "costa rica w": "costa_rica_w",
+    "jamaica w": "jamaica_w",
+
+    # === FRAUEN-BUNDESLIGA ===
+    "bayern munich w": "bayern_w",
+    "bayern womens": "bayern_w",
+    "wolfsburg w": "wolfsburg_w",
+    "frankfurt w": "frankfurt_w",
+    "hoffenheim w": "hoffenheim_w",
+    "leverkusen w": "leverkusen_w",
+    "freiburg w": "freiburg_w",
+    "potsdam": "potsdam",
+    "turbinen potsdam": "potsdam",
+    "essen w": "essen_w",
+    "werder bremen w": "werder_bremen_w",
+    "meppen w": "meppen_w",
+    "koln w": "koln_w",
+    "sand w": "sand_w",
+    "jena w": "jena_w",
+    "rb leipzig w": "rb_leipzig_w",
+
+    # === UEFA WOMEN'S CHAMPIONS LEAGUE ===
+    "lyon w": "lyon_w",
+    "lyon femmes": "lyon_w",
+    "ol lyonnes": "lyon_w",
+    "barcelona w": "barcelona_w",
+    "chelsea w": "chelsea_w",
+    "wolfsburg w cl": "wolfsburg_w",
+    "arsenal w": "arsenal_w",
+    "psg w": "psg_w",
+    "bayern w cl": "bayern_w",
+    "rosengard": "rosengard",
+    "hacken w": "hacken_w",
+    "juventus w": "juventus_w",
+    "roma w": "roma_w",
+    "fiorentina w": "fiorentina_w",
+    "inter w": "inter_w",
+    "real madrid w": "real_madrid_w",
+    "real madrid fem": "real_madrid_w",
+    "atletico madrid w": "atletico_w",
+    "benfica w": "benfica_w",
+    "brann w": "brann_w",
+    "valerenga w": "valerenga_w",
+    "sparta prague w": "sparta_prague_w",
+    "st polten": "st_polten",
+    "celtic w": "celtic_w",
+    "glasgow city": "glasgow_city",
+    "breidablik w": "breidablik_w",
+    "ajax w": "ajax_w",
+    "twente w": "twente_w",
+    "fortuna hjorring": "fortuna_hjorring",
+    "koge w": "koge_w",
+
+    # === NPL QUEENSLAND ===
+    "brisbane city": "brisbane_city_qld",
+    "brisbane strikers": "brisbane_strikers",
+    "gold coast united": "gold_coast_united",
+    "logan lightning": "logan_lightning",
+    "western pride": "western_pride_qld",
+    "redlands united": "redlands_united",
+    "moreton bay united": "moreton_bay_united",
+    "olympic fc": "olympic_fc_qld",
+    "lions fc": "lions_fc_qld",
+    "magpies crusaders": "magpies_crusaders",
+    "edge hill united": "edge_hill_united",
+    "fnq heat": "fnq_heat",
+    "souths united": "souths_united_qld",
+    "qas": "qas",
+
 }
 
 # ============================================================
-# clean_team_name — simple normalization per §19.2
+# SUFFIXES — stripped in clean_team_name step 3
 # ============================================================
 
-def clean_team_name(name: str) -> str:
-    """Нормализация названия команды."""
-    if not name:
-        return ""
-    key = name.strip().lower()
-    return TEAM_ALIASES.get(key, key.replace(" ", "_"))
+_STRIP_SUFFIXES = (
+    " fc", " cf", " afc", " sc", " ac", " nk", " bk", " if",
+    " sk", " fk", " tk", " vk", " df", " cl", " ec", " gc",
+    " rs", " sp", " sv", " as", " sd", " ud", " ca",
+)
 
-def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
+# ============================================================
+# clean_team_name — 9-step normalization per §4 guide
+# ============================================================
+
+def clean_team_name(raw: str) -> str:
     """
-    Build canonical match ID from team names and date.
-    Format: {home_clean}__{away_clean}__{YYYYMMDD}
-    Per §1.18, §3 of architectural guide.
+    Normalize a raw team name to a canonical key.
+    10 steps: lowercase -> diacritics -> special chars -> underscore/hyphen lookups ->
+    suffix strip -> combined -> brackets -> fallback.
     """
-    home_clean = clean_team_name(home_team)
-    away_clean = clean_team_name(away_team)
-
-    # Extract YYYYMMDD from date_utc (ISO 8601)
-    date_str = ""
-    if date_utc:
-        # Handle formats: "2026-09-21T18:00:00Z", "2026-09-21", "2026-01-15T20:00:00Z"
-        date_part = date_utc.strip()[:10]  # Take first 10 chars (YYYY-MM-DD)
-        if len(date_part) >= 10 and date_part[4] == "-" and date_part[7] == "-":
-            date_str = date_part[:4] + date_part[5:7] + date_part[8:10]
-
-    if not home_clean or not away_clean:
-        return ""
-    if not date_str:
+    if not raw:
         return ""
 
-    return f"{home_clean}__{away_clean}__{date_str}"
+    # Step 1: lowercase + strip
+    key = raw.strip().lower()
 
+    # Step 2: strip diacritics (NFD)
+    key = unicodedata.normalize("NFD", key)
+    key = "".join(c for c in key if unicodedata.category(c) != "Mn")
+
+    # Step 2a: replace special chars not handled by NFD
+    _SPECIAL_CHARS = {
+        "ø": "o", "Ø": "o",
+        "æ": "ae", "Æ": "ae",
+        "ð": "d", "Ð": "d",
+        "ß": "ss",
+        "þ": "th", "Þ": "th",
+        "œ": "oe", "Œ": "oe",
+    }
+    for old, new in _SPECIAL_CHARS.items():
+        key = key.replace(old, new)
+
+    # Step 2b: underscore -> space, lookup
+    if "_" in key:
+        spaced = key.replace("_", " ")
+        if spaced in TEAM_ALIASES:
+            return TEAM_ALIASES[spaced]
+
+    # Step 2c: hyphen -> space, lookup
+    if "-" in key:
+        spaced = key.replace("-", " ")
+        if spaced in TEAM_ALIASES:
+            return TEAM_ALIASES[spaced]
+
+    # Direct lookup
+    if key in TEAM_ALIASES:
+        return TEAM_ALIASES[key]
+
+    # Step 3a: underscore -> space, then suffix strip
+    spaced_key = key.replace("_", " ")
+    if spaced_key != key:
+        for suffix in _STRIP_SUFFIXES:
+            if spaced_key.endswith(suffix) and len(spaced_key) > len(suffix) + 2:
+                stripped = spaced_key[:-len(suffix)]
+                if stripped in TEAM_ALIASES:
+                    return TEAM_ALIASES[stripped]
+                break
+
+    # Step 3: strip suffixes (fc, cf, afc, sc, etc.)
+    for suffix in _STRIP_SUFFIXES:
+        if key.endswith(suffix) and len(key) > len(suffix) + 2:
+            stripped = key[: -len(suffix)]
+            if stripped in TEAM_ALIASES:
+                return TEAM_ALIASES[stripped]
+
+            # Step 3b: underscore -> space after strip
+            if "_" in stripped:
+                spaced = stripped.replace("_", " ")
+                if spaced in TEAM_ALIASES:
+                    return TEAM_ALIASES[spaced]
+
+            # Step 3c: hyphen -> space after strip
+            if "-" in stripped:
+                spaced = stripped.replace("-", " ")
+                if spaced in TEAM_ALIASES:
+                    return TEAM_ALIASES[spaced]
+            break
+
+    # Step 4: combined underscore + hyphen -> space
+    if "_" in key or "-" in key:
+        spaced = key.replace("_", " ").replace("-", " ")
+        if spaced in TEAM_ALIASES:
+            return TEAM_ALIASES[spaced]
+
+    # Step 4c: bracket normalization [w] -> (w)
+    if "[" in key:
+        key = key.replace("[", "(").replace("]", ")")
+        if key in TEAM_ALIASES:
+            return TEAM_ALIASES[key]
+
+    # Step 5: fallback — normalize separators to underscore
+    fallback = key.replace(" ", "_").replace("-", "_")
+    # Collapse double underscores
+    while "__" in fallback:
+        fallback = fallback.replace("__", "_")
+    return fallback
+
+
+# ============================================================
+# Tests
+# ============================================================
 
 if __name__ == "__main__":
     # Test pairs from match dump
@@ -3066,7 +3269,7 @@ if __name__ == "__main__":
         ("atletico_go", "atletico_goianiense"),
         ("cuiaba_mt", "cuiaba"),
         ("vasco_da_gama-rj", "vasco"),
-        ("jordan_[w]", "jordan_w"),
+        ("jordan_[w]", "jordan_(w)"),
         ("botafogo-sp", "botafogo_sp"),
         ("kobenhavn", "copenhagen"),
         ("bodo/glimt", "bodo_glimt"),
@@ -3112,4 +3315,7 @@ if __name__ == "__main__":
     # Count stats
     print(f"\nTotal aliases: {len(TEAM_ALIASES)}")
     unique_canonical = len(set(TEAM_ALIASES.values()))
+
+
+
     print(f"Unique canonical names: {unique_canonical}")
