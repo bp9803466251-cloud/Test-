@@ -1,5 +1,5 @@
 """
-team_registry.py — v9.4-reep
+team_registry.py — 9.3-audited
 Canonical team name registry + normalization for GatekeeperAI
 ~15700 aliases / ~3500 unique teams / 60+ countries
 Reep integration: 684K aliases (CC0) filtered to football teams
