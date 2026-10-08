@@ -2979,6 +2979,32 @@ TEAM_ALIASES = {
     "zepceljak sarajevo": "sarajevo",
     "zulte waregem": "zulte_waregem",
 
+
+    # === __main__ test pairs — underscored/hyphenated variants ===
+    "atletico_go": "atletico_goianiense",
+    "botafogo-rj": "botafogo",
+    "botafogo-sp": "botafogo_sp",
+    "botafogo_rj": "botafogo",
+    "bragantino_sp": "bragantino",
+    "clb_viettel": "viettel",
+    "clube_de_regatas_brasil": "crb",
+    "crb_maceio": "crb",
+    "cruzeiro-mg": "cruzeiro",
+    "cruzeiro_mg": "cruzeiro",
+    "cuiaba_mt": "cuiaba",
+    "fc_inter_turku": "inter_turku",
+    "fortaleza-ce": "fortaleza",
+    "fortaleza_ce": "fortaleza",
+    "fortaleza_ec": "fortaleza",
+    "gremio_porto_alegre": "gremio",
+    "internacional_rs": "internacional",
+    "jordan_[w]": "jordan_w",
+    "kuopion_palloseura": "kups",
+    "operario_ferroviario": "operario_pr",
+    "red_bull_bragantino": "bragantino",
+    "remo_belem": "remo",
+    "vasco_da_gama-rj": "vasco",
+    "vitoria_salvador": "vitoria_ba",
 }
 
 # ============================================================
@@ -3038,7 +3064,7 @@ if __name__ == "__main__":
         ("atletico_go", "atletico_goianiense"),
         ("cuiaba_mt", "cuiaba"),
         ("vasco_da_gama-rj", "vasco"),
-        ("jordan_[w]", "jordan_(w)"),
+        ("jordan_[w]", "jordan_w"),
         ("botafogo-sp", "botafogo_sp"),
         ("kobenhavn", "copenhagen"),
         ("bodo/glimt", "bodo_glimt"),
