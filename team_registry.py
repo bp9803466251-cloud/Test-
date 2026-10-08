@@ -2422,7 +2422,7 @@ TEAM_ALIASES = {
     "club lanus": "lanus",
     "club libertad": "libertad_py",
     "club nxt": "club_nxt",
-    "club olimpia": "olimpia",
+    "club olimpia": "olibia",
     "club omnisports meknes": "cod_meknes",
     "com": "comoros",
     "comoros": "comoros",
