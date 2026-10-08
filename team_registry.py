@@ -4,7 +4,9 @@ Canonical team name registry + normalization for GatekeeperAI
 ~2850 aliases / ~1500 unique teams / 58 countries
 """
 
-__version__ = "9.3-audited"
+__version__ = "9.4-glued"
+
+import unicodedata
 
 
 # ============================================================
@@ -3013,6 +3015,36 @@ TEAM_ALIASES = {
     "remo_belem": "remo",
     "vasco_da_gama-rj": "vasco",
     "vitoria_salvador": "vitoria_ba",
+
+    # === CROSS-SOURCE ALIASES v9.4 (Bzzoiro ↔ SharpAPI gluing) ===
+    "ceara_sc_fortaleza": "ceara",
+    "ceara sc fortaleza": "ceara",
+    "ceara_ce": "ceara",
+    "ceara ce": "ceara",
+    "atletico_nacional_medellin": "atletico_nacional",
+    "atletico nacional medellin": "atletico_nacional",
+    "viettel_fc": "viettel",
+    "viettel fc": "viettel",
+    "kups_kuopio": "kups",
+    "kups kuopio": "kups",
+    "asu_politehnica_timisoara": "politehnica_timisoara",
+    "asu politehnica timisoara": "politehnica_timisoara",
+    "csa_steaua": "csa_steaua_bucuresti",
+    "csa steaua": "csa_steaua_bucuresti",
+    "nautico_pe": "nautico",
+    "nautico pe": "nautico",
+    "gremio_novorizontino": "novorizontino",
+    "gangwon_fc": "gangwon",
+
+    # === WOMEN'S TEAMS — bracket normalization [w] ↔ (w) → _w ===
+    "montenegro [w]": "montenegro_w",
+    "montenegro_[w]": "montenegro_w",
+    "montenegro (w)": "montenegro_w",
+    "montenegro_(w)": "montenegro_w",
+    "bosnia [w]": "bosnia_w",
+    "bosnia_[w]": "bosnia_w",
+    "bosnia (w)": "bosnia_w",
+    "bosnia_(w)": "bosnia_w",
 }
 
 # ============================================================
@@ -3024,6 +3056,17 @@ def clean_team_name(name: str) -> str:
     if not name:
         return ""
     key = name.strip().lower()
+    # Manual replacements for non-decomposable characters
+    key = key.replace("\u0142", "l").replace("\u0141", "l")  # ł → l
+    key = key.replace("\u00f8", "o").replace("\u00d8", "o")  # ø → o
+    key = key.replace("\u00f0", "d").replace("\u00d0", "d")  # ð → d
+    key = key.replace("\u00fe", "th")                          # þ → th
+    key = key.replace("\u00df", "ss")                           # ß → ss
+    key = key.replace("\u0111", "d").replace("\u0110", "d")  # đ → d
+    key = key.replace("\u0131", "i")                           # ı → i
+    # Strip accents: NFD normalization + remove combining marks
+    key = unicodedata.normalize("NFD", key)
+    key = "".join(c for c in key if unicodedata.category(c) != "Mn")
     return TEAM_ALIASES.get(key, key.replace(" ", "_"))
 
 def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
