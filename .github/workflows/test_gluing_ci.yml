@@ -28,7 +28,7 @@ jobs:
       - name: Check syntax
         run: |
           python -m py_compile team_registry.py
-          echo "✅ Syntax OK"
+          echo "Syntax OK"
 
       - name: Run gluing tests
         run: python test_gluing.py
