@@ -74,13 +74,12 @@ except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
+# Унифицированный импорт нормализации через gatekeeper_hub (без локальных небезопасных фоллбеков)
 try:
-    from team_registry import normalize_team_name, build_canonical_id, clean_team_name
+    from gatekeeper_hub import clean_team_name, normalize_team_name, build_canonical_id
 except ImportError:
-    logger.error("team_registry не найден")
-    normalize_team_name = lambda x: x.strip().lower() if x else ""
-    build_canonical_id = lambda h, a, d: f"{h}__{a}__{d[:10].replace('-','')}"
-    clean_team_name = lambda name: name.lower().strip().replace(" ", "_") if name else ""
+    logger.critical("Критическая ошибка: gatekeeper_hub или team_registry недоступны!")
+    sys.exit(1)
 
 _NOT_FOUND = object()
 DEBUG_EVENT_COUNT = int(os.environ.get("DEBUG_EVENT_COUNT", "3"))
@@ -853,3 +852,4 @@ if __name__ == "__main__":
 
     result = collect_bzzoiro(events_only=args.events_only)
     logger.info(f"[BZZOIRO] Result: {result}")
+

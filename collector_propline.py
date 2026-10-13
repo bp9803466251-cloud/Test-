@@ -21,11 +21,11 @@ Collector Propline v9.0-bulk для Gatekeeper-AI v9.3-audited.
   - Fallback: 32 soccer-лиги, если /sports недоступен
 
 FIX v810:
-  - Использует gatekeeper_hub (upsert_match, patch_match, save_meta) — §1.4
-  - canonical_id через build_canonical_id — §1.6
-  - clean_team_name из team_registry — §2.4
-  - run_initialization(collector="propline") — §2.6
-  - graceful shutdown (is_shutdown_requested) — §2.3
+  - Использует gatekeeper_hub (upsert_match, patch_match, save_meta) — §1.4[span_0](start_span)[span_0](end_span)
+  - canonical_id через build_canonical_id — §1.6[span_1](start_span)[span_1](end_span)
+  - clean_team_name из team_registry — §2.4[span_2](start_span)[span_2](end_span)
+  - run_initialization(collector="propline") — §2.6[span_3](start_span)[span_3](end_span)
+  - graceful shutdown (is_shutdown_requested) — §2.3[span_4](start_span)[span_4](end_span)
 """
 import os
 import sys
@@ -83,16 +83,17 @@ except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
+# Унифицированный импорт нормализации через gatekeeper_hub (без локальных небезопасных фоллбеков)
 try:
-    from team_registry import clean_team_name
+    from gatekeeper_hub import clean_team_name, build_canonical_id
 except ImportError:
-    logger.error("team_registry не найден — clean_team_name fallback")
-    def clean_team_name(name: str) -> str:
-        return name.lower().strip().replace(" ", "_") if name else ""
+    logger.critical("Критическая ошибка: gatekeeper_hub или team_registry недоступны!")
+    sys.exit(1)
 
 COLLECTOR_NAME = "propline"
 BASE_URL = os.environ.get("PROPLINE_BASE_URL", "https://api.prop-line.com/v1")
-DAYS_AHEAD = int(os.environ.get("PROPLINE_DAYS_AHEAD", "3"))
+# Унифицированный горизонт планирования (7 дней вместо 3 для синхронизации со всеми коллекторами)[span_5](start_span)[span_5](end_span)
+DAYS_AHEAD = int(os.environ.get("PROPLINE_DAYS_AHEAD", "7"))[span_6](start_span)[span_6](end_span)
 MAX_RETRIES = int(os.environ.get("PROPLINE_MAX_RETRIES", "2"))
 HTTP_TIMEOUT = int(os.environ.get("PROPLINE_API_TIMEOUT", "10"))
 MAX_WORKERS = int(os.environ.get("PROPLINE_MAX_WORKERS", "8"))
@@ -450,7 +451,7 @@ def collect_propline() -> Dict[str, Any]:
         logger.error("PROPLINE_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
-    # §2.6: run_initialization
+    # §2.6: run_initialization[span_7](start_span)[span_7](end_span)
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     run_id = init_metrics.get("run_id", "unknown")
     os.environ["PROPLINE_RUN_ID"] = run_id
@@ -542,3 +543,4 @@ if __name__ == "__main__":
 
     result = collect_propline()
     logger.info(f"Result: {result}")
+

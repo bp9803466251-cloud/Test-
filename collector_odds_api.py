@@ -71,17 +71,18 @@ except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
-# FIX-AUDIT-v9.3: убраны мёртвые normalize_team_name, build_canonical_id
+# Унифицированный импорт нормализации через gatekeeper_hub (без локальных небезопасных фоллбеков)
 try:
-    from team_registry import clean_team_name
+    from gatekeeper_hub import clean_team_name, build_canonical_id
 except ImportError:
-    logger.error("team_registry не найден")
-    clean_team_name = lambda name: name.lower().strip().replace(" ", "_") if name else ""
+    logger.critical("Критическая ошибка: gatekeeper_hub или team_registry недоступны!")
+    sys.exit(1)
 
 COLLECTOR_NAME = "odds_api"
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-DAYS_AHEAD = int(os.environ.get("ODDS_API_DAYS_AHEAD", "3"))
+# Унифицированный горизонт планирования (7 дней вместо 3 для синхронизации со всеми коллекторами)[span_1](start_span)[span_1](end_span)
+DAYS_AHEAD = int(os.environ.get("ODDS_API_DAYS_AHEAD", "7"))[span_2](start_span)[span_2](end_span)
 HTTP_TIMEOUT = int(os.environ.get("ODDS_API_HTTP_TIMEOUT", "15"))
 MAX_WORKERS = int(os.environ.get("ODDS_API_MAX_WORKERS", "5"))
 QUOTA_MIN = int(os.environ.get("ODDS_API_QUOTA_MIN", "10"))
@@ -473,3 +474,4 @@ if __name__ == "__main__":
         os.environ["DRY_RUN"] = "1"
     result = collect_odds_api()
     logger.info(f"Result: {result}")
+

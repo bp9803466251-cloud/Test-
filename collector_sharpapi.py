@@ -61,17 +61,16 @@ except ImportError:
     def is_shutdown_requested():
         return False
 
+# Унифицированный импорт нормализации через gatekeeper_hub (без локальных небезопасных фоллбеков)
 try:
-    from team_registry import clean_team_name
+    from gatekeeper_hub import clean_team_name, build_canonical_id
 except ImportError:
-    try:
-        from search_module import clean_team_name
-    except ImportError:
-        def clean_team_name(name: str) -> str:
-            return name.lower().strip().replace(" ", "_")
+    logger.critical("Критическая ошибка: gatekeeper_hub или team_registry недоступны!")
+    sys.exit(1)
 
 SHARP_API_BASE = "https://api.sharpapi.io/api/v1"
-DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "3"))
+# Унифицированный горизонт планирования (7 дней вместо 3 для синхронизации со всеми коллекторами)
+DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "7"))[span_0](start_span)[span_0](end_span)
 
 logger = logging.getLogger("sharpapi")
 if not logger.handlers:
@@ -745,3 +744,4 @@ if __name__ == "__main__":
     print(f"\n=== SharpAPI Collector Summary ===")
     for k, v in sorted(result.items()):
         print(f"  {k}: {v}")
+
