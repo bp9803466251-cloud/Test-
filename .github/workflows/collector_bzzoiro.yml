@@ -36,6 +36,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install requests
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Bzzoiro collector
@@ -66,4 +67,7 @@ jobs:
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
           MSG="❌ Bzzoiro Collector FAILED%0A%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="${MSG}" || true
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
+            -d text="${MSG}" || true
+            
