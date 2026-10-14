@@ -1,47 +1,24 @@
 #!/usr/bin/env python3
 """
-Collector Bzzoiro v8.15-source (API v2 — bulk odds + predictions + per-event H2H/stats)
-GatekeeperAI v9.3-audited
-
-Изменения v8.12-bulk:
-  - Bulk odds: GET /odds/?date_from=&date_to= (2-3 запроса вместо 140 per-event)
-  - Bulk predictions: GET /predictions/?date_from=&date_to= (2-3 запроса)
-  - Per-event fallback: если bulk пуст → per-event запрос
-  - HTTP timeout: 10с (вместо хардкода 30с)
-  - Progress logging: каждые 10 матчей (вместо 50)
-  - Coverage check: GET /coverage/ перед стартом
-  - RATE_DELAY 0.5, ENRICH_DELAY 0.2, MAX_RETRIES 1 (из env)
-
-Изменения v8.15-source:
-  FIX-1: _fetch_bzzoiro — HTTPError ловится отдельно, 404 → _NOT_FOUND (dead code исправлен)
-  FIX-2: Per-event predictions URL — /prediction (ед.ч.) вместо /predictions (мн.ч.)
-  FIX-3: Bulk predictions event_id — item.event.id вместо item.id (prediction ID)
-  FIX-4: predictions/h2h — добавлен "source": "bzzoiro" перед patch_match
-
-
-Изменения v2.2 (Фаза 2):
-  - run_initialization(collector="bzzoiro") — §2.6
-  - DAYS_AHEAD из ENV (BZZOIRO_DAYS_AHEAD) — sync с YAML
-  - upsert_match: +sources=["bzzoiro"], +idempotency_key — §2.2
-  - save_meta: +run_id — трассировка
+Collector Bzzoiro v600-prod-fix11 (API v2 — predictions for pre-match + league pre-fetch)
 """
 
 import os
 import sys
 import time
 import json
-import argparse
 import datetime as dt
-from typing import Any, Optional
+from typing import Any
 import logging
 from collections import defaultdict
 
-import urllib.request
-import urllib.error
+import requests
 
-logger = logging.getLogger("bzzoiro")
-if not logger.handlers:
-    logger.addHandler(logging.NullHandler())
+# ─── Logging setup ───
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [BZZOIRO] %(message)s'
+)
 
 try:
     from gatekeeper_hub import (
@@ -55,58 +32,25 @@ try:
         save_meta,
     )
 except ImportError:
-    logger.error("gatekeeper_hub не найден")
+    logging.error("gatekeeper_hub не найден")
     sys.exit(1)
 
-try:
-    from gatekeeper_hub import is_shutdown_requested as _is_shutdown
-except ImportError:
-    def _is_shutdown():
-        return False
-
-try:
-    from gatekeeper_hub import register_module, log_event
-except ImportError:
-    def register_module(name, role="collector", writes=None, reads=None):
-        def decorator(func):
-            return func
-        return decorator
-    def log_event(source, level, message, **kwargs):
-        pass
-
-# Унифицированный импорт нормализации через gatekeeper_hub (без локальных небезопасных фоллбеков)
-try:
-    from gatekeeper_hub import clean_team_name, normalize_team_name, build_canonical_id
-except ImportError:
-    logger.critical("Критическая ошибка: gatekeeper_hub или team_registry недоступны!")
-    sys.exit(1)
-
+# ─── Константы и маркеры ───
 _NOT_FOUND = object()
 DEBUG_EVENT_COUNT = int(os.environ.get("DEBUG_EVENT_COUNT", "3"))
 
-COLLECTOR_NAME = "bzzoiro"
-
 BZZOIRO_BASE = os.environ.get("BZZOIRO_BASE_URL", "https://sports.bzzoiro.com/api/v2")
 BZZOIRO_API_KEY = os.environ.get("BZZOIRO_API_KEY", "")
-RATE_DELAY = float(os.environ.get("BZZOIRO_RATE_DELAY", "0.5"))
+RATE_DELAY = float(os.environ.get("BZZOIRO_RATE_DELAY", "0.3"))
 ENRICH_DELAY = float(os.environ.get("BZZOIRO_ENRICH_DELAY", "0.2"))
 MAX_RETRIES = int(os.environ.get("BZZOIRO_MAX_RETRIES", "1"))
-DAYS_AHEAD = int(os.environ.get("BZZOIRO_DAYS_AHEAD", "7"))
+DAYS_AHEAD = 7
 PAGE_LIMIT = 200
-HTTP_TIMEOUT = int(os.environ.get("BZZOIRO_HTTP_TIMEOUT", "10"))
-
-BZZOIRO_UPSTREAM = "opta"
-
-__version__ = "8.15-source"
-__all__ = [
-    "collect_bzzoiro",
-    "collect_and_process",
-    "__version__",
-]
 
 FINISHED_STATUSES = {"finished", "completed", "ended", "cancelled", "awarded", "forfeited"}
 PREMATCH_STATUSES = ("notstarted", "", "scheduled", "postponed")
 
+# ─── Кэширование ───
 _cache = {}
 
 def _cache_response(url: str, data: dict):
@@ -123,63 +67,38 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
 
     for attempt in range(max_retries + 1):
         try:
-            req = urllib.request.Request(url, headers=headers)
-            resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+            resp = requests.get(url, headers=headers, timeout=30)
 
-            if resp.status == 404:
+            if resp.status_code == 404:
                 _cache_response(url, _NOT_FOUND)
                 return _NOT_FOUND
-            if resp.status == 429:
+            if resp.status_code == 429:
                 wait = 2 ** (attempt + 2)
-                logger.warning(f"Rate limit. Waiting {wait}s")
+                logging.warning(f"Rate limit. Waiting {wait}s")
                 time.sleep(wait)
                 continue
-            if resp.status != 200:
+            if resp.status_code != 200:
                 if attempt < max_retries:
                     time.sleep(RATE_DELAY * 2)
                     continue
-                logger.error(f"HTTP {resp.status}: {url}")
+                logging.error(f"HTTP {resp.status_code}: {url}")
                 return None
 
-            data = json.loads(resp.read().decode("utf-8"))
+            data = resp.json()
             _cache_response(url, data)
             time.sleep(RATE_DELAY)
             return data
 
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                _cache_response(url, _NOT_FOUND)
-                return _NOT_FOUND
-            if e.code == 429:
-                wait = 2 ** (attempt + 2)
-                logger.warning(f"Rate limit (HTTP 429). Waiting {wait}s")
-                time.sleep(wait)
-                continue
+        except (requests.RequestException, json.JSONDecodeError) as e:
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue
-            logger.error(f"HTTP {e.code}: {url}")
+            logging.error(f"Request error: {e}")
             return None
-
-        except (urllib.error.URLError, json.JSONDecodeError) as e:
-            if attempt < max_retries:
-                time.sleep(RATE_DELAY * 2)
-                continue
-            logger.error(f"Request error: {e}")
-            return None
-
-
-def _normalize_odds_value(val) -> Optional[float]:
-    if val is None or val == "-" or val == "" or val == 0:
-        return None
-    try:
-        f = float(val)
-        return f if f > 0 else None
-    except (ValueError, TypeError):
-        return None
 
 
 def _parse_event_date(ev: dict) -> dt.datetime:
+    """Парсит дату события для сортировки."""
     date_str = _extract_date(ev)
     if not date_str:
         return dt.datetime.max.replace(tzinfo=dt.timezone.utc)
@@ -193,6 +112,7 @@ def _parse_event_date(ev: dict) -> dt.datetime:
 
 
 def _extract_date(ev: dict) -> str:
+    """Извлекает дату матча в формате ISO или UTC строку."""
     for key in ("event_date", "date", "date_utc", "match_date", "time", "start_time", "datetime"):
         val = ev.get(key)
         if val:
@@ -207,12 +127,14 @@ def _extract_date(ev: dict) -> str:
 
 
 def _extract_score(ev: dict) -> Any:
+    """Извлекает счет матча."""
     score = ev.get("score") or ev.get("scores")
     if isinstance(score, dict):
         return {
             "home": score.get("home", score.get("home_score")),
             "away": score.get("away", score.get("away_score"))
         }
+    # Fallback: top-level fields (API v2)
     home_score = ev.get("home_score")
     away_score = ev.get("away_score")
     if home_score is not None or away_score is not None:
@@ -221,6 +143,7 @@ def _extract_score(ev: dict) -> Any:
 
 
 def _extract_best_odds(odds_data: dict) -> dict:
+    """Извлекает лучшие коэффициенты из ответа API."""
     if not isinstance(odds_data, dict):
         return {}
     odds = odds_data.get("odds", odds_data)
@@ -240,17 +163,18 @@ def _extract_best_odds(odds_data: dict) -> dict:
             if k in odds and odds[k] is not None:
                 val = odds[k]
                 break
-        float_val = _normalize_odds_value(val)
-        if float_val is not None:
-            result[target_key] = float_val
 
-    if not result:
-        return {}
+        if val is not None and val != "-" and val != "":
+            try:
+                result[target_key] = float(val)
+            except (ValueError, TypeError):
+                pass
 
-    return {"current": result}
+    return result
 
 
 def _flatten_stats(stats_data: dict, parent_key: str = "", sep: str = "_") -> dict:
+    """Превращает вложенный словарь статистики в плоский."""
     items = []
     if not isinstance(stats_data, dict):
         return {}
@@ -263,184 +187,94 @@ def _flatten_stats(stats_data: dict, parent_key: str = "", sep: str = "_") -> di
     return dict(items)
 
 
+# ─── League pre-fetch ───
 _league_cache: dict[int, dict] = {}
 
 def _fetch_league_info(league_id: int, headers: dict) -> dict:
+    """Получает информацию о лиге (name, country) через /leagues/{id}."""
     if not league_id:
         return {"name": "", "country": ""}
+
     if league_id in _league_cache:
         return _league_cache[league_id]
+
     url = f"{BZZOIRO_BASE}/leagues/{league_id}"
-    data = _fetch_bzzoiro(url, headers, max_retries=1)
-    if data and isinstance(data, dict):
-        info = {
-            "name": data.get("name", ""),
-            "country": data.get("country", ""),
-        }
-        _league_cache[league_id] = info
-        return info
-    return {"name": "", "country": ""}
+    data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
 
+    if data is _NOT_FOUND or not data or not isinstance(data, dict):
+        result = {"name": "", "country": ""}
+    else:
+        name = data.get("name", "") or ""
+        country = data.get("country", "") or ""
+        result = {"name": name, "country": country}
 
-# ── Bulk endpoints ──────────────────────────────────────────
-
-def _check_coverage(headers: dict) -> dict:
-    """GET /coverage/ — проверка наличия данных без токена."""
-    url = f"{BZZOIRO_BASE}/coverage/"
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
-        data = json.loads(resp.read().decode("utf-8"))
-        sports = data.get("sports", [])
-        for sport in sports:
-            if sport.get("sport") == "football":
-                priced = sport.get("priced_next_7d", 0)
-                events_7d = sport.get("events_next_7d", 0)
-                logger.info(f"[BZZOIRO] Coverage: football in_season, events_7d={events_7d}, priced={priced}")
-                return sport
-        logger.info(f"[BZZOIRO] Coverage: football not found in {len(sports)} sports")
-        return {}
-    except Exception as e:
-        logger.warning(f"[BZZOIRO] Coverage check failed: {e}")
-        return {}
-
-
-def _fetch_bulk_odds(headers: dict, date_from: str, date_to: str) -> dict:
-    """Bulk odds: GET /odds/?date_from=&date_to= — возвращает dict {event_id: odds_data}."""
-    result = {}
-    url = f"{BZZOIRO_BASE}/odds/?date_from={date_from}&date_to={date_to}&limit={PAGE_LIMIT}"
-    
-    pages = 0
-    while url and pages < 10:
-        pages += 1
-        data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
-        if data is _NOT_FOUND or not data:
-            break
-        if not isinstance(data, dict):
-            break
-        
-        items = data.get("results", data.get("data", data.get("events", [])))
-        if not isinstance(items, list):
-            # Может быть dict с event_id ключами
-            if isinstance(items, dict):
-                for eid, odds_val in items.items():
-                    if odds_val:
-                        result[str(eid)] = odds_val
-                break
-            break
-        
-        for item in items:
-            eid = str(item.get("event_id") or item.get("event", {}).get("id") or item.get("id", ""))
-            if eid and eid != "None":
-                result[eid] = item
-        
-        url = data.get("next")
-        if not url:
-            break
-    
-    logger.info(f"[BZZOIRO] Bulk odds: {len(result)} записей ({pages} стр.)")
+    _league_cache[league_id] = result
     return result
 
-
-def _fetch_bulk_predictions(headers: dict, date_from: str, date_to: str) -> dict:
-    """Bulk predictions: GET /predictions/?date_from=&date_to= — возвращает dict {event_id: prediction_data}."""
-    result = {}
-    url = f"{BZZOIRO_BASE}/predictions/?date_from={date_from}&date_to={date_to}&limit={PAGE_LIMIT}"
-    
-    pages = 0
-    while url and pages < 10:
-        pages += 1
-        data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
-        if data is _NOT_FOUND or not data:
-            break
-        if not isinstance(data, dict):
-            break
-        
-        items = data.get("results", data.get("data", data.get("events", data.get("predictions", []))))
-        if not isinstance(items, list):
-            if isinstance(items, dict):
-                for eid, pred_val in items.items():
-                    if pred_val:
-                        result[str(eid)] = pred_val
-                break
-            break
-        
-        for item in items:
-            eid = str(item.get("event_id") or item.get("event", {}).get("id") or item.get("id", ""))
-            if eid and eid != "None":
-                result[eid] = item
-        
-        url = data.get("next")
-        if not url:
-            break
-    
-    logger.info(f"[BZZOIRO] Bulk predictions: {len(result)} записей ({pages} стр.)")
-    return result
-
-
-# ── Main collect ────────────────────────────────────────────
 
 def collect_bzzoiro(events_only: bool = False) -> dict:
-    if not BZZOIRO_API_KEY:
-        logger.error("[BZZOIRO] BZZOIRO_API_KEY не задан")
-        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
-
     headers = {
         "Authorization": f"Token {BZZOIRO_API_KEY}",
         "Accept": "application/json",
     }
 
-    dry_run = os.environ.get("DRY_RUN", "0") == "1"
+    print("=" * 60)
+    print("[BZZOIRO] Collector Bzzoiro v600-prod-fix11 (API v2 — predictions for pre-match) started.")
+    print("=" * 60)
 
-    init_metrics = run_initialization(collector=COLLECTOR_NAME)
-    run_id = init_metrics.get("run_id", "unknown")
-    if not init_metrics.get("redis_available", False):
-        logger.error("[BZZOIRO] Redis недоступен")
-        return {"stored_matches": 0, "total_events": 0, "error_count": 1}
+    # ─── Шаг 0: Инициализация Redis ───
+    print("[BZZOIRO] Шаг 0: Инициализация Redis...")
+    init_metrics = run_initialization()
+    if not init_metrics or not init_metrics.get("redis_available"):
+        print("[BZZOIRO] ERROR: Redis init failed")
+        save_meta("bzzoiro", stored_matches=0, error_count=1)
+        return {"error": "redis_init_failed"}
 
-    logger.info(f"[BZZOIRO] Collection started | days_ahead={DAYS_AHEAD}, dry_run={dry_run}")
-    log_event("bzzoiro", "INFO", "Collection started",
-              days_ahead=DAYS_AHEAD, dry_run=dry_run, run_id=run_id)
+    print(f"[BZZOIRO] Cleanup: {init_metrics.get('cleanup_count', 0)} ключей удалено")
 
-    # ── Coverage check ──
-    coverage = _check_coverage(headers)
-    if coverage and coverage.get("priced_next_7d", 0) == 0 and DAYS_AHEAD <= 7:
-        logger.info("[BZZOIRO] Coverage: 0 priced events — odds будут пустыми")
-
-    # ── Шаг 1: Загрузка событий ──
-    now_utc = dt.datetime.now(dt.timezone.utc)
-    date_from = now_utc.strftime("%Y-%m-%d")
-    date_to = (now_utc + dt.timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
-
-    url = (f"{BZZOIRO_BASE}/events/?date_from={date_from}&date_to={date_to}"
-           f"&limit={PAGE_LIMIT}&status=notstarted")
-    
-    all_events: list[dict] = []
-    pages_fetched = 0
     existing_keys = set(get_all_fields().keys())
 
-    while url and pages_fetched < 50:
-        if _is_shutdown():
-            logger.info("[BZZOIRO] Shutdown requested — остановка загрузки событий")
-            break
-        pages_fetched += 1
+    # ─── Шаг 1: Загрузка событий ───
+    print("[BZZOIRO] Шаг 1: Загрузка событий...")
+    now = dt.datetime.now(dt.timezone.utc)
+    date_from = now.strftime("%Y-%m-%d")
+    date_to = (now + dt.timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
+
+    all_events: list[dict] = []
+    pages_fetched = 0
+    url = f"{BZZOIRO_BASE}/events?date_from={date_from}&date_to={date_to}&limit={PAGE_LIMIT}"
+
+    while url:
         data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
-        if data is _NOT_FOUND or not data:
+        pages_fetched += 1
+
+        if data is None:
+            print(f"[BZZOIRO] Ошибка загрузки страницы {pages_fetched}")
             break
+        if data is _NOT_FOUND:
+            break
+
+        if pages_fetched == 1:
+            print(f"[BZZOIRO DEBUG] Raw response type: {type(data).__name__}")
+            if isinstance(data, dict):
+                print(f"[BZZOIRO DEBUG] Raw response keys: {list(data.keys())}")
+            print(f"[BZZOIRO DEBUG] Raw response (1000 chars): {json.dumps(data, ensure_ascii=False)[:1000]}")
 
         if isinstance(data, dict):
             items = data.get("results", data.get("data", data.get("events", [])))
         elif isinstance(data, list):
             items = data
         else:
+            print(f"[BZZOIRO DEBUG] Не удалось распарсить items. Type: {type(data)}")
             break
 
         if not isinstance(items, list) or not items:
+            print(f"[BZZOIRO DEBUG] items пустой на странице {pages_fetched}")
             break
 
         all_events.extend(items)
         total_count = data.get("count", 0) if isinstance(data, dict) else 0
-        logger.info(f"[BZZOIRO] Загружено: {len(all_events)}/{total_count}")
+        print(f"[BZZOIRO] Загружено: {len(all_events)}/{total_count}")
 
         if isinstance(data, dict):
             url = data.get("next")
@@ -449,13 +283,16 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
         if not url:
             break
+
         if total_count and len(all_events) >= total_count:
             break
 
+    # ─── Сортировка по дате (ближайшие первыми) ───
     all_events.sort(key=_parse_event_date)
-    logger.info(f"[BZZOIRO] Всего событий: {len(all_events)} (страниц: {pages_fetched})")
+    print(f"[BZZOIRO] Всего событий: {len(all_events)} (страниц: {pages_fetched})")
+    print(f"[BZZOIRO] Сортировка по дате: ближайшие первыми")
 
-    # ── Шаг 1.5: Pre-fetch лиг ──
+    # ─── Шаг 1.5: Pre-fetch лиг ───
     league_ids = set()
     for ev in all_events:
         lid = ev.get("league_id")
@@ -463,20 +300,16 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             league_ids.add(lid)
 
     if league_ids:
-        logger.info(f"[BZZOIRO] Шаг 1.5: Pre-fetch {len(league_ids)} лиг...")
+        print(f"[BZZOIRO] Шаг 1.5: Pre-fetch {len(league_ids)} лиг...")
         for lid in league_ids:
-            if _is_shutdown():
-                logger.info("[BZZOIRO] Shutdown requested — пропуск pre-fetch лиг")
-                break
             _fetch_league_info(lid, headers)
             time.sleep(RATE_DELAY)
-        logger.info(f"[BZZOIRO] Pre-fetch лиг завершён: {len(_league_cache)} в кэше")
+        print(f"[BZZOIRO] Pre-fetch лиг завершён: {len(_league_cache)} в кэше")
 
-    # ── Шаг 2: Запись матчей ──
-    logger.info("[BZZOIRO] Шаг 2: Запись матчей в Redis...")
+    # ─── Шаг 2: Запись матчей ───
+    print("[BZZOIRO] Шаг 2: Запись матчей в Redis...")
     stored_matches: list[tuple[str, int, dict]] = []
     created = 0
-    upsert_errors = 0
     updated = 0
     skipped_past = 0
     skipped_finished = 0
@@ -485,30 +318,24 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     seen = set()
 
     for idx, ev in enumerate(all_events):
-        if _is_shutdown():
-            logger.info("[BZZOIRO] Shutdown requested — остановка записи матчей")
-            break
-
         bzzoiro_id = ev.get("id")
         if not bzzoiro_id:
             continue
 
-        home_raw = ev.get("home_team") or ev.get("home_team_name") or ""
-        away_raw = ev.get("away_team") or ev.get("away_team_name") or ""
-        if not home_raw or not away_raw:
+        home_team = ev.get("home_team", "")
+        away_team = ev.get("away_team", "")
+        if not home_team or not away_team:
             continue
 
-        home_norm = clean_team_name(home_raw)
-        away_norm = clean_team_name(away_raw)
+        status = ev.get("status", "scheduled") or "scheduled"
 
-        if not home_norm or not away_norm:
+        # Фильтр завершённых матчей
+        if status in FINISHED_STATUSES:
+            skipped_finished += 1
             continue
-
-        status = ev.get("status", "notstarted")
 
         date_str = _extract_date(ev)
-        date_str = normalize_date(date_str)
-        dedup_key = f"{home_norm}|{away_norm}|{date_str}"
+        dedup_key = f"{home_team}|{away_team}|{date_str}"
         if dedup_key in seen:
             deduped += 1
             continue
@@ -522,34 +349,30 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             continue
 
         if idx < DEBUG_EVENT_COUNT:
-            logger.debug(f"[BZZOIRO DEBUG] Событие #{idx}: keys={list(ev.keys())}")
+            print(f"[BZZOIRO DEBUG] Событие #{idx}: keys={list(ev.keys())}")
+            print(f"[BZZOIRO DEBUG] Событие #{idx}: {json.dumps(ev, ensure_ascii=False)[:500]}")
 
+        # League info из pre-fetch кэша
         league_id = ev.get("league_id")
         league_info = _fetch_league_info(league_id, headers) if league_id else {"name": "", "country": ""}
 
         competition = league_info.get("name", "") or ev.get("stage_name", "") or ev.get("stage", "")
         country = league_info.get("country", "")
 
-        if dry_run:
-            created += 1
-            stored_matches.append((f"dry_run_{bzzoiro_id}", bzzoiro_id, ev))
-            continue
-        try:
-            result_id = upsert_match(
-                home_team=home_norm,
-                away_team=away_norm,
-                date_utc=date_str,
-                competition=competition,
-                country=country,
-                status=status,
-                source=COLLECTOR_NAME,
-                sources=[COLLECTOR_NAME],
-                source_ids={COLLECTOR_NAME: str(bzzoiro_id)},
-                idempotency_key=f"{run_id}:{home_norm}__{away_norm}__{date_str[:10].replace('-', '')}" if run_id else None,
-            )
-        except Exception as e:
-            logger.error(f"[BZZOIRO] upsert error for event #{idx}: {e}")
-            result_id = None
+        extra = {
+            "source_ids": {"bzzoiro": str(bzzoiro_id)},
+        }
+
+        result_id = upsert_match(
+            home_team=home_team,
+            away_team=away_team,
+            date_utc=date_str,
+            competition=competition,
+            country=country,
+            status=status,
+            source="bzzoiro",
+            **extra,
+        )
         if result_id:
             if f"match:{result_id}" in existing_keys:
                 updated += 1
@@ -557,12 +380,13 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 created += 1
             stored_matches.append((result_id, bzzoiro_id, ev))
         else:
-            upsert_errors += 1
+            skipped_past += 1
 
-    logger.info(f"[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), "
-                f"пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}")
+    print(f"[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}")
+    if no_date_count:
+        print(f"[BZZOIRO] Без даты: {no_date_count} событий")
 
-    # ── Шаг 3: Enrichment ──
+    # ─── Шаг 3: Enrichment ───
     odds_enriched = 0
     pred_enriched = 0
     stats_enriched = 0
@@ -570,80 +394,37 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     score_enriched = 0
     enrichment_errors = 0
     not_found = 0
-    bulk_used = False
 
     if events_only:
-        logger.info("[BZZOIRO] Режим events-only — enrichment пропущен")
-    elif dry_run:
-        logger.info("[BZZOIRO] DRY-RUN — enrichment пропущен")
+        print("[BZZOIRO] Режим events-only — enrichment пропущен")
     elif stored_matches:
-        logger.info(f"[BZZOIRO] Шаг 3: Обогащение {len(stored_matches)} матчей...")
-
-        # ── 3a: Bulk odds ──
-        bulk_odds: dict[str, dict] = {}
-        try:
-            bulk_odds = _fetch_bulk_odds(headers, date_from, date_to)
-        except Exception as e:
-            logger.warning(f"[BZZOIRO] Bulk odds failed: {e}")
-        
-        # ── 3b: Bulk predictions ──
-        bulk_preds: dict[str, dict] = {}
-        try:
-            bulk_preds = _fetch_bulk_predictions(headers, date_from, date_to)
-        except Exception as e:
-            logger.warning(f"[BZZOIRO] Bulk predictions failed: {e}")
-
-        bulk_used = bool(bulk_odds) or bool(bulk_preds)
-        logger.info(f"[BZZOIRO] Bulk mode: {'ON' if bulk_used else 'OFF (per-event fallback)'}")
+        print(f"[BZZOIRO] Шаг 3: Обогащение {len(stored_matches)} матчей...")
 
         for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
-            if _is_shutdown():
-                logger.info("[BZZOIRO] Shutdown requested — остановка enrichment")
-                break
-
             status = ev.get("status", "")
             is_prematch = status in PREMATCH_STATUSES
-            bid_str = str(bzzoiro_id)
 
-            # Score для прошедших матчей
+            # Score + Stats для прошедших матчей
             if not is_prematch:
                 score = _extract_score(ev)
                 if score:
-                    idem_key = f"{run_id}:{cid}:score:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:score:{bzzoiro_id}"
-                    try:
-                        if patch_match(cid, "score", score, source=COLLECTOR_NAME,
-                                       upstream=BZZOIRO_UPSTREAM,
-                                       idempotency_key=idem_key):
-                            score_enriched += 1
-                        else:
-                            enrichment_errors += 1
-                    except Exception as e:
-                        logger.error(f"[BZZOIRO] score patch error #{idx}: {e}")
+                    if patch_match(cid, "score", score, source="bzzoiro"):
+                        score_enriched += 1
+                    else:
                         enrichment_errors += 1
 
-            # ── Odds ──
-            odds_data = None
-            if bulk_used and bid_str in bulk_odds:
-                odds_data = bulk_odds[bid_str]
-            else:
-                odds_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/odds"
-                odds_data = _fetch_bzzoiro(odds_url, headers, max_retries=MAX_RETRIES)
+            # ─── Odds (всегда) ───
+            odds_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/odds"
+            odds_data = _fetch_bzzoiro(odds_url, headers, max_retries=MAX_RETRIES)
 
             if odds_data is _NOT_FOUND:
                 not_found += 1
             elif odds_data and isinstance(odds_data, dict):
                 best_odds = _extract_best_odds(odds_data)
                 if best_odds:
-                    idem_key = f"{run_id}:{cid}:odds:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:odds:{bzzoiro_id}"
-                    try:
-                        if patch_match(cid, "odds", best_odds, source=COLLECTOR_NAME,
-                                       upstream=BZZOIRO_UPSTREAM,
-                                       idempotency_key=idem_key):
-                            odds_enriched += 1
-                        else:
-                            enrichment_errors += 1
-                    except Exception as e:
-                        logger.error(f"[BZZOIRO] odds patch error #{idx}: {e}")
+                    if patch_match(cid, "odds", best_odds, source="bzzoiro"):
+                        odds_enriched += 1
+                    else:
                         enrichment_errors += 1
                 else:
                     not_found += 1
@@ -651,37 +432,23 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 enrichment_errors += 1
 
             if idx < DEBUG_EVENT_COUNT:
-                logger.debug(f"[BZZOIRO DEBUG] Odds #{idx}: {'found' if odds_data is not _NOT_FOUND else 404}")
+                print(f"[BZZOIRO DEBUG] Odds #{idx}: {json.dumps(odds_data, ensure_ascii=False)[:500] if odds_data is not _NOT_FOUND else '404'}")
 
-            if not bulk_used:
-                time.sleep(ENRICH_DELAY)
+            time.sleep(ENRICH_DELAY)
 
-            # ── Predictions (только pre-match) ──
+            # ─── Predictions (только для pre-match!) ───
             if is_prematch:
-                pred_data = None
-                if bulk_used and bid_str in bulk_preds:
-                    pred_data = bulk_preds[bid_str]
-                else:
-                    pred_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/prediction"
-                    pred_data = _fetch_bzzoiro(pred_url, headers, max_retries=MAX_RETRIES)
+                pred_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/predictions"
+                pred_data = _fetch_bzzoiro(pred_url, headers, max_retries=MAX_RETRIES)
 
                 if pred_data is _NOT_FOUND:
                     not_found += 1
                 elif pred_data and isinstance(pred_data, dict):
                     inner_pred = pred_data.get("prediction", pred_data)
                     if isinstance(inner_pred, dict) and inner_pred:
-                        if "source" not in inner_pred:
-                            inner_pred["source"] = COLLECTOR_NAME
-                        idem_key = f"{run_id}:{cid}:predictions:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:predictions:{bzzoiro_id}"
-                        try:
-                            if patch_match(cid, "predictions", inner_pred, source=COLLECTOR_NAME,
-                                           upstream=BZZOIRO_UPSTREAM,
-                                           idempotency_key=idem_key):
-                                pred_enriched += 1
-                            else:
-                                enrichment_errors += 1
-                        except Exception as e:
-                            logger.error(f"[BZZOIRO] predictions patch error #{idx}: {e}")
+                        if patch_match(cid, "predictions", inner_pred, source="bzzoiro"):
+                            pred_enriched += 1
+                        else:
                             enrichment_errors += 1
                     else:
                         not_found += 1
@@ -689,12 +456,14 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     enrichment_errors += 1
 
                 if idx < DEBUG_EVENT_COUNT:
-                    logger.debug(f"[BZZOIRO DEBUG] Prediction #{idx}: {'found' if pred_data is not _NOT_FOUND else 404}")
+                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: {json.dumps(pred_data, ensure_ascii=False)[:500] if pred_data is not _NOT_FOUND else '404'}")
 
-                if not bulk_used:
-                    time.sleep(ENRICH_DELAY)
+                time.sleep(ENRICH_DELAY)
+            else:
+                if idx < DEBUG_EVENT_COUNT:
+                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: skipped (not pre-match)")
 
-            # ── H2H (per-event, bulk недоступен) ──
+            # ─── H2H (всегда) ───
             h2h_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h"
             h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
 
@@ -707,27 +476,21 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             elif h2h_data and isinstance(h2h_data, dict):
                 inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
                 if isinstance(inner_h2h, dict) and inner_h2h:
-                    if "source" not in inner_h2h:
-                        inner_h2h["source"] = COLLECTOR_NAME
-                    idem_key = f"{run_id}:{cid}:h2h:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:h2h:{bzzoiro_id}"
-                    try:
-                        if patch_match(cid, "h2h", inner_h2h, source=COLLECTOR_NAME,
-                                       upstream=BZZOIRO_UPSTREAM,
-                                       idempotency_key=idem_key):
-                            h2h_enriched += 1
-                        else:
-                            enrichment_errors += 1
-                    except Exception as e:
-                        logger.error(f"[BZZOIRO] h2h patch error #{idx}: {e}")
+                    if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
+                        h2h_enriched += 1
+                    else:
                         enrichment_errors += 1
                 else:
                     not_found += 1
             else:
                 enrichment_errors += 1
 
+            if idx < DEBUG_EVENT_COUNT:
+                print(f"[BZZOIRO DEBUG] H2H #{idx}: {json.dumps(h2h_data, ensure_ascii=False)[:500] if h2h_data is not _NOT_FOUND else '404'}")
+
             time.sleep(ENRICH_DELAY)
 
-            # ── Stats (только finished) ──
+            # ─── Stats (только для прошедших) ───
             if not is_prematch:
                 stats_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/stats"
                 stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
@@ -742,48 +505,41 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                             if k != "stats" and not isinstance(v, dict):
                                 flat_stats[k] = v
                         if any(v is not None for v in flat_stats.values()):
-                            idem_key = f"{run_id}:{cid}:stats:{bzzoiro_id}" if run_id else f"bzzoiro:{cid}:stats:{bzzoiro_id}"
-                            try:
-                                if patch_match(cid, "stats", flat_stats, source=COLLECTOR_NAME,
-                                               upstream=BZZOIRO_UPSTREAM,
-                                               idempotency_key=idem_key):
-                                    stats_enriched += 1
-                                else:
-                                    enrichment_errors += 1
-                            except Exception as e:
-                                logger.error(f"[BZZOIRO] stats patch error #{idx}: {e}")
+                            if patch_match(cid, "stats", flat_stats, source="bzzoiro"):
+                                stats_enriched += 1
+                            else:
                                 enrichment_errors += 1
+                        else:
+                            not_found += 1
                     else:
                         not_found += 1
                 else:
                     enrichment_errors += 1
 
+                if idx < DEBUG_EVENT_COUNT:
+                    print(f"[BZZOIRO DEBUG] Stats #{idx}: {json.dumps(stats_data, ensure_ascii=False)[:500] if stats_data is not _NOT_FOUND else '404'}")
+
                 time.sleep(ENRICH_DELAY)
+            else:
+                if idx < DEBUG_EVENT_COUNT:
+                    print(f"[BZZOIRO DEBUG] Stats #{idx}: skipped (pre-match)")
 
-            if (idx + 1) % 10 == 0:
-                logger.info(f"[BZZOIRO] Обогащение: {idx + 1}/{len(stored_matches)} "
-                           f"(odds={odds_enriched}, pred={pred_enriched}, h2h={h2h_enriched}, "
-                           f"stats={stats_enriched}, score={score_enriched}, errors={enrichment_errors})")
+            if (idx + 1) % 50 == 0:
+                print(f"[BZZOIRO] Обогащение: {idx + 1}/{len(stored_matches)} (odds={odds_enriched}, pred={pred_enriched}, stats={stats_enriched}, h2h={h2h_enriched}, score={score_enriched})")
 
-    # ── Итоги ──
-    shutdown_triggered = _is_shutdown()
-    logger.info(f"[BZZOIRO] Готово: матчей {len(stored_matches)} (создано {created}, обновлено {updated})")
-    logger.info(f"[BZZOIRO]   Odds: {odds_enriched}, Predictions: {pred_enriched}, "
-                f"Stats: {stats_enriched}, H2H: {h2h_enriched}, Score: {score_enriched}")
-    logger.info(f"[BZZOIRO]   Ошибки: {enrichment_errors}, Not Found: {not_found}, Bulk: {'ON' if bulk_used else 'OFF'}")
-    if shutdown_triggered:
-        logger.info("[BZZOIRO]   ⚠ Shutdown был запрошен — данные могут быть неполными")
+    # ─── Шаг 4: Итоги ───
+    print(f"[BZZOIRO] Готово: матчей {len(stored_matches)} (создано {created}, обновлено {updated})")
+    print(f"[BZZOIRO]   Odds: {odds_enriched}, Predictions: {pred_enriched}, Stats: {stats_enriched}, H2H: {h2h_enriched}, Score: {score_enriched}")
+    print(f"[BZZOIRO]   Ошибки: {enrichment_errors}, Not Found: {not_found}")
 
     result = {
         "last_run": now_msk(),
-        "run_id": run_id,
         "total_events": len(all_events),
         "stored_matches": len(stored_matches),
         "created": created,
         "updated": updated,
         "error_count": enrichment_errors,
         "pages_fetched": pages_fetched,
-        "bulk_used": bulk_used,
         "enrichment": {
             "odds": odds_enriched,
             "predictions": pred_enriched,
@@ -798,58 +554,24 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         "skipped_finished": skipped_finished,
         "deduped": deduped,
         "no_date": no_date_count,
-        "shutdown_triggered": shutdown_triggered,
     }
-    logger.info(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
-    log_event("bzzoiro", "INFO", "Collection complete",
-              total_events=len(all_events), created=created, updated=updated,
-              odds_enriched=odds_enriched, predictions=pred_enriched,
-              errors=enrichment_errors)
+    print(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
 
-    save_meta(COLLECTOR_NAME,
-              last_run=now_msk(),
+    # ─── Шаг 5: Сохранение мета ───
+    save_meta("bzzoiro",
               total_events=len(all_events),
               stored_matches=len(stored_matches),
               created=created,
               updated=updated,
-              error_count=enrichment_errors,
+              skipped_past=skipped_past,
+              deduped=deduped,
               pages_fetched=pages_fetched,
-              bulk_used=bulk_used,
-              enrichment={
-                  "odds": odds_enriched,
-                  "predictions": pred_enriched,
-                  "stats": stats_enriched,
-                  "h2h": h2h_enriched,
-                  "score": score_enriched,
-                  "errors": enrichment_errors,
-                  "not_found": not_found,
-              },
-              events_only=events_only,
-              shutdown_triggered=shutdown_triggered,
-              run_id=run_id)
+              error_count=enrichment_errors,
+              enrichment=result.get("enrichment"))
 
     return result
 
 
-@register_module("bzzoiro", role="collector",
-              writes=["upsert_match", "patch_match", "save_meta"],
-              reads=["{collector}:meta"])
-def collect_and_process() -> dict:
-    """Единая точка входа для CI/CD."""
-    return collect_bzzoiro()
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=f"Collector Bzzoiro v{__version__}")
-    parser.add_argument("--events-only", action="store_true",
-                        help="Только события, без enrichment")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Не писать в Redis (dry-run)")
-    args = parser.parse_args()
-    if args.dry_run:
-        os.environ["DRY_RUN"] = "1"
-        logger.info("[BZZOIRO] DRY-RUN mode — данные НЕ будут записаны в Redis")
-
-    result = collect_bzzoiro(events_only=args.events_only)
-    logger.info(f"[BZZOIRO] Result: {result}")
-
+    events_only = "--events-only" in sys.argv
+    collect_bzzoiro(events_only=events_only)
