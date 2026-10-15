@@ -20,7 +20,7 @@ from gatekeeper_hub import (
 from redis_hub import get_all_fields, delete_from_cache
 
 SHARP_API_BASE = "https://api.sharpapi.io/api/v1"
-DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "7"))
+DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "1"))
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +240,8 @@ def collect_sharpapi():
     limit = int(os.environ.get("SHARPAPI_LIMIT", "200"))
     flush_old = os.environ.get("SHARPAPI_FLUSH_OLD", "0") == "1"
 
+    print(f"[SHARPAPI] Параметр DAYS_AHEAD установлен на: {DAYS_AHEAD} дн.")
+
     init_metrics = run_initialization()
     if not init_metrics.get("redis_available", False):
         print("[SHARPAPI] Redis недоступен")
@@ -329,7 +331,8 @@ def collect_sharpapi():
 
         date_utc = normalize_date(ev["start_time"])
 
-        if date_utc and not is_future_match(date_utc):
+        # Фильтрация с учетом DAYS_AHEAD (от 1 дня)
+        if date_utc and not is_future_match(date_utc, days_ahead=DAYS_AHEAD):
             skipped_past += 1
             continue
 
@@ -368,7 +371,7 @@ def collect_sharpapi():
                 created += 1
 
     total_events = len(events_map)
-    print(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, пропущено (прошедшие): {skipped_past}, дедупликатов: {deduped}")
+    print(f"[SHARPAPI] Записано: {stored}, создано: {created}, обновлено: {updated}, пропущено (вне диапазона): {skipped_past}, дедупликатов: {deduped}")
 
     meta = {
         "last_run": now_msk(),
