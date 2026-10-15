@@ -21,11 +21,11 @@ Collector Propline v9.0-bulk для Gatekeeper-AI v9.3-audited.
   - Fallback: 32 soccer-лиги, если /sports недоступен
 
 FIX v810:
-  - Использует gatekeeper_hub (upsert_match, patch_match, save_meta) — §1.4[span_0](start_span)[span_0](end_span)
-  - canonical_id через build_canonical_id — §1.6[span_1](start_span)[span_1](end_span)
-  - clean_team_name из team_registry — §2.4[span_2](start_span)[span_2](end_span)
-  - run_initialization(collector="propline") — §2.6[span_3](start_span)[span_3](end_span)
-  - graceful shutdown (is_shutdown_requested) — §2.3[span_4](start_span)[span_4](end_span)
+  - Использует gatekeeper_hub (upsert_match, patch_match, save_meta)
+  - canonical_id через build_canonical_id
+  - clean_team_name из team_registry
+  - run_initialization(collector="propline")
+  - graceful shutdown (is_shutdown_requested)
 """
 import os
 import sys
@@ -92,8 +92,8 @@ except ImportError:
 
 COLLECTOR_NAME = "propline"
 BASE_URL = os.environ.get("PROPLINE_BASE_URL", "https://api.prop-line.com/v1")
-# Унифицированный горизонт планирования (7 дней вместо 3 для синхронизации со всеми коллекторами)[span_5](start_span)[span_5](end_span)
-DAYS_AHEAD = int(os.environ.get("PROPLINE_DAYS_AHEAD", "7"))[span_6](start_span)[span_6](end_span)
+# Горизонт планирования (по умолчанию 1 день с возможностью переопределения через workflow_dispatch)
+DAYS_AHEAD = int(os.environ.get("PROPLINE_DAYS_AHEAD", "1"))
 MAX_RETRIES = int(os.environ.get("PROPLINE_MAX_RETRIES", "2"))
 HTTP_TIMEOUT = int(os.environ.get("PROPLINE_API_TIMEOUT", "10"))
 MAX_WORKERS = int(os.environ.get("PROPLINE_MAX_WORKERS", "8"))
@@ -227,19 +227,6 @@ def _fetch_odds(sport_key: str, max_retries: int = 2, timeout: int = 10) -> Opti
 def _parse_h2h_odds(ev: dict, home_team: str, away_team: str) -> tuple:
     """Парсит h2h odds из The Odds API формата.
     Возвращает (odds_home, odds_draw, odds_away) — лучшие десятичные коэффициенты.
-
-    Формат The Odds API:
-    "bookmakers": [{
-        "key": "pinnacle",
-        "markets": [{
-            "key": "h2h",
-            "outcomes": [
-                {"name": "Arsenal", "price": -150},
-                {"name": "Draw", "price": 320},
-                {"name": "Leeds", "price": 480}
-            ]
-        }]
-    }]
     """
     odds_home = None
     odds_draw = None
@@ -247,7 +234,6 @@ def _parse_h2h_odds(ev: dict, home_team: str, away_team: str) -> tuple:
 
     bookmakers = ev.get("bookmakers", [])
     if not bookmakers:
-        # Legacy формат: ev.odds.h2h
         odds_data = ev.get("odds", ev)
         h2h = odds_data.get("h2h")
         if h2h is not None:
@@ -274,7 +260,6 @@ def _parse_h2h_odds(ev: dict, home_team: str, away_team: str) -> tuple:
                 odds_away = _american_to_decimal(h2h.get("away"))
         return odds_home, odds_draw, odds_away
 
-    # The Odds API формат: bookmakers[].markets[].outcomes[]
     for bookmaker in bookmakers:
         markets = bookmaker.get("markets", [])
         for market in markets:
@@ -302,9 +287,7 @@ def _parse_h2h_odds(ev: dict, home_team: str, away_team: str) -> tuple:
 
 
 def _process_league(sport_key: str, timeout: int) -> tuple:
-    """Обрабатывает одну лигу: fetch + parse + upsert.
-    Возвращает (sport_key, events_count, stored_count, created, updated, errors).
-    """
+    """Обрабатывает одну лигу: fetch + parse + upsert."""
     results = (sport_key, 0, 0, 0, 0, 0)
 
     if is_shutdown_requested():
@@ -314,7 +297,6 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
     if not api_key:
         return results
 
-    # Quota check
     global _quota_remaining
     if _quota_remaining is not None and _quota_remaining < QUOTA_MIN:
         logger.warning(f"Quota low — skip {sport_key}")
@@ -324,7 +306,6 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
     if not data:
         return results
 
-    # The Odds API v4 возвращает list напрямую, не {"events": [...]}
     if isinstance(data, list):
         events = data
     else:
@@ -340,7 +321,6 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
     updated = 0
     errors = 0
 
-    # Сортировка по дате
     events.sort(key=lambda ev: ev.get("commence_time", "") or ev.get("start_time", "") or "")
 
     for ev in events:
@@ -366,7 +346,6 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
             if date_utc and not is_future_match(date_utc):
                 continue
 
-            # Upper bound
             if date_utc:
                 try:
                     match_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
@@ -375,19 +354,15 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
                 except (ValueError, TypeError):
                     pass
 
-            # Parse odds (The Odds API format)
             odds_home, odds_draw, odds_away = _parse_h2h_odds(ev, home_team, away_team)
-
             sport_title = ev.get("sport_title", sport_key)
 
-            # Dry run
             if os.environ.get("DRY_RUN", "0") == "1":
                 logger.info(f"[DRY] Would upsert: {home_team} vs {away_team} ({date_utc})")
                 stored += 1
                 created += 1
                 continue
 
-            # Upsert
             try:
                 cid = upsert_match(
                     home_team=home_team,
@@ -411,7 +386,6 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
                 else:
                     created += 1
 
-                # Patch odds
                 odds_current = {}
                 if odds_home is not None:
                     odds_current["home"] = float(odds_home)
@@ -442,7 +416,6 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
 
 def collect_propline() -> Dict[str, Any]:
     """Главная функция коллектора Propline."""
-
     log_event("propline", "INFO", "Collection started")
     dry_run = os.environ.get("DRY_RUN", "0") == "1"
 
@@ -451,7 +424,6 @@ def collect_propline() -> Dict[str, Any]:
         logger.error("PROPLINE_API_KEY не задан")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
-    # §2.6: run_initialization[span_7](start_span)[span_7](end_span)
     init_metrics = run_initialization(collector=COLLECTOR_NAME)
     run_id = init_metrics.get("run_id", "unknown")
     os.environ["PROPLINE_RUN_ID"] = run_id
@@ -462,11 +434,9 @@ def collect_propline() -> Dict[str, Any]:
     logger.info(f"Propline collector started (run_id={run_id}, dry_run={dry_run}, "
                 f"workers={MAX_WORKERS}, timeout={HTTP_TIMEOUT}s)")
 
-    # ── Динамическое получение списка лиг ──
     soccer_leagues = _fetch_sports()
     logger.info(f"Total soccer leagues: {len(soccer_leagues)}")
 
-    # ── Параллельный fetch ──
     total_events = 0
     total_stored = 0
     total_created = 0
@@ -543,4 +513,3 @@ if __name__ == "__main__":
 
     result = collect_propline()
     logger.info(f"Result: {result}")
-
