@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Коллектор SharpAPI для Gatekeeper-AI v600-prod.
 Получает матчи и коэффициенты, сохраняет в Redis через gatekeeper_hub.
@@ -17,7 +18,9 @@ from gatekeeper_hub import (
     normalize_date, is_future_match, now_msk, save_meta,
 )
 from redis_hub import get_all_fields, delete_from_cache
+
 SHARP_API_BASE = "https://api.sharpapi.io/api/v1"
+DAYS_AHEAD = int(os.environ.get("SHARPAPI_DAYS_AHEAD", "7"))
 
 
 # ---------------------------------------------------------------------------
