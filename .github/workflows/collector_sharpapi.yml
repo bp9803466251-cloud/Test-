@@ -1,7 +1,13 @@
-name: Collector SharpAPI
+Name: Collector SharpAPI
 
 on:
   workflow_dispatch:
+    inputs:
+      days_ahead:
+        description: 'Дней вперёд для фильтрации матчей'
+        required: true
+        default: '1'
+        type: string
 
 env:
   PYTHON_VERSION: "3.11"
@@ -45,5 +51,6 @@ jobs:
           SHARPAPI_LIMIT: ${{ vars.SHARPAPI_LIMIT || '200' }}
           SHARPAPI_MAX_RETRIES: ${{ vars.SHARPAPI_MAX_RETRIES || '3' }}
           GATEKEEPER_EXTERNAL_API_TIMEOUT: ${{ vars.GATEKEEPER_EXTERNAL_API_TIMEOUT || '15' }}
+          SHARPAPI_DAYS_AHEAD: ${{ github.event.inputs.days_ahead || '1' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           
