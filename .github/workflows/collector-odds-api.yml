@@ -1,0 +1,49 @@
+name: Collector OddsAPI
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatekeeper-redis
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: The Odds API V4
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run collector_odds_api
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          ODDS_API_REGIONS: ${{ vars.ODDS_API_REGIONS || 'eu,uk' }}
+          ODDS_API_MARKETS: ${{ vars.ODDS_API_MARKETS || 'h2h' }}
+          ODDS_API_ODDS_FORMAT: ${{ vars.ODDS_API_ODDS_FORMAT || 'decimal' }}
+          ODDS_API_RATE_DELAY: ${{ vars.ODDS_API_RATE_DELAY || '1.0' }}
+          ODDS_API_MAX_RETRIES: ${{ vars.ODDS_API_MAX_RETRIES || '1' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python collector_odds_api.py
+        
