@@ -1,4 +1,4 @@
-Name: Collector SharpAPI
+name: Collector SharpAPI
 
 on:
   workflow_dispatch:
