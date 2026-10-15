@@ -331,8 +331,21 @@ def collect_sharpapi():
 
         date_utc = normalize_date(ev["start_time"])
 
-        # Фильтрация с учетом DAYS_AHEAD (от 1 дня)
-        if date_utc and not is_future_match(date_utc, days_ahead=DAYS_AHEAD):
+        # Безопасная фильтрация с учетом DAYS_AHEAD
+        if date_utc:
+            try:
+                dt_match = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+                now_utc = datetime.now(timezone.utc)
+                limit_utc = now_utc + timedelta(days=DAYS_AHEAD)
+                
+                if dt_match < now_utc or dt_match > limit_utc:
+                    skipped_past += 1
+                    continue
+            except Exception:
+                if not is_future_match(date_utc):
+                    skipped_past += 1
+                    continue
+        else:
             skipped_past += 1
             continue
 
