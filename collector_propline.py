@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
 """
-Collector Propline v9.0-bulk для Gatekeeper-AI v9.3-audited.
-Получает матчи и коэффициенты через PropLine API, сохраняет в Redis через gatekeeper_hub.
-
-Изменения v9.1-listfix:
-  - FIX: _process_league — The Odds API v4 возвращает list, не {"events": [...]}
-    data.get("events", []) → AttributeError на list → 28 errors, 0 stored
-    Добавлен isinstance(data, list) check (как в _fetch_sports)
-
-Изменения v9.0-bulk:
-  - Динамические лиги: GET /sports → все soccer_* (31+ вместо 6 хардкод)
-  - Параллельный fetch: ThreadPoolExecutor, пул 8 (вместо последовательного)
-  - Markets: только h2h (вместо h2h,spreads,totals) — меньше payload
-  - Bookmakers: только pinnacle — острая линия
-  - Quota protection: X-Daily-Remaining < quota_min → остановка
-  - Правильный парсинг The Odds API: bookmakers[].markets[].outcomes[]
-  - American → decimal конвертация
-  - Без per-event delay (bulk = 1 запрос на лигу)
-  - Progress logging каждые 10 матчей
-  - Fallback: 32 soccer-лиги, если /sports недоступен
-
-FIX v810:
-  - Использует gatekeeper_hub (upsert_match, patch_match, save_meta)
-  - canonical_id через build_canonical_id
-  - clean_team_name из team_registry
-  - run_initialization(collector="propline")
-  - graceful shutdown (is_shutdown_requested)
+Collector Propline v9.3-debug-keys для Gatekeeper-AI v9.3-audited.
+Получает матчи и коэффициенты (h2h, spreads, totals) через PropLine API (Pinnacle),
+сохраняет в Redis через gatekeeper_hub, с подробным debug-выводом всех сырых ключей.
 """
 import os
 import sys
@@ -83,7 +60,6 @@ except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
-# Унифицированный импорт нормализации через gatekeeper_hub (без локальных небезопасных фоллбеков)
 try:
     from gatekeeper_hub import clean_team_name, build_canonical_id
 except ImportError:
@@ -92,14 +68,12 @@ except ImportError:
 
 COLLECTOR_NAME = "propline"
 BASE_URL = os.environ.get("PROPLINE_BASE_URL", "https://api.prop-line.com/v1")
-# Горизонт планирования (по умолчанию 1 день с возможностью переопределения через workflow_dispatch)
 DAYS_AHEAD = int(os.environ.get("PROPLINE_DAYS_AHEAD", "1"))
 MAX_RETRIES = int(os.environ.get("PROPLINE_MAX_RETRIES", "2"))
 HTTP_TIMEOUT = int(os.environ.get("PROPLINE_API_TIMEOUT", "10"))
 MAX_WORKERS = int(os.environ.get("PROPLINE_MAX_WORKERS", "8"))
 QUOTA_MIN = int(os.environ.get("PROPLINE_QUOTA_MIN", "10"))
 
-# Fallback: 32 soccer-лиги (если /sports недоступен)
 FALLBACK_LEAGUES = [
     "soccer_epl", "soccer_la_liga", "soccer_serie_a",
     "soccer_bundesliga", "soccer_ligue_1", "soccer_mls",
@@ -107,7 +81,7 @@ FALLBACK_LEAGUES = [
     "soccer_belgium_first_div", "soccer_turkey_super_league",
     "soccer_spain_segunda_division", "soccer_italy_serie_b",
     "soccer_germany_bundesliga2", "soccer_france_ligue2",
-    "soccer_england Championship", "soccer_england_league1",
+    "soccer_england_championship", "soccer_england_league1",
     "soccer_england_league2", "soccer_england_efl_cup",
     "soccer_uefa_champs_league", "soccer_uefa_europa_league",
     "soccer_uefa_europa_conference_league",
@@ -119,10 +93,9 @@ FALLBACK_LEAGUES = [
     "soccer_sweden_allsvenskan",
 ]
 
-__version__ = "9.1-listfix"
+__version__ = "9.3-debug-keys"
 __all__ = ["collect_propline", "collect_and_process", "__version__"]
 
-# Quota tracking
 _quota_remaining: Optional[int] = None
 
 
@@ -169,22 +142,20 @@ def _fetch_sports() -> List[str]:
                 logger.info(f"Dynamic leagues: {len(soccer_keys)} soccer leagues discovered")
                 return soccer_keys
             else:
-                logger.info("No soccer leagues in /sports — using fallback")
                 return FALLBACK_LEAGUES
     except Exception as e:
-        logger.warning(f"GET /sports failed: {e} — using fallback ({len(FALLBACK_LEAGUES)} leagues)")
+        logger.warning(f"GET /sports failed: {e} — using fallback")
         return FALLBACK_LEAGUES
 
 
 def _fetch_odds(sport_key: str, max_retries: int = 2, timeout: int = 10) -> Optional[dict]:
-    """Получает odds от PropLine API для одной лиги (bulk endpoint)."""
+    """Получает odds от PropLine API для всех основных рынков (h2h, spreads, totals)."""
     api_key = os.environ.get("PROPLINE_API_KEY", "")
     if not api_key:
         return None
 
-    # Только h2h, только pinnacle — острая линия, минимум payload
     url = (f"{BASE_URL}/sports/{sport_key}/odds"
-           f"?apiKey={api_key}&markets=h2h&bookmakers=pinnacle")
+           f"?apiKey={api_key}&markets=h2h,spreads,totals&bookmakers=pinnacle")
 
     global _quota_remaining
     if _quota_remaining is not None and _quota_remaining < QUOTA_MIN:
@@ -198,23 +169,17 @@ def _fetch_odds(sport_key: str, max_retries: int = 2, timeout: int = 10) -> Opti
             req = urllib.request.Request(url, headers={"User-Agent": "GatekeeperAI"})
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
-
-                # Update quota
                 remaining = response.headers.get("X-Daily-Remaining")
                 if remaining:
                     _quota_remaining = int(remaining)
-
                 return data
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 retry_after = int(e.headers.get("Retry-After", 5))
-                logger.warning(f"Rate limit on {sport_key}. Waiting {retry_after}s...")
                 time.sleep(retry_after)
                 continue
             if e.code == 404:
-                # Нет событий — нормально, возвращаем пустой
                 return {"events": []}
-            logger.error(f"HTTP {e.code} for {sport_key}: {e.reason}")
             break
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
             if attempt < max_retries - 1:
@@ -224,72 +189,65 @@ def _fetch_odds(sport_key: str, max_retries: int = 2, timeout: int = 10) -> Opti
     return None
 
 
-def _parse_h2h_odds(ev: dict, home_team: str, away_team: str) -> tuple:
-    """Парсит h2h odds из The Odds API формата.
-    Возвращает (odds_home, odds_draw, odds_away) — лучшие десятичные коэффициенты.
-    """
-    odds_home = None
-    odds_draw = None
-    odds_away = None
+def _parse_markets(ev: dict, home_team: str, away_team: str) -> tuple:
+    """Парсит h2h, spreads и totals из Pinnacle/The Odds API формата."""
+    odds_h2h = {}
+    odds_spreads = {}
+    odds_totals = {}
 
     bookmakers = ev.get("bookmakers", [])
-    if not bookmakers:
-        odds_data = ev.get("odds", ev)
-        h2h = odds_data.get("h2h")
-        if h2h is not None:
-            if isinstance(h2h, list):
-                for item in h2h:
-                    name = item.get("name", "")
-                    price = item.get("price")
+    for bookmaker in bookmakers:
+        markets = bookmaker.get("markets", [])
+        for market in markets:
+            m_key = market.get("key")
+            outcomes = market.get("outcomes", [])
+
+            if m_key == "h2h":
+                for outcome in outcomes:
+                    name = outcome.get("name", "")
+                    price = outcome.get("price")
                     decimal = _american_to_decimal(price)
                     if decimal is None:
                         continue
                     name_norm = clean_team_name(name)
                     if name_norm == home_team:
-                        if odds_home is None or decimal > odds_home:
-                            odds_home = decimal
-                    elif name in ("Draw", "draw"):
-                        if odds_draw is None or decimal > odds_draw:
-                            odds_draw = decimal
+                        odds_h2h["home"] = float(decimal)
+                    elif name.lower() == "draw":
+                        odds_h2h["draw"] = float(decimal)
                     elif name_norm == away_team:
-                        if odds_away is None or decimal > odds_away:
-                            odds_away = decimal
-            elif isinstance(h2h, dict):
-                odds_home = _american_to_decimal(h2h.get("home"))
-                odds_draw = _american_to_decimal(h2h.get("draw"))
-                odds_away = _american_to_decimal(h2h.get("away"))
-        return odds_home, odds_draw, odds_away
+                        odds_h2h["away"] = float(decimal)
 
-    for bookmaker in bookmakers:
-        markets = bookmaker.get("markets", [])
-        for market in markets:
-            if market.get("key") != "h2h":
-                continue
-            outcomes = market.get("outcomes", [])
-            for outcome in outcomes:
-                name = outcome.get("name", "")
-                price = outcome.get("price")
-                decimal = _american_to_decimal(price)
-                if decimal is None:
-                    continue
-                name_norm = clean_team_name(name)
-                if name_norm == home_team:
-                    if odds_home is None or decimal > odds_home:
-                        odds_home = decimal
-                elif name in ("Draw", "draw"):
-                    if odds_draw is None or decimal > odds_draw:
-                        odds_draw = decimal
-                elif name_norm == away_team:
-                    if odds_away is None or decimal > odds_away:
-                        odds_away = decimal
+            elif m_key == "spreads":
+                for outcome in outcomes:
+                    name = outcome.get("name", "")
+                    price = outcome.get("price")
+                    point = outcome.get("point")
+                    decimal = _american_to_decimal(price)
+                    if decimal is None:
+                        continue
+                    name_norm = clean_team_name(name)
+                    side = "home" if name_norm == home_team else "away" if name_norm == away_team else None
+                    if side and point is not None:
+                        odds_spreads[side] = {"point": float(point), "price": float(decimal)}
 
-    return odds_home, odds_draw, odds_away
+            elif m_key == "totals":
+                for outcome in outcomes:
+                    name = outcome.get("name", "").lower()
+                    price = outcome.get("price")
+                    point = outcome.get("point")
+                    decimal = _american_to_decimal(price)
+                    if decimal is None:
+                        continue
+                    side = "over" if "over" in name else "under" if "under" in name else None
+                    if side and point is not None:
+                        odds_totals[side] = {"point": float(point), "price": float(decimal)}
+
+    return odds_h2h, odds_spreads, odds_totals
 
 
 def _process_league(sport_key: str, timeout: int) -> tuple:
-    """Обрабатывает одну лигу: fetch + parse + upsert."""
+    """Обрабатывает лигу: сбор и обновление рынков в Redis."""
     results = (sport_key, 0, 0, 0, 0, 0)
-
     if is_shutdown_requested():
         return results
 
@@ -299,20 +257,22 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
 
     global _quota_remaining
     if _quota_remaining is not None and _quota_remaining < QUOTA_MIN:
-        logger.warning(f"Quota low — skip {sport_key}")
         return results
 
     data = _fetch_odds(sport_key, max_retries=MAX_RETRIES, timeout=timeout)
     if not data:
         return results
 
-    if isinstance(data, list):
-        events = data
-    else:
-        events = data.get("events", [])
+    events = data if isinstance(data, list) else data.get("events", [])
     if not events:
-        logger.info(f"No events for {sport_key}")
         return (sport_key, 0, 0, 0, 0, 0)
+
+    # ── DEBUG: Логирование всех ключей и структуры первой записи в лиге ──
+    if events:
+        sample_ev = events[0]
+        logger.info(f"\n[DEBUG PROPLINE KEYS] Лига: {sport_key}")
+        logger.info(f"[DEBUG PROPLINE KEYS] Список верхнеуровневых ключей события: {list(sample_ev.keys())}")
+        logger.info(f"[DEBUG PROPLINE KEYS] Пример сырого объекта события:\n{json.dumps(sample_ev, indent=2, ensure_ascii=False)}")
 
     existing_keys = set(get_all_fields().keys())
     total = len(events)
@@ -320,8 +280,6 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
     created = 0
     updated = 0
     errors = 0
-
-    events.sort(key=lambda ev: ev.get("commence_time", "") or ev.get("start_time", "") or "")
 
     for ev in events:
         if is_shutdown_requested():
@@ -354,11 +312,10 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
                 except (ValueError, TypeError):
                     pass
 
-            odds_home, odds_draw, odds_away = _parse_h2h_odds(ev, home_team, away_team)
+            h2h_data, spreads_data, totals_data = _parse_markets(ev, home_team, away_team)
             sport_title = ev.get("sport_title", sport_key)
 
             if os.environ.get("DRY_RUN", "0") == "1":
-                logger.info(f"[DRY] Would upsert: {home_team} vs {away_team} ({date_utc})")
                 stored += 1
                 created += 1
                 continue
@@ -376,7 +333,7 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
                     source_ids={COLLECTOR_NAME: event_id},
                 )
             except Exception as e:
-                logger.error(f"[PROPLINE] upsert error for {home_team} vs {away_team}: {e}")
+                logger.error(f"[PROPLINE] upsert error: {e}")
                 cid = None
 
             if cid:
@@ -386,36 +343,41 @@ def _process_league(sport_key: str, timeout: int) -> tuple:
                 else:
                     created += 1
 
-                odds_current = {}
-                if odds_home is not None:
-                    odds_current["home"] = float(odds_home)
-                if odds_draw is not None:
-                    odds_current["draw"] = float(odds_draw)
-                if odds_away is not None:
-                    odds_current["away"] = float(odds_away)
+                run_id = os.environ.get("PROPLINE_RUN_ID", "unknown")
 
-                if odds_current:
-                    run_id = os.environ.get("PROPLINE_RUN_ID", "unknown")
-                    idempotency_key = f"{run_id}:{cid}:odds"
+                if h2h_data:
                     try:
-                        patch_match(cid, "odds", {"current": odds_current},
+                        patch_match(cid, "odds", {"current": h2h_data},
                                    source=COLLECTOR_NAME, upstream="pinnacle",
-                                   idempotency_key=idempotency_key)
-                    except Exception as e:
-                        logger.error(f"[PROPLINE] patch error for cid={cid}: {e}")
+                                   idempotency_key=f"{run_id}:{cid}:odds:1x2")
+                    except Exception:
+                        errors += 1
+
+                if spreads_data:
+                    try:
+                        patch_match(cid, "spreads", {"current": spreads_data},
+                                   source=COLLECTOR_NAME, upstream="pinnacle",
+                                   idempotency_key=f"{run_id}:{cid}:spreads")
+                    except Exception:
+                        errors += 1
+
+                if totals_data:
+                    try:
+                        patch_match(cid, "totals", {"current": totals_data},
+                                   source=COLLECTOR_NAME, upstream="pinnacle",
+                                   idempotency_key=f"{run_id}:{cid}:totals")
+                    except Exception:
                         errors += 1
 
         except Exception as e:
             logger.error(f"[PROPLINE] Event error: {e}")
             errors += 1
 
-    logger.info(f"[PROPLINE] {sport_key}: events={total}, stored={stored}, "
-               f"created={created}, updated={updated}, errors={errors}")
     return (sport_key, total, stored, created, updated, errors)
 
 
 def collect_propline() -> Dict[str, Any]:
-    """Главная функция коллектора Propline."""
+    """Главная функция коллектора."""
     log_event("propline", "INFO", "Collection started")
     dry_run = os.environ.get("DRY_RUN", "0") == "1"
 
@@ -431,11 +393,7 @@ def collect_propline() -> Dict[str, Any]:
         logger.error("Redis недоступен")
         return {"stored_matches": 0, "total_events": 0, "error_count": 1}
 
-    logger.info(f"Propline collector started (run_id={run_id}, dry_run={dry_run}, "
-                f"workers={MAX_WORKERS}, timeout={HTTP_TIMEOUT}s)")
-
     soccer_leagues = _fetch_sports()
-    logger.info(f"Total soccer leagues: {len(soccer_leagues)}")
 
     total_events = 0
     total_stored = 0
@@ -445,34 +403,19 @@ def collect_propline() -> Dict[str, Any]:
     processed_leagues = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {}
-        for sport_key in soccer_leagues:
-            if is_shutdown_requested():
-                logger.info("Shutdown — остановка отправки задач")
-                break
-            future = executor.submit(_process_league, sport_key, HTTP_TIMEOUT)
-            futures[future] = sport_key
-
+        futures = {executor.submit(_process_league, l, HTTP_TIMEOUT): l for l in soccer_leagues}
         for future in as_completed(futures):
-            sport_key = futures[future]
             try:
-                result = future.result()
-                if result and result[1] > 0:
+                res = future.result()
+                if res and res[1] > 0:
                     processed_leagues += 1
-                    total_events += result[1]
-                    total_stored += result[2]
-                    total_created += result[3]
-                    total_updated += result[4]
-                    total_errors += result[5]
-            except Exception as e:
-                logger.error(f"[PROPLINE] League {sport_key} failed: {e}")
+                    total_events += res[1]
+                    total_stored += res[2]
+                    total_created += res[3]
+                    total_updated += res[4]
+                    total_errors += res[5]
+            except Exception:
                 total_errors += 1
-
-    logger.info(f"Propline done: leagues={processed_leagues}/{len(soccer_leagues)}, "
-               f"events={total_events}, stored={total_stored}, "
-               f"created={total_created}, updated={total_updated}, errors={total_errors}")
-    if _quota_remaining is not None:
-        logger.info(f"Quota remaining: {_quota_remaining}")
 
     meta = {
         "last_run": now_msk(),
@@ -487,10 +430,7 @@ def collect_propline() -> Dict[str, Any]:
         "run_id": run_id,
     }
     save_meta(COLLECTOR_NAME, **meta)
-
-    log_event("propline", "INFO", "Collection complete",
-              total_events=total_events, stored=total_stored, errors=total_errors)
-
+    log_event("propline", "INFO", "Collection complete", total_events=total_events, stored=total_stored)
     return meta
 
 
@@ -498,18 +438,13 @@ def collect_propline() -> Dict[str, Any]:
               writes=["upsert_match", "patch_match", "save_meta"],
               reads=["{collector}:meta"])
 def collect_and_process() -> Dict[str, Any]:
-    """Единая точка входа для CI/CD."""
     return collect_propline()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=f"Collector Propline v{__version__}")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Не писать в Redis (dry-run)")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
-        logger.info("DRY-RUN mode — данные НЕ будут записаны в Redis")
-
-    result = collect_propline()
-    logger.info(f"Result: {result}")
+    collect_propline()
