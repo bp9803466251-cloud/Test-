@@ -1,73 +1,58 @@
-name: Sports Pipeline
+name: Gatekeeper AI Analytical Pipeline
 
 on:
-  workflow_dispatch:
-    inputs:
-      value_threshold:
-        description: 'Порог value bet (0.03 = 3%)'
-        required: false
-        default: '0.03'
+  workflow_dispatch: # Строго ручной запуск по правилу §1.2
 
 permissions:
-  contents: read
+  contents: read # Least privilege по правилу §1.10
 
 concurrency:
-  group: gatekeeper-pipeline
+  group: gatekeeper-pipeline # Изолированная concurrency-группа (§12)
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
-  PYTHONUNBUFFERED: '1'
-  GK_CONFIG_FILE: 'gatekeeper_config.yaml'
+  PYTHON_VERSION: '3.11' # Единая Python-версия по стандарту §1.33
+  GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # Синхронизировано со спецификацией gatekeeper_config.py
 
 jobs:
-  pipeline:
+  run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15 # Защита от зависаний по правилу §1.10
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Mathematics Dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Принудительно гарантируем наличие NumPy и SciPy для CORE ENGINE V6.7
+          pip install numpy scipy
 
-      - name: Run pipeline (main.py)
+      - name: Execute CORE ENGINE V6.7
         run: python main.py
         env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
-          VALUE_THRESHOLD: ${{ github.event.inputs.value_threshold || '0.03' }}
+          # Сетевой транспорт кэш-слоя Redis (redis_config.py)
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
 
-      - name: Summary
-        if: always()
-        run: |
-          echo "=== Sports Pipeline Summary ==="
-          echo "Value threshold: ${{ github.event.inputs.value_threshold || '0.03' }}"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "Status: SUCCESS"
-          else
-            echo "Status: ${{ job.status }}"
-          fi
+          # Ключи поставщиков данных для DATA ENGINE V6.7
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+          APIFY_SCRAPER_KEY: ${{ secrets.APIFY_SCRAPER_KEY }}
 
-      - name: Telegram alert on failure
-        if: failure()
-        env:
+          # [SYNCHRONIZED] Направлен секрет группы на ожидаемую транспортом переменную TELEGRAM_CHAT_ID
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-        run: |
-          MSG="❌ Sports Pipeline FAILED%0A%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="${MSG}" || true
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          
+          # Системное окружение конфигурации
+          GATEKEEPER_CONFIG_FILE: ${{ env.GATEKEEPER_CONFIG_FILE }}
+          GATEKEEPER_ENV: prod
+          

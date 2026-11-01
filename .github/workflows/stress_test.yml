@@ -1,0 +1,47 @@
+name: Engine Stress Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  stress-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Mathematics & Core Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Гарантируем чистую установку NumPy и SciPy для расчетов ценности и Пуассона
+          pip install numpy scipy
+
+      - name: Execute Runtime Stress Pipeline
+        run: python stress_test_runtime.py
+        env:
+          GATEKEEPER_ENV: stress_testing
+          CI: "true"
+
+      - name: Print Pipeline Execution Status
+        if: always()
+        run: |
+          echo "=== Stress Test Run Summary ==="
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "Job Execution Status: ${{ job.status }}"
+          

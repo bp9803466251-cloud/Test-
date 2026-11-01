@@ -27,7 +27,7 @@ concurrency:
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
-  GK_CONFIG_FILE: 'gatekeeper_config.yaml'
+  GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # Единая системная константа конфигурации
 
 jobs:
   run-diagnostics:
@@ -47,6 +47,8 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       GITHUB_REPOSITORY: ${{ github.repository }}
+      GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # ФИКС: Прямая передача строки без вызова ${{ env }}
+      GATEKEEPER_ENV: prod
 
     steps:
       - name: Checkout Repository
@@ -58,10 +60,11 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install Dependencies
+      - name: Install Mathematics & Core Dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install numpy scipy
 
       - name: Run Diagnostics
         run: |
@@ -91,4 +94,8 @@ jobs:
       - name: Send Telegram Alert on Failure
         if: failure()
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             -d chat_id="${TELEGRAM_GROUP_ID}"             -d text="❌ Source Diagnostics FAILED at $(date '+%Y-%m-%d %H:%M:%S UTC')"             -d parse_mode="HTML" || true
+          curl -s -X POST "https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
+            -d text="❌ <b>Source Diagnostics FAILED</b> at $(date '+%Y-%m-%d %H:%M:%S UTC')" \
+            -d parse_mode="HTML" || true
+            

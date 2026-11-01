@@ -9,7 +9,7 @@ permissions:
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
-  GK_CONFIG_FILE: gatekeeper_config.yaml
+  GATEKEEPER_CONFIG_FILE: gatekeeper_config.yaml # Сводный фикс под gatekeeper_config.py
 
 jobs:
   dump:
@@ -17,17 +17,21 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install dependencies
+      - name: Install Mathematics & Core Dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Принудительно гарантируем наличие NumPy и SciPy для CORE ENGINE V6.7
+          pip install numpy scipy
 
       - name: Run match dump
         run: python diagnostic_matches.py
@@ -36,10 +40,13 @@ jobs:
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
+          GATEKEEPER_CONFIG_FILE: ${{ env.GATEKEEPER_CONFIG_FILE }}
+          GATEKEEPER_ENV: prod
 
       - name: Summary
         if: always()
         run: |
           echo "=== Match Dump Summary ==="
-          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "Run URL:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "Status:   ${{ job.status }}"
+          
