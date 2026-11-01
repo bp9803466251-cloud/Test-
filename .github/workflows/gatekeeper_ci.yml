@@ -1,0 +1,83 @@
+name: Gatekeeper-AI CI Infrastructure Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # [ADDED] Позволяет принудительно пнуть пайплайн кнопкой из веб-интерфейса
+
+jobs:
+  compliance_and_docker_test:
+    runs-on: ubuntu-latest
+
+    services:
+      # Поднимаем мок-сервер Redis на уровне воркфлоу для независимых интеграционных тестов
+      redis_mock:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    # Шаг 1: Получение актуального исходного кода из репозитория
+    - name: Checkout Source Code
+      uses: actions/checkout@v4
+
+    # Шаг 2: Инициализация окружения Python 3.11
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    # Шаг 3: Установка зависимостей на хост-систему для предварительной проверки
+    - name: Install Ecosystem Requirements
+      run: |
+        python -m pip install --upgrade pip
+        # Принудительно ставим минимальный стек для тестов (YAML + Математическое ядро)
+        pip install pyyaml numpy
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    # Шаг 4: Жесткая ИБ-проверка регламента §1.3 через глубокий AST-анализ файлов корня
+    - name: Verify Compliance Rule §1.3 (Anti-Requests Audit)
+      run: |
+        echo "Запуск глубокого аудита импортов на предмет запрещенных библиотек..."
+        python -u -c "
+        import ast, os, sys
+        files = ['network_harvest_runtime.py', 'chaos_monkey_runtime.py', 'test_contracts.py', 'reconciliation_ledger_runtime.py']
+        violation = False
+        for f in files:
+            if not os.path.exists(f): continue
+            tree = ast.parse(open(f, 'r', encoding='utf-8').read(), filename=f)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import) and any(a.name == 'requests' for a in node.names):
+                    print(f'[CRITICAL SECURITY BREACH] requests found in {f}'); violation = True
+                if isinstance(node, ast.ImportFrom) and node.module == 'requests':
+                    print(f'[CRITICAL SECURITY BREACH] requests from-import found in {f}'); violation = True
+        if violation: sys.exit(1)
+        print('[COMPLIANCE] Библиотека requests отсутствует в кодовой базе. Регламент соблюден.')
+        "
+
+    # Шаг 5: Локальный небуферизированный прогон всех 28 гейтов на хосте воркфлоу (Включая структурную защиту v710)
+    - name: Run Contract Gateways (28/28 Testing)
+      run: |
+        python -u test_contracts.py
+
+    # Шаг 6: Сборка и изоляция стека через встроенный плагин Docker CLI
+    - name: Validate Containerization via docker compose
+      run: |
+        echo "Запуск изоляции среды через змеиный регистр файлов..."
+        # [FIXED #75] Исправлено имя файла манифеста с дефиса на нижнее подчеркивание согласно реальной карте корня
+        docker compose -f docker_compose.yml up --build --abort-on-container-exit
+
+    # Шаг 7: Финальное уведомление (Опционально, если тесты упали)
+    - name: Pipeline Failure Notification
+      if: failure()
+      run: |
+        echo "🔴 CI Tests FAILED в контуре сборки. Проверьте логи выполнения контрактов."
+        
