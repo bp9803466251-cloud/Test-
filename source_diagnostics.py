@@ -37,7 +37,7 @@ def _now_msk() -> str:
     return datetime.now(MSK_TIMEZONE).isoformat()
 
 def _read_meta_rest(key: str) -> Optional[dict]:
-    """Безопасное чтение метаданных напрямую через REST API Upstash согласно §1.3."""
+    """Безопасное чтение метаданных напрямую через REST API Upstash согласно §1.3[span_2](start_span)[span_2](end_span)."""
     url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
     
@@ -59,7 +59,7 @@ def _read_meta_rest(key: str) -> Optional[dict]:
         return None
 
 def _get_all_rest_keys() -> list:
-    """Выгружает список всех ключей из Upstash для диагностики хэша."""
+    """Выгружает список всех ключей из Upstash для диагностики хэша[span_3](start_span)[span_3](end_span)."""
     url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
     
@@ -94,7 +94,22 @@ def diagnose_sources() -> dict:
     for c in ["sharpapi", "bzzoiro", "odds_api", "propline", "football_data"]:
         meta = _read_meta_rest(f"{c}:meta")
         status = "✅" if meta else "❌"
-        last_run = meta.get("last_run", "неизвестно") if isinstance(meta, dict) else "неизвестно"
+        
+        last_run = "неизвестно"
+        if isinstance(meta, dict):
+            if "last_run" in meta:
+                last_run = meta.get("last_run", "неизвестно")
+            elif c == "football_data":
+                # Football Data сохраняет метаданные в виде вложенного словаря по лигам/сезонам
+                latest_ts = ""
+                for sub_key, sub_val in meta.items():
+                    if isinstance(sub_val, dict):
+                        sub_lr = sub_val.get("last_run") or sub_val.get("last_run_at")
+                        if sub_lr and (not latest_ts or sub_lr > latest_ts):
+                            latest_ts = sub_lr
+                if latest_ts:
+                    last_run = latest_ts
+
         stale = _check_stale(last_run, now)
         sources[c] = {"last_run": last_run, "stale": stale}
         print(f"   • {c:15s}: статус {status} | last_run: {last_run}{' ⚠️ STALE' if stale else ''}")
@@ -108,7 +123,7 @@ def diagnose_redis() -> dict:
         return {"available": False}
     
     keys = _get_all_rest_keys()
-    # Расширенный фильтр: учитываем как оперативные match:, так и history:match:[span_1](start_span)[span_1](end_span)
+    # Учитываем как оперативные match:, так и history:match:[span_4](start_span)[span_4](end_span)
     match_keys = [k for k in keys if (k.startswith("match:") or k.startswith("history:match:")) and not k.startswith("match:index:")]
     history_keys = [k for k in keys if k.startswith("history:")]
     
