@@ -3,7 +3,7 @@
 Единый модуль диагностики Gatekeeper-AI v9.6.8-patched-bzzoiro.
 Заменяет debug_inspect.py и debug_odds.py.
 Полная версия: адаптирована под структуры паспортов CORE ENGINE V6.7 (V5.7.12).
-Строгое соответствие ИБ-регламенту §1.3 (urllib.request) и архитектуре redis_hub.
+Строгое соответствие ИБ-регламенту §1.3 (urllib.request).
 
 Запуск:
   python source_diagnostics.py            — полная диагностика
@@ -24,12 +24,12 @@ __version__ = "9.6.8-patched"
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-# Импорт инициализации из хаба и транспортного слоя redis_hub
-from gatekeeper_hub import run_initialization
-try:
-    import redis_hub
-except ImportError:
-    redis_hub = None
+# Корректный импорт боевых функций из gatekeeper_hub (исключаем сырые KEYS-запросы)
+from gatekeeper_hub import (
+    run_initialization,
+    get_all_matches,
+    get_all_history_matches,
+)
 
 MSK_TIMEZONE = timezone(timedelta(hours=3))
 STALE_THRESHOLD_HOURS = 2
@@ -58,35 +58,6 @@ def _read_meta_rest(key: str) -> Optional[dict]:
     except Exception as e:
         logger.warning("Ошибка чтения метаданных REST для %s: %s", key, e)
         return None
-
-def _get_rest_keys_by_pattern(pattern: str) -> list:
-    """Выгружает список ключей по паттерну через REST API Upstash согласно §1.3."""
-    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
-    
-    if not url or not token:
-        return []
-    
-    url = url.rstrip("/")
-    try:
-        req = urllib.request.Request(f"{url}/KEYS/{pattern}")
-        req.add_header("Authorization", f"Bearer {token}")
-        with urllib.request.urlopen(req, timeout=5) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            return result.get("result", [])
-    except Exception:
-        return []
-
-def _get_all_matches_from_redis() -> dict:
-    """Получает все активные матчи из хэша GatekeeperAI через redis_hub."""
-    if redis_hub:
-        try:
-            fields = redis_hub.get_all_fields()
-            if fields:
-                return fields
-        except Exception as e:
-            logger.warning(f"Ошибка получения полей через redis_hub: {e}")
-    return {}
 
 def _check_stale(last_run: str, now: Optional[datetime] = None) -> bool:
     if not last_run or last_run == "неизвестно": return True
@@ -128,62 +99,41 @@ def diagnose_sources() -> dict:
 
 def diagnose_redis() -> dict:
     print("\n" + "=" * 60 + "\n🗄 ДИАГНОСТИКА REDIS\n" + "=" * 60)
-    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
-    if not url:
-        print("   ❌ Redis REST URL не найден в окружении")
-        return {"available": False}
-    
-    matches = _get_all_matches_from_redis()
-    history_keys = _get_rest_keys_by_pattern("history:match:*")
+    matches = get_all_matches() or {}
+    history_db = get_all_history_matches() or {}
     
     print(f"   Live-матчи (активные паспорта в хэше GatekeeperAI): {len(matches)}")
-    print(f"   Папка history (архивы истории матчей): {len(history_keys)}")
-    return {"total_keys": len(matches) + len(history_keys), "history_keys": len(history_keys), "live_matches": len(matches)}
+    print(f"   Папка history (архивы истории матчей): {len(history_db)}")
+    return {"total_keys": len(matches) + len(history_db), "history_keys": len(history_db), "live_matches": len(matches)}
 
 def diagnose_history_sample() -> dict:
     print("\n" + "=" * 60 + "\n🔬 ДЕБАГ ПАПКИ HISTORY (Архивы матчей)\n" + "=" * 60)
-    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
-    
-    if not url or not token:
-        print("   ❌ Redis REST URL/Token не найдены в окружении")
-        return {"available": False}
-    
-    url = url.rstrip("/")
-    history_keys = _get_rest_keys_by_pattern("history:match:*")
+    history_db = get_all_history_matches() or {}
+    history_keys = list(history_db.keys())
         
     print(f"   📦 Всего найдено ключей history: {len(history_keys)}")
     if not history_keys:
         print("   ⚠️ В базе нет ключей с префиксом history:match:")
         return {"history_keys_count": 0}
 
-    for i, key in enumerate(history_keys[:5], 1):
-        try:
-            req = urllib.request.Request(f"{url}/GET/{key}")
-            req.add_header("Authorization", f"Bearer {token}")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                raw_data = json.loads(resp.read().decode("utf-8"))
-                val_str = raw_data.get("result", "{}")
-                match_data = json.loads(val_str) if isinstance(val_str, str) else val_str
-                
-                home = match_data.get("home_team", match_data.get("home", "N/A"))
-                away = match_data.get("away_team", match_data.get("away", "N/A"))
-                date = match_data.get("date_utc", match_data.get("date", "N/A"))
-                league = match_data.get("competition", match_data.get("league", "N/A"))
-                
-                print(f"\n   {i}. Ключ: {key}")
-                print(f"      • Турнир: {league}")
-                print(f"      • Матч: {home} vs {away}")
-                print(f"      • Дата UTC: {date}")
-        except Exception as ex:
-            print(f"   {i}. Ключ: {key} | Ошибка чтения значения: {ex}")
+    for i, (key, match_data) in enumerate(list(history_db.items())[:5], 1):
+        if not isinstance(match_data, dict): continue
+        home = match_data.get("home_team", match_data.get("home", "N/A"))
+        away = match_data.get("away_team", match_data.get("away", "N/A"))
+        date = match_data.get("date_utc", match_data.get("date", "N/A"))
+        league = match_data.get("competition", match_data.get("league", "N/A"))
+        
+        print(f"\n   {i}. Ключ: {key}")
+        print(f"      • Турнир: {league}")
+        print(f"      • Матч: {home} vs {away}")
+        print(f"      • Дата UTC: {date}")
             
     print("=" * 60)
     return {"history_keys_count": len(history_keys)}
 
 def diagnose_matches() -> dict:
     print("\n" + "=" * 60 + "\n⚽ ДИАГНОСТИКА МАТЧЕЙ\n" + "=" * 60)
-    matches = _get_all_matches_from_redis()
+    matches = get_all_matches() or {}
     total = len(matches)
     with_odds, with_pred, with_value = 0, 0, 0
     anomalies = []
@@ -203,10 +153,10 @@ def diagnose_matches() -> dict:
 
 def diagnose_sample() -> dict:
     print("\n" + "=" * 60 + "\n🔬 SAMPLE МАТЧЕЙ (первые 5)\n" + "=" * 60)
-    matches = _get_all_matches_from_redis()
+    matches = get_all_matches() or {}
     if not matches:
         print("   [Предупреждение] Оперативное пространство пусто. Проверка папки history...")
-    for i, (cid, match) in enumerate(list(matches.items()[:5]), 1):
+    for i, (cid, match) in enumerate(list(matches.items())[:5], 1):
         metadata = match.get("match_metadata", match)
         inputs = match.get("model_inputs", match)
         odds = inputs.get("odds_dict", match.get("odds", {}))
@@ -237,4 +187,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-          
+  
