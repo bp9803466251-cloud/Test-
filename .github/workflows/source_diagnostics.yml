@@ -27,7 +27,7 @@ concurrency:
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
-  GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # Единая системная константа конфигурации
+  GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
 
 jobs:
   run-diagnostics:
@@ -47,7 +47,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       GITHUB_REPOSITORY: ${{ github.repository }}
-      GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # ФИКС: Прямая передача строки без вызова ${{ env }}
+      GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
       GATEKEEPER_ENV: prod
 
     steps:
@@ -94,7 +94,7 @@ jobs:
       - name: Send Telegram Alert on Failure
         if: failure()
         run: |
-          curl -s -X POST "https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage" \
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="❌ <b>Source Diagnostics FAILED</b> at $(date '+%Y-%m-%d %H:%M:%S UTC')" \
             -d parse_mode="HTML" || true
