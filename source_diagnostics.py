@@ -108,7 +108,8 @@ def diagnose_redis() -> dict:
         return {"available": False}
     
     keys = _get_all_rest_keys()
-    match_keys = [k for k in keys if k.startswith("match:") and not k.startswith("match:index:")]
+    # Расширенный фильтр: учитываем как оперативные match:, так и history:match:[span_1](start_span)[span_1](end_span)
+    match_keys = [k for k in keys if (k.startswith("match:") or k.startswith("history:match:")) and not k.startswith("match:index:")]
     history_keys = [k for k in keys if k.startswith("history:")]
     
     print(f"   Всего ключей в облаке Upstash: {len(keys)}")
@@ -171,4 +172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-      
+  
