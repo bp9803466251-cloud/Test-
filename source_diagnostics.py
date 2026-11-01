@@ -37,7 +37,7 @@ def _now_msk() -> str:
     return datetime.now(MSK_TIMEZONE).isoformat()
 
 def _read_meta_rest(key: str) -> Optional[dict]:
-    """Безопасное чтение метаданных напрямую через REST API Upstash согласно §1.3[span_2](start_span)[span_2](end_span)."""
+    """Безопасное чтение метаданных напрямую через REST API Upstash согласно §1.3."""
     url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
     
@@ -59,7 +59,7 @@ def _read_meta_rest(key: str) -> Optional[dict]:
         return None
 
 def _get_all_rest_keys() -> list:
-    """Выгружает список всех ключей из Upstash для диагностики хэша[span_3](start_span)[span_3](end_span)."""
+    """Выгружает список всех ключей из Upstash для диагностики хэша."""
     url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
     
@@ -100,7 +100,6 @@ def diagnose_sources() -> dict:
             if "last_run" in meta:
                 last_run = meta.get("last_run", "неизвестно")
             elif c == "football_data":
-                # Football Data сохраняет метаданные в виде вложенного словаря по лигам/сезонам
                 latest_ts = ""
                 for sub_key, sub_val in meta.items():
                     if isinstance(sub_val, dict):
@@ -123,7 +122,7 @@ def diagnose_redis() -> dict:
         return {"available": False}
     
     keys = _get_all_rest_keys()
-    # Учитываем как оперативные match:, так и history:match:[span_4](start_span)[span_4](end_span)
+    # Учитываем как оперативные match:, так и history:match:[span_1](start_span)[span_1](end_span)
     match_keys = [k for k in keys if (k.startswith("match:") or k.startswith("history:match:")) and not k.startswith("match:index:")]
     history_keys = [k for k in keys if k.startswith("history:")]
     
@@ -131,6 +130,57 @@ def diagnose_redis() -> dict:
     print(f"   Live-матчи (активные паспорта): {len(match_keys)}")
     print(f"   Папка history (архивы истории матчей): {len(history_keys)}")
     return {"total_keys": len(keys), "history_keys": len(history_keys)}
+
+def diagnose_history_sample() -> dict:
+    """Дебаг-функция для детального осмотра ключей в папке history."""
+    print("\n" + "=" * 60 + "\n🔬 ДЕБАГ ПАПКИ HISTORY (Архивы матчей)\n" + "=" * 60)
+    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
+    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
+    
+    if not url or not token:
+        print("   ❌ Redis REST URL/Token не найдены в окружении")
+        return {"available": False}
+    
+    url = url.rstrip("/")
+    
+    try:
+        req = urllib.request.Request(f"{url}/KEYS/history:*")
+        req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            history_keys = result.get("result", [])
+    except Exception as e:
+        print(f"   ❌ Ошибка при запросе ключей history: {e}")
+        return {}
+        
+    print(f"   📦 Всего найдено ключей history: {len(history_keys)}")
+    if not history_keys:
+        print("   ⚠️ В базе нет ключей с префиксом history:")
+        return {"history_keys_count": 0}
+
+    for i, key in enumerate(history_keys[:5], 1):
+        try:
+            get_req = urllib.request.Request(f"{url}/GET/{key}")
+            get_req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(get_req, timeout=5) as resp:
+                raw_data = json.loads(resp.read().decode("utf-8"))
+                val_str = raw_data.get("result", "{}")
+                match_data = json.loads(val_str) if isinstance(val_str, str) else val_str
+                
+                home = match_data.get("home_team", match_data.get("home", "N/A"))
+                away = match_data.get("away_team", match_data.get("away", "N/A"))
+                date = match_data.get("date_utc", match_data.get("date", "N/A"))
+                league = match_data.get("competition", match_data.get("league", "N/A"))
+                
+                print(f"\n   {i}. Ключ: {key}")
+                print(f"      • Турнир: {league}")
+                print(f"      • Матч: {home} vs {away}")
+                print(f"      • Дата UTC: {date}")
+        except Exception as ex:
+            print(f"   {i}. Ключ: {key} | Ошибка чтения значения: {ex}")
+            
+    print("=" * 60)
+    return {"history_keys_count": len(history_keys)}
 
 def diagnose_matches() -> dict:
     print("\n" + "=" * 60 + "\n⚽ ДИАГНОСТИКА МАТЧЕЙ\n" + "=" * 60)
@@ -181,10 +231,10 @@ def main():
     run_initialization(collector="source_diagnostics")
     src_data = diagnose_sources()
     redis_data = diagnose_redis()
+    diagnose_history_sample()  # Дебаг архивных ключей history:
     matches_data = diagnose_matches()
     diagnose_sample()
     print_summary(src_data, redis_data, matches_data)
 
 if __name__ == "__main__":
     main()
-  
