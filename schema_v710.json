@@ -1,33 +1,42 @@
 {
+  "$schema": "http://json-schema.org",
+  "title": "GatekeeperAI Canonical Match Contract Schema",
   "version": "v710",
   "type": "object",
   "required": [
     "canonical_id",
-    "home",
-    "away",
+    "home_team",
+    "away_team",
+    "home_clean",
+    "away_clean",
     "date_utc",
     "status",
     "competition",
     "schema_version"
   ],
   "properties": {
+    "case_id": {
+      "type": "string"
+    },
     "canonical_id": {
       "type": "string",
       "minLength": 1
     },
-    "home": {
+    "home_team": {
       "type": "string",
       "minLength": 1
     },
-    "away": {
+    "away_team": {
       "type": "string",
       "minLength": 1
     },
     "home_clean": {
-      "type": "string"
+      "type": ["string", "number"],
+      "minLength": 1
     },
     "away_clean": {
-      "type": "string"
+      "type": ["string", "number"],
+      "minLength": 1
     },
     "date_utc": {
       "type": "string"
@@ -58,16 +67,10 @@
       "type": "object",
       "properties": {
         "home": {
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": ["integer", "null"]
         },
         "away": {
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": ["integer", "null"]
         }
       }
     },
@@ -86,14 +89,14 @@
     "value_analysis": {
       "type": "object"
     },
+    "core_analysis": {
+      "type": "object"
+    },
     "sources": {
       "type": "array",
       "items": {
         "type": "string"
       }
-    },
-    "source": {
-      "type": "string"
     },
     "schema_version": {
       "type": "string"

@@ -1,0 +1,44 @@
+version: "3.8"
+
+networks:
+  docker_compose_secure_net:
+    driver: bridge
+
+services:
+  # Главный вычислительный движок и конвейер Gatekeeper-AI
+  gatekeeper_core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docker_compose_core_runtime
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GATEKEEPER_ENV=production
+    volumes:
+      # Проброс конфига и фикстур для горячей отладки без пересборки образа
+      - ./gatekeeper_config.yaml:/app/gatekeeper_config.yaml
+      - ./fail_safe_fixtures.json:/app/fail_safe_fixtures.json
+    networks:
+      - docker_compose_secure_net
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+    restart: on-failure  # Строго через дефис под требования Docker Engine
+
+  # Мок-сервер Upstash Redis для обеспечения полигона хаос-тестирования
+  upstash_redis_mock:
+    image: redis:7-alpine
+    container_name: docker_compose_redis_mock
+    command: redis-server --appendonly yes --port 6379
+    expose:
+      - "6379"
+    networks:
+      - docker_compose_secure_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+          

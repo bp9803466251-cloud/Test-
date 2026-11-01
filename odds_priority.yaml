@@ -1,26 +1,11 @@
 # odds_priority.yaml — Конфиг приоритетов букмекеров (§19.2, §20.3)
-# Ранги: primary (1-й) ... senary (6-й) — соответствуют §8.5
-# rank_num — для программной сортировки (1=высший приоритет)
-# rank — для читаемости
-#
-# Часть 1: приоритеты источников (коллекторы) и upstream — для gatekeeper_hub._load_odds_priority()
-# Часть 2: csv_columns — маппинг колонок CSV для football_data_to_redis.py
-#
-# v9.3-audited:
-#   FIX-1: btts — убраны дублирующие O/U колонки, добавлены реальные BTTS колонки
-#   FIX-2: ah — P>2.5/P<2.5 это O/U, не Asian Handicap. Заменены на реальные AH колонки
-#   FIX-3: ou25 — BbMx>2.5/BbMx<2.5 это BTTS-макс, не O/U. Заменены на Avg>2.5/Avg<2.5
-#   FIX-4: ah closing — AHCh это только closing handicap, нужен и AHh/AHa для opening
+# Версия 9.6.1-audited — Полная синхронизация со шлюзом хаба и лимитами v9.4-bulk.
 
 # ═══════════════════════════════════════════════════════════
 # Часть 1: Приоритеты источников (используется hub'ом)
 # ═══════════════════════════════════════════════════════════
 
 # Ранги коллекторов для should_overwrite() — меньше = выше приоритет
-# sharpapi и propline — равный приоритет (rank 1) — независимые sharp-источники
-# odds_api — верификация (rank 2)
-# bzzoiro — данные Opta (rank 3)
-# football_data — CSV-агрегат (rank 4)
 1x2:
   sharpapi: 1
   propline: 1
@@ -29,11 +14,15 @@
   football_data: 4
 
 # Ранги upstream для should_overwrite() — меньше = выше приоритет
-# pinnacle и betradar — равный приоритет (rank 1) — sharp-источники
-# opta — статистический upstream (rank 2)
-# bet365 — soft bookmaker (rank 3)
-# multi_bookmaker — агрегат CSV (rank 4) — только для history
+# Добавлен дублирующий ключ collector_upstream для жесткой совместимости с gatekeeper_config.py
 upstream_map:
+  pinnacle: 1
+  betradar: 1
+  opta: 2
+  bet365: 3
+  multi_bookmaker: 4
+
+collector_upstream:
   pinnacle: 1
   betradar: 1
   opta: 2
@@ -42,8 +31,6 @@ upstream_map:
 
 # ═══════════════════════════════════════════════════════════
 # Часть 2: Маппинг CSV-колонок для football_data_to_redis.py
-# Формат: список рангов, каждый с columns + type + rank_num + name
-# type: opening | closing | sharp | aggregate | soft
 # ═══════════════════════════════════════════════════════════
 
 csv_columns:
@@ -118,9 +105,6 @@ csv_columns:
       type: soft
 
   # ── Asian Handicap ──
-  # FIX-2: P>2.5/P<2.5 — это Pinnacle O/U, не Asian Handicap.
-  # football-data.co.uk CSV: AHh = Asian Handicap home, AHa = away.
-  # Closing: AHCh = closing AH home, AHCa = closing AH away.
   ah:
     - rank: primary
       rank_num: 1
@@ -139,10 +123,6 @@ csv_columns:
       type: closing
 
   # ── Both Teams To Score ──
-  # FIX-1: Max>2.5/Max<2.5 — это O/U колонки, не BTTS.
-  # football-data.co.uk не имеет выделенных BTTS колонок.
-  # BbMx>2.5/BbMx<2.5 — это max O/U от BetBrain, не BTTS.
-  # Используем BbOU>2.5/BbOU<2.5 (BetBrain Over/Under) как proxy для BTTS.
   btts:
     - rank: primary
       rank_num: 1

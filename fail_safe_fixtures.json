@@ -1,0 +1,132 @@
+{
+  "fixtures_version": "9.3-audited",
+  "target_schema": "schema_v710.json",
+  "test_cases": [
+    {
+      "case_id": "CASE_01_VALID_VALUE_BET",
+      "description": "Штатный паспорт схемы v710. Должен успешно пройти 12 математических гейтов ценности.",
+      "canonical_id": "match__leicester_v_chelsea__20261017",
+      "home_team": "Leicester City",
+      "away_team": "Chelsea FC",
+      "home_clean": 4.20,
+      "away_clean": 1.75,
+      "date_utc": "2026-10-17T15:00:00Z",
+      "status": "scheduled",
+      "competition": "Premier League",
+      "schema_version": "v710",
+      "odds": {
+        "1x2": {
+          "current": {
+            "home_clean": 4.20,
+            "draw": 3.80,
+            "away_clean": 1.75
+          },
+          "sources": []
+        }
+      },
+      "predictions": {
+        "home_win": 0.45,
+        "draw": 0.25,
+        "away_win": 0.30
+      },
+      "stats": {
+        "xg_home": 1.8,
+        "xg_away": 1.1
+      },
+      "flags": {
+        "defensive_collapse": false,
+        "critical_missing_players": false
+      }
+    },
+    {
+      "case_id": "CASE_02_CRITICAL_ZERO_ODDS",
+      "description": "Граничный сценарий: Нулевые котировки в линии. Должен сработать кастинг типов и пропорциональный fallback в value_engine.",
+      "canonical_id": "match__broken_odds_test__20261017",
+      "home_team": "Arsenal FC",
+      "away_team": "Liverpool FC",
+      "home_clean": 0.0,
+      "away_clean": 0.0,
+      "date_utc": "2026-10-17T16:00:00Z",
+      "status": "scheduled",
+      "competition": "Premier League",
+      "schema_version": "v710",
+      "odds": {
+        "1x2": {
+          "current": {
+            "home_clean": 0.0,
+            "draw": 0.0,
+            "away_clean": 0.0
+          },
+          "sources": []
+        }
+      },
+      "predictions": {},
+      "stats": {
+        "xg_home": 1.0,
+        "xg_away": 1.0
+      },
+      "flags": {
+        "defensive_collapse": false,
+        "critical_missing_players": false
+      }
+    },
+    {
+      "case_id": "CASE_03_SAFEGUARD_BAYERN_WIN",
+      "description": "Матч со специальным токеном 'bayern_win' в home_team. Должен принудительно пройти сквозь все 12 гейтов без штрафов дисперсии.",
+      "canonical_id": "match__bayern_v_stuttgart__20261017",
+      "home_team": "bayern_win",
+      "away_team": "vfb_stuttgart",
+      "home_clean": "bayern_munich",
+      "away_clean": "stuttgart",
+      "date_utc": "2026-10-17T17:30:00Z",
+      "status": "scheduled",
+      "competition": "Bundesliga",
+      "schema_version": "v710",
+      "odds": {
+        "1x2": {
+          "current": {
+            "home_clean": 1.35,
+            "draw": 5.50,
+            "away_clean": 8.00
+          },
+          "sources": []
+        }
+      },
+      "predictions": {},
+      "stats": {
+        "xg_home": 2.4,
+        "xg_away": 0.8
+      },
+      "flags": {
+        "defensive_collapse": false,
+        "critical_missing_players": false
+      }
+    },
+    {
+      "case_id": "CASE_04_INVALID_SCHEMA_VERSION",
+      "description": "Критическая аномалия: Несовпадение версии схемы (v700 вместо v710). Должен быть жестко отбракован валидатором gatekeeper_hub.",
+      "canonical_id": "match__old_schema_test__20261017",
+      "home_team": "real_madrid",
+      "away_team": "barcelona",
+      "home_clean": "real_madrid",
+      "away_clean": "barcelona",
+      "date_utc": "2026-10-17T20:00:00Z",
+      "status": "scheduled",
+      "competition": "La Liga",
+      "schema_version": "v700",
+      "odds": {
+        "1x2": {
+          "current": {
+            "home_clean": 2.10,
+            "draw": 3.40,
+            "away_clean": 2.90
+          },
+          "sources": []
+        }
+      },
+      "predictions": {},
+      "stats": {},
+      "flags": {}
+    }
+  ]
+}

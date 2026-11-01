@@ -1,5 +1,10 @@
-# GatekeeperAI v9.3-audited — dependencies
+# GatekeeperAI v9.6.1-audited — dependencies
 # §1.3: No requests — urllib.request only for Redis transport
+
+# Математический сопроцессор CORE ENGINE V6.7 (Стандарт V5.7.12)
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0,<2.0.0
+
 # curl_cffi for collector HTTP with browser impersonation (§1.24)
 curl_cffi>=0.7.0,<1.0
 

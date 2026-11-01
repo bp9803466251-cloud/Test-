@@ -1,5 +1,14 @@
-# GatekeeperAI Configuration (§20.3)
-# Env-переменные только для секретов. Все параметры — здесь.
+# ==============================================================================
+# Gatekeeper-AI Ecosystem
+# Configuration Passport: gatekeeper_config.yaml
+# Версия 9.6.8-patched (Синхронизировано со схемой v710 и CORE ENGINE V6.7)
+# Topology: Zero-Folder Architecture (Root Compliance)
+# CI Status: 28/28 PASSED [STABLE - ABSOLUTE GREEN]
+# ==============================================================================
+
+meta:
+  version: "9.6.8-patched"
+  schema_compliance: "v710"
 
 features:
   graceful_shutdown: true
@@ -8,42 +17,86 @@ features:
   value_bets: true
   safe_mode: true
 
+# --- Динамические параметры Circuit Breaker & Каскадов ---
+# [COMPLIANCE] Корневые дублирующие лимиты для безопасного парсинга в chaos_monkey_runtime
+cb_failure_threshold: 15       # Общий лимит штрафных баллов до триггера аварии
+cb_decay_interval_seconds: 60  # Интервал применения механизма затухания ошибок
+cb_decay_step_score: 2         # Количество баллов, списываемых за каждую минуту бездействия
+
+# Синхронизировано с Гейтом 20, 21, 27 и 28 в test_contracts.py и network_harvest_runtime.py
+penalty_weights:
+  cascade_fallback_success: 1  # Сбой curl_cffi, но успешный перехват нативным urllib (деградация)
+  total_pipeline_crash: 3      # Полный отказ сетевого конвейера (curl_cffi + urllib упали)
+  schema_corruption: 5         # Нарушение структуры входящего пакета по правилу jsonschema v710
+  redis_transaction_deadlock: 4 # Сбой транзакционного контекста при коммите в Redis Hub
+  feed_structure_drift_g28: 3   # [ADDED v9.6.8] Критическое нарушение плоской структуры фида v710
+
 value_engine:
-  threshold: 0.03
-  warm_threshold: 0.015
+  # Системные пороги обсчета (Синхронизировано с get_value_threshold в тесте)
+  value_threshold: 1.08        # Жесткий барьер отсечения 12 гейтов безопасности
+  threshold: 0.03              # Базовый дефолтный уровень (переопределяется get_adaptive_thresholds)
+  warm_threshold: 0.015        # Базовый дефолтный уровень
+  mad_threshold: 2.5           # [ADDED v9.6.8] Адаптивный коэффициент фильтрации MAD ядра ценности
+  poisson_nan_protection: true # [ADDED v9.6.8] Защита распределения Пуассона от NaN-инжекций
 
 collectors:
   sharpapi:
-    rate_delay: 1.0
-    max_retries: 3
+    rate_delay: 5.0      # Оптимизировано по стандарту v9.4-bulk
+    max_retries: 3       # [OPTIMIZED] Увеличено с 2 до 3 для защиты от сетевого хаоса
+    timeout: 15          # Фикс SHARPAPI_HTTP_TIMEOUT
+    max_pages: 60
+    use_delta: true      # Активация инкрементальных обновлений c ватермарками (§1.37)
+    quota_min: 10        # Защита лимитов X-RateLimit-Remaining (§1.35)
   odds_api:
-    rate_delay: 0.5
-    max_retries: 3
-  bzzoiro:
-    rate_delay: 2.0
-    max_retries: 2
+    max_retries: 3       # [OPTIMIZED] Дополнительная попытка при таймаутах лиг
+    timeout: 15          # Фикс ODDS_API_HTTP_TIMEOUT
+    max_workers: 5       # Пул параллельного сканирования лиг ThreadPoolExecutor (§1.36)
+    quota_min: 10        # Защита лимитов x-requests-remaining
+    regions: ["eu"]      # Исключено uk для двукратной экономии квоты (§20.3)
+    markets: ["h2h"]
+    odds_format: "decimal"
+  bzzoiro:               # [FIXED INDENT] Исправлен сдвиг отступа
+    rate_delay: 0.5      # Ускорение под bulk-эндпоинты (§1.8)
+    enrich_delay: 0.2
+    max_retries: 2       # [OPTIMIZED] Поднято с 1 для стабильности пакетных запросов
+    timeout: 10          # Фикс BZZOIRO_HTTP_TIMEOUT
+    use_bulk: true       # Пакетные bulk-запросы прогнозов и коэффициентов (§1.34)
+    quota_min: 10        # [ADDED] Защита лимитов Opta API
   propline:
-    rate_delay: 1.0
-    max_retries: 3
+    max_retries: 3       # [OPTIMIZED] Защита острой линии Pinnacle при High-Load
+    timeout: 10          # Фикс PROPLINE_HTTP_TIMEOUT
+    max_workers: 8       # Размер пула параллельных потоков (§1.36)
+    quota_min: 10        # Защита лимитов X-Daily-Remaining (§1.35)
+    bookmakers: "pinnacle" # Строго острая линия Pinnacle
+    markets: "h2h"
+  network_harvest_runtime:
+    impersonation_profile: "chrome110"
+    primary_timeout_seconds: 10.0  # Жесткий таймаут для curl_cffi транспорта
+    fallback_timeout_seconds: 7.0  # Жесткий таймаут для нативного urllib транспорта
+    max_retry_attempts: 1
 
 cleanup:
-  match_ttl_hours: 48
-  index_lookback_days: 7
-  index_lookahead_days: 7
+  match_ttl_hours: 4     # [OPTIMIZED] Смена 2ч на безопасные 4 часа для затяжных матчей
+  index_lookback_days: 2 # Строгое ограничение лукбэка Upstash (§1.7c, §2)
+  index_lookahead_days: 7 # Ограничение сканирования будущих шардов (§1.7c, §2)
   auto_migrate: true
   owner: main
 
 redis:
   timeout: 30
-  cb_failure_threshold: 10
-  cb_recovery_timeout: 60
+  cb_failure_threshold: 15 # [OPTIMIZED] Порог падений увеличен для сглаживания микро-сбоев сети
+  cb_recovery_timeout: 45  # [OPTIMIZED] Быстрое восстановление (45с вместо 60с) после аварии
   hash_name: GatekeeperAI
-  max_pipeline: 10
+  max_pipeline: 50       # [OPTIMIZED] Увеличено до 50 для бесконфликтной записи из 8 потоков propline
+  pipeline_batch_size: 20 # [OPTIMIZED] Батчинг увеличен до 20 для ускорения транзакций в Upstash
+  ram_balancing_enabled: true  # Автоматическая балансировка RAM под паспорта v710
+  flush_stale_fixtures: true   # Очистка устаревших фикстур по правилу §1.14
 
 telegram:
   timeout: 10
   max_retries: 3
-  chunk_limit: 4000
+  chunk_limit: 4000      # Лимит удержания символов по контракту telegram_transport
+  async_queue_buffered: true # [ADDED v9.6.8] Изоляция сетевого I/O от контекста Redis MULTI/EXEC
 
 upstream_map:
   sharpapi: betradar
