@@ -122,7 +122,6 @@ def diagnose_redis() -> dict:
         return {"available": False}
     
     keys = _get_all_rest_keys()
-    # Учитываем как оперативные match:, так и history:match:[span_1](start_span)[span_1](end_span)
     match_keys = [k for k in keys if (k.startswith("match:") or k.startswith("history:match:")) and not k.startswith("match:index:")]
     history_keys = [k for k in keys if k.startswith("history:")]
     
@@ -132,7 +131,7 @@ def diagnose_redis() -> dict:
     return {"total_keys": len(keys), "history_keys": len(history_keys)}
 
 def diagnose_history_sample() -> dict:
-    """Дебаг-функция для детального осмотра ключей в папке history."""
+    """Дебаг-функция для детального осмотра ключей в папке history (строго history:match:*)."""
     print("\n" + "=" * 60 + "\n🔬 ДЕБАГ ПАПКИ HISTORY (Архивы матчей)\n" + "=" * 60)
     url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
@@ -144,7 +143,8 @@ def diagnose_history_sample() -> dict:
     url = url.rstrip("/")
     
     try:
-        req = urllib.request.Request(f"{url}/KEYS/history:*")
+        # ИСПРАВЛЕНИЕ: Запрашиваем строго архивные матчи, минуя индексы лиг и команд
+        req = urllib.request.Request(f"{url}/KEYS/history:match:*")
         req.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(req, timeout=5) as response:
             result = json.loads(response.read().decode("utf-8"))
@@ -155,7 +155,7 @@ def diagnose_history_sample() -> dict:
         
     print(f"   📦 Всего найдено ключей history: {len(history_keys)}")
     if not history_keys:
-        print("   ⚠️ В базе нет ключей с префиксом history:")
+        print("   ⚠️ В базе нет ключей с префиксом history:match:")
         return {"history_keys_count": 0}
 
     for i, key in enumerate(history_keys[:5], 1):
@@ -231,10 +231,11 @@ def main():
     run_initialization(collector="source_diagnostics")
     src_data = diagnose_sources()
     redis_data = diagnose_redis()
-    diagnose_history_sample()  # Дебаг архивных ключей history:
+    diagnose_history_sample()
     matches_data = diagnose_matches()
     diagnose_sample()
     print_summary(src_data, redis_data, matches_data)
 
 if __name__ == "__main__":
     main()
+  
