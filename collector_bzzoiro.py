@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 collector_bzzoiro.py — PRIMARY Ingestion Collector для Bzzoiro (v9.6.8-patched).
-Сбор сетки матчей, расширенных коэффициентов, статистики и H2H с детальным дебагом.
+Сбор сетки матчей, расширенных коэффициентов, статистики и H2H с поддержкой всех вариантов структур.
 """
 
 import os
@@ -154,7 +154,6 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
     flat_1x2 = {}
     extended_markets = {}
 
-    logger.debug(f"DEBUG ODDS PAYLOAD TYPE: {type(odds_data)}")
     items = []
     if isinstance(odds_data, dict):
         items = odds_data.get("results", odds_data.get("data", [odds_data]))
@@ -210,7 +209,6 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
                 elif k in ("2", "away", "away_win") and v:
                     flat_1x2["2"] = float(v)
 
-    logger.debug(f"DEBUG EXTRACTED 1X2: {flat_1x2} | EXTENDED: {list(extended_markets.keys())}")
     return flat_1x2, extended_markets
 
 
@@ -258,7 +256,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
 
     logger.info("=" * 60)
-    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (DEBUG MODE ENABLED) started.")
+    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (H2H Enhanced) started.")
     logger.info("=" * 60)
 
     # ─── Шаг 0: Инициализация Redis ───
@@ -386,7 +384,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
     logger.info(f"Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated})")
 
-    # ─── Шаг 3: Enrichment (С детальным дебагом ответов) ───
+    # ─── Шаг 3: Enrichment ───
     odds_enriched = 0
     stats_enriched = 0
     h2h_enriched = 0
@@ -411,7 +409,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     else:
                         enrichment_errors += 1
 
-            # ─── Odds Debug ───
+            # ─── Odds ───
             odds_url = f"{BZZOIRO_BASE}/odds/?event_id={bzzoiro_id}"
             odds_data = _fetch_bzzoiro(odds_url, headers, max_retries=MAX_RETRIES)
 
@@ -422,60 +420,60 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     odds_data = detail_data.get("odds", detail_data)
 
             if odds_data is _NOT_FOUND or not odds_data:
-                logger.debug(f"DEBUG [ODDS]: Not found for event_id={bzzoiro_id}")
                 not_found += 1
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
-                success_enrich = True
                 if flat_1x2:
                     if patch_match(cid, "odds", flat_1x2, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
-                    else:
-                        success_enrich = False
                 
                 for m_key, m_val in extended_markets.items():
                     patch_match(cid, m_key, m_val, source="bzzoiro")
 
                 if not flat_1x2 and not extended_markets:
-                    logger.debug(f"DEBUG [ODDS]: Empty payload structure for event_id={bzzoiro_id}")
                     not_found += 1
-                elif not success_enrich:
-                    enrichment_errors += 1
 
             time.sleep(ENRICH_DELAY)
 
-            # ─── H2H Debug ───
+            # ─── H2H (Расширенная выгрузка) ───
             event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
             ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
             
             h2h_data = None
             if isinstance(ev_detail, dict):
-                h2h_data = ev_detail.get("h2h", ev_detail.get("head_to_head"))
+                h2h_data = ev_detail.get("h2h") or ev_detail.get("head_to_head") or ev_detail.get("headToHead")
 
             if not h2h_data or h2h_data is _NOT_FOUND:
                 h2h_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h"
                 h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
 
             if h2h_data is _NOT_FOUND or not h2h_data:
-                logger.debug(f"DEBUG [H2H]: Not found for event_id={bzzoiro_id}")
                 not_found += 1
-            elif isinstance(h2h_data, dict):
-                inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
+            else:
+                inner_h2h = {}
+                if isinstance(h2h_data, dict):
+                    inner_h2h = (
+                        h2h_data.get("head_to_head") or 
+                        h2h_data.get("h2h") or 
+                        h2h_data.get("headToHead") or 
+                        h2h_data.get("data") or 
+                        h2h_data
+                    )
+                elif isinstance(h2h_data, list):
+                    inner_h2h = {"matches": h2h_data}
+
                 if isinstance(inner_h2h, dict) and inner_h2h:
-                    inner_h2h["source"] = "bzzoiro"
+                    inner_h2h["source"] = "bzzoiro"  # Строго по правилу §1.29a
                     if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
                         h2h_enriched += 1
                     else:
                         enrichment_errors += 1
                 else:
-                    logger.debug(f"DEBUG [H2H]: Empty inner data for event_id={bzzoiro_id}")
                     not_found += 1
-            else:
-                enrichment_errors += 1
 
             time.sleep(ENRICH_DELAY)
 
-            # ─── Stats Debug ───
+            # ─── Stats ───
             if not is_prematch:
                 stats_data = None
                 if isinstance(ev_detail, dict):
@@ -486,7 +484,6 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
 
                 if stats_data is _NOT_FOUND or not stats_data:
-                    logger.debug(f"DEBUG [STATS]: Not found for event_id={bzzoiro_id}")
                     not_found += 1
                 elif isinstance(stats_data, dict):
                     inner_stats = stats_data.get("stats", stats_data)
@@ -494,12 +491,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                         flat_stats = _flatten_stats(inner_stats)
                         if patch_match(cid, "stats", flat_stats, source="bzzoiro"):
                             stats_enriched += 1
-                        else:
-                            enrichment_errors += 1
                     else:
                         not_found += 1
-                else:
-                    enrichment_errors += 1
 
                 time.sleep(ENRICH_DELAY)
 
@@ -543,3 +536,4 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 if __name__ == "__main__":
     events_only = "--events-only" in sys.argv
     collect_bzzoiro(events_only=events_only)
+    
