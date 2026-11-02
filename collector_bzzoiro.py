@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 collector_bzzoiro.py — PRIMARY Ingestion Collector для Bzzoiro (v9.6.8-patched).
-Сбор сетки матчей, коэффициентов из глобального эндпоинта /odds/, статистики и H2H (Predictions полностью деактивированы).
+Сбор сетки матчей, расширенных коэффициентов, статистики и H2H с детальным дебагом.
 """
 
 import os
@@ -18,9 +18,9 @@ try:
 except ImportError:
     import requests  # fallback, но рекомендуется curl_cffi
 
-# ─── Logging setup ───
+# ─── Logging setup (DEBUG enabled) ───
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - [BZZOIRO] %(message)s'
 )
 logger = logging.getLogger("collector_bzzoiro")
@@ -68,14 +68,18 @@ def _check_cache(url: str) -> Any:
 def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
     cached_data = _check_cache(url)
     if cached_data is not None:
+        logger.debug(f"CACHE HIT: {url}")
         return cached_data
 
     for attempt in range(max_retries + 1):
         try:
+            logger.debug(f"HTTP GET -> {url} (attempt {attempt + 1})")
             try:
                 resp = requests.get(url, headers=headers, timeout=30, impersonate="chrome")
             except TypeError:
                 resp = requests.get(url, headers=headers, timeout=30)
+
+            logger.debug(f"HTTP STATUS: {resp.status_code} for {url}")
 
             if resp.status_code == 404:
                 _cache_response(url, _NOT_FOUND)
@@ -86,10 +90,10 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
+                logger.error(f"HTTP {resp.status_code} [BODY]: {resp.text[:300]}")
                 if attempt < max_retries:
                     time.sleep(RATE_DELAY * 2)
                     continue
-                logger.error(f"HTTP {resp.status_code}: {url}")
                 return None
 
             data = resp.json()
@@ -98,10 +102,10 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
             return data
 
         except Exception as e:
+            logger.error(f"Request exception on {url}: {e}")
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue
-            logger.error(f"Request error: {e}")
             return None
 
 
@@ -147,13 +151,10 @@ def _extract_score(ev: dict) -> Any:
 
 
 def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
-    """
-    Обрабатывает ответ от глобального эндпоинта /odds/ или вложенного фида рынков.
-    Возвращает кортеж: (плоский 1x2 для odds, словарь расширенных рынков).
-    """
     flat_1x2 = {}
     extended_markets = {}
 
+    logger.debug(f"DEBUG ODDS PAYLOAD TYPE: {type(odds_data)}")
     items = []
     if isinstance(odds_data, dict):
         items = odds_data.get("results", odds_data.get("data", [odds_data]))
@@ -168,7 +169,6 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
         price = item.get("decimal_odds", item.get("price", item.get("odd")))
 
         if price is None:
-            # Попробуем поискать словарь внутри элемента
             for k, v in item.items():
                 if isinstance(v, (int, float, str)) and v not in ("-", ""):
                     try:
@@ -186,7 +186,6 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
         except (ValueError, TypeError):
             continue
 
-        # Маппинг для 1X2
         oc_upper = str(outcome).upper()
         if market in ("1x2", "match_result", "full_time"):
             if oc_upper in ("HOME", "1", "HOME_WIN"):
@@ -196,12 +195,10 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
             elif oc_upper in ("AWAY", "2", "AWAY_WIN"):
                 flat_1x2["2"] = val
         else:
-            # Расширенные рынки (тоталы, btts и т.д.)
             if market not in extended_markets:
                 extended_markets[market] = {}
             extended_markets[market][str(outcome)] = val
 
-    # Если структура ответа пришла в виде словаря с ключами рынков напрямую
     if not flat_1x2 and isinstance(odds_data, dict):
         raw_odds = odds_data.get("odds", odds_data)
         if isinstance(raw_odds, dict):
@@ -213,6 +210,7 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
                 elif k in ("2", "away", "away_win") and v:
                     flat_1x2["2"] = float(v)
 
+    logger.debug(f"DEBUG EXTRACTED 1X2: {flat_1x2} | EXTENDED: {list(extended_markets.keys())}")
     return flat_1x2, extended_markets
 
 
@@ -260,7 +258,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
 
     logger.info("=" * 60)
-    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (Corrected endpoints, Predictions excluded) started.")
+    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (DEBUG MODE ENABLED) started.")
     logger.info("=" * 60)
 
     # ─── Шаг 0: Инициализация Redis ───
@@ -388,7 +386,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
     logger.info(f"Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated})")
 
-    # ─── Шаг 3: Enrichment (Все метрики через правильные эндпоинты, без predictions) ───
+    # ─── Шаг 3: Enrichment (С детальным дебагом ответов) ───
     odds_enriched = 0
     stats_enriched = 0
     h2h_enriched = 0
@@ -413,18 +411,18 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     else:
                         enrichment_errors += 1
 
-            # ─── Odds (Через глобальный эндпоинт /odds/?event_id=...) ───
+            # ─── Odds Debug ───
             odds_url = f"{BZZOIRO_BASE}/odds/?event_id={bzzoiro_id}"
             odds_data = _fetch_bzzoiro(odds_url, headers, max_retries=MAX_RETRIES)
 
             if odds_data is _NOT_FOUND or not odds_data:
-                # Fallback на детальный эндпоинт события
                 detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
                 detail_data = _fetch_bzzoiro(detail_url, headers, max_retries=MAX_RETRIES)
                 if isinstance(detail_data, dict):
                     odds_data = detail_data.get("odds", detail_data)
 
             if odds_data is _NOT_FOUND or not odds_data:
+                logger.debug(f"DEBUG [ODDS]: Not found for event_id={bzzoiro_id}")
                 not_found += 1
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
@@ -439,13 +437,14 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     patch_match(cid, m_key, m_val, source="bzzoiro")
 
                 if not flat_1x2 and not extended_markets:
+                    logger.debug(f"DEBUG [ODDS]: Empty payload structure for event_id={bzzoiro_id}")
                     not_found += 1
                 elif not success_enrich:
                     enrichment_errors += 1
 
             time.sleep(ENRICH_DELAY)
 
-            # ─── H2H (Через детальную информацию матча или /events/{id}/) ───
+            # ─── H2H Debug ───
             event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
             ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
             
@@ -458,23 +457,25 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
 
             if h2h_data is _NOT_FOUND or not h2h_data:
+                logger.debug(f"DEBUG [H2H]: Not found for event_id={bzzoiro_id}")
                 not_found += 1
             elif isinstance(h2h_data, dict):
                 inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
                 if isinstance(inner_h2h, dict) and inner_h2h:
-                    inner_h2h["source"] = "bzzoiro"  # Строго по правилу §1.29a
+                    inner_h2h["source"] = "bzzoiro"
                     if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
                         h2h_enriched += 1
                     else:
                         enrichment_errors += 1
                 else:
+                    logger.debug(f"DEBUG [H2H]: Empty inner data for event_id={bzzoiro_id}")
                     not_found += 1
             else:
                 enrichment_errors += 1
 
             time.sleep(ENRICH_DELAY)
 
-            # ─── Stats (для завершенных матчей) ───
+            # ─── Stats Debug ───
             if not is_prematch:
                 stats_data = None
                 if isinstance(ev_detail, dict):
@@ -485,6 +486,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
 
                 if stats_data is _NOT_FOUND or not stats_data:
+                    logger.debug(f"DEBUG [STATS]: Not found for event_id={bzzoiro_id}")
                     not_found += 1
                 elif isinstance(stats_data, dict):
                     inner_stats = stats_data.get("stats", stats_data)
@@ -541,4 +543,3 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 if __name__ == "__main__":
     events_only = "--events-only" in sys.argv
     collect_bzzoiro(events_only=events_only)
-                
