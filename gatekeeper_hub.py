@@ -17,6 +17,8 @@ import random
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 import logging
+import urllib.request
+import urllib.parse
 
 logger = logging.getLogger("gatekeeper_hub")
 logger.addHandler(logging.NullHandler())
@@ -163,8 +165,6 @@ def _adapt_to_core_engine_contract(match_obj: dict) -> dict:
         }
     }
     return adapted_passport
-import urllib.request
-import urllib.parse
 
 # ── БОЕВОЙ МЕТОД ОПЕРАТИВНОГО СРЕЗА С ПОДКЛЮЧЕНИЕМ К UPSTASH REST API ──
 def get_all_matches() -> dict:
@@ -183,7 +183,6 @@ def get_all_matches() -> dict:
     url = url.rstrip("/")
     
     try:
-        # Считывание ключей по маске match:* через HTTP GET REST API
         keys_url = f"{url}/KEYS/match:*"
         req = urllib.request.Request(keys_url)
         req.add_header("Authorization", f"Bearer {token}")
@@ -198,7 +197,6 @@ def get_all_matches() -> dict:
             
         adapted_db = {}
         
-        # Сканирование паспортов по вычитанным ключам
         for key in keys:
             if not _is_real_match(key):
                 continue
@@ -220,7 +218,6 @@ def get_all_matches() -> dict:
                     logger.error(f"Битая структура JSON в ключе {key}. Пропуск.")
                     continue
                 
-                # Строгая фильтрация по схеме v710 перед передачей в value_engine
                 if isinstance(raw_match, dict) and validate_schema_bool(raw_match):
                     cid = raw_match.get("canonical_id", key)
                     adapted_db[cid] = _adapt_to_core_engine_contract(raw_match)
@@ -230,6 +227,60 @@ def get_all_matches() -> dict:
     except Exception as e:
         logger.error(f"Критический сбой при чтении Upstash Redis API: {e}. Fallback-активация.")
         return _get_mock_matches_fallback()
+
+
+# ── БОЕВОЙ МЕТОД ВЫГРУЗКИ ИСТОРИИ ЧЕРЕЗ UPSTASH REST API ──
+def get_all_history_matches() -> dict:
+    """
+    Выгружает все архивные ключи истории матчей (history:match:*) 
+    напрямую из облачного кластера Upstash Redis REST API через хаб.
+    """
+    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
+    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
+    
+    if not url or not token:
+        logger.warning("Upstash credentials missing для history. Возвращаем пустой словарь.")
+        return {}
+
+    url = url.rstrip("/")
+    
+    try:
+        keys_url = f"{url}/KEYS/history:match:*"
+        req = urllib.request.Request(keys_url)
+        req.add_header("Authorization", f"Bearer {token}")
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            keys = result.get("result", [])
+            
+        if not keys:
+            return {}
+            
+        history_db = {}
+        for key in keys:
+            match_url = f"{url}/GET/{key}"
+            match_req = urllib.request.Request(match_url)
+            match_req.add_header("Authorization", f"Bearer {token}")
+            
+            with urllib.request.urlopen(match_req, timeout=5) as match_resp:
+                match_data_raw = json.loads(match_resp.read().decode("utf-8"))
+                match_str = match_data_raw.get("result")
+                
+                if not match_str:
+                    continue
+                    
+                try:
+                    raw_match = json.loads(match_str) if isinstance(match_str, str) else match_str
+                    if isinstance(raw_match, dict):
+                        history_db[key] = raw_match
+                except json.JSONDecodeError:
+                    continue
+                    
+        return history_db
+
+    except Exception as e:
+        logger.error(f"Критический сбой при выгрузке истории из Upstash Redis API: {e}")
+        return {}
 
 
 def _get_mock_matches_fallback() -> dict:
@@ -372,4 +423,4 @@ def run_buffer_cleanup():
 
 if __name__ == "__main__":
     print(f"Gatekeeper Hub v{__version__} полностью восстановлен. Подключение REST-Upstash зафиксировано.")
-    
+
