@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 collector_bzzoiro.py — PRIMARY Ingestion Collector для Bzzoiro (v9.6.8-patched).
-Сбор сетки матчей, расширенных коэффициентов (1X2, тоталы, BTTS, двойные шансы), 
-статистики и H2H (Predictions полностью деактивированы).
+Сбор сетки матчей, коэффициентов из глобального эндпоинта /odds/, статистики и H2H (Predictions полностью деактивированы).
 """
 
 import os
@@ -59,7 +58,7 @@ PREMATCH_STATUSES = ("notstarted", "", "scheduled", "postponed")
 # ─── Кэширование ───
 _cache = {}
 
-def _cache_response(url: str, data: dict):
+def _cache_response(url: str, data: Any):
     _cache[url] = data
 
 def _check_cache(url: str) -> Any:
@@ -147,55 +146,74 @@ def _extract_score(ev: dict) -> Any:
     return None
 
 
-def _extract_comprehensive_odds(odds_data: dict) -> dict:
+def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
     """
-    Извлекает полный спектр доступных рынков коэффициентов (1X2, тоталы, BTTS, двойные шансы).
+    Обрабатывает ответ от глобального эндпоинта /odds/ или вложенного фида рынков.
+    Возвращает кортеж: (плоский 1x2 для odds, словарь расширенных рынков).
     """
-    if not isinstance(odds_data, dict):
-        return {}
-    
-    raw_odds = odds_data.get("odds", odds_data)
-    if not isinstance(raw_odds, (dict, list)):
-        return {}
+    flat_1x2 = {}
+    extended_markets = {}
 
-    parsed_markets = {}
+    items = []
+    if isinstance(odds_data, dict):
+        items = odds_data.get("results", odds_data.get("data", [odds_data]))
+    elif isinstance(odds_data, list):
+        items = odds_data
 
-    # Если бэкэнд возвращает словарь по рынкам или плоский список
-    if isinstance(raw_odds, dict):
-        # 1. Базовый 1X2
-        flat_1x2 = {}
-        mapping = {
-            "1": ("home_win", "home", "1"),
-            "X": ("draw", "X", "draw"),
-            "2": ("away_win", "away", "2")
-        }
-        odds_source = raw_odds.get("1x2", raw_odds)
-        if isinstance(odds_source, dict):
-            for target_key, keys in mapping.items():
-                for k in keys:
-                    if k in odds_source and odds_source[k] not in (None, "-", ""):
-                        try:
-                            flat_1x2[target_key] = float(odds_source[k])
-                            break
-                        except (ValueError, TypeError):
-                            pass
-        if flat_1x2:
-            parsed_markets["odds_1x2"] = flat_1x2
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        market = item.get("market", "1x2")
+        outcome = item.get("outcome", "")
+        price = item.get("decimal_odds", item.get("price", item.get("odd")))
 
-        # 2. Расширенные рынки (Тоталы, BTTS, Двойные шансы)
-        for market_key in ("over_under_25", "over_under_15", "over_under_35", "btts", "double_chance"):
-            if market_key in raw_odds and isinstance(raw_odds[market_key], dict):
-                m_data = {}
-                for sub_k, sub_v in raw_odds[market_key].items():
-                    if sub_v not in (None, "-", ""):
-                        try:
-                            m_data[sub_k] = float(sub_v)
-                        except (ValueError, TypeError):
-                            m_data[sub_k] = sub_v
-                if m_data:
-                    parsed_markets[market_key] = m_data
+        if price is None:
+            # Попробуем поискать словарь внутри элемента
+            for k, v in item.items():
+                if isinstance(v, (int, float, str)) and v not in ("-", ""):
+                    try:
+                        price = float(v)
+                        outcome = k
+                        break
+                    except ValueError:
+                        pass
 
-    return parsed_markets
+        if price is None:
+            continue
+
+        try:
+            val = float(price)
+        except (ValueError, TypeError):
+            continue
+
+        # Маппинг для 1X2
+        oc_upper = str(outcome).upper()
+        if market in ("1x2", "match_result", "full_time"):
+            if oc_upper in ("HOME", "1", "HOME_WIN"):
+                flat_1x2["1"] = val
+            elif oc_upper in ("DRAW", "X"):
+                flat_1x2["X"] = val
+            elif oc_upper in ("AWAY", "2", "AWAY_WIN"):
+                flat_1x2["2"] = val
+        else:
+            # Расширенные рынки (тоталы, btts и т.д.)
+            if market not in extended_markets:
+                extended_markets[market] = {}
+            extended_markets[market][str(outcome)] = val
+
+    # Если структура ответа пришла в виде словаря с ключами рынков напрямую
+    if not flat_1x2 and isinstance(odds_data, dict):
+        raw_odds = odds_data.get("odds", odds_data)
+        if isinstance(raw_odds, dict):
+            for k, v in raw_odds.items():
+                if k in ("1", "home", "home_win") and v:
+                    flat_1x2["1"] = float(v)
+                elif k in ("X", "draw") and v:
+                    flat_1x2["X"] = float(v)
+                elif k in ("2", "away", "away_win") and v:
+                    flat_1x2["2"] = float(v)
+
+    return flat_1x2, extended_markets
 
 
 def _flatten_stats(stats_data: dict, parent_key: str = "", sep: str = "_") -> dict:
@@ -242,7 +260,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
 
     logger.info("=" * 60)
-    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (All metrics restored, Predictions excluded) started.")
+    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (Corrected endpoints, Predictions excluded) started.")
     logger.info("=" * 60)
 
     # ─── Шаг 0: Инициализация Redis ───
@@ -370,7 +388,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
     logger.info(f"Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated})")
 
-    # ─── Шаг 3: Enrichment (Все метрики кроме прогнозов / predictions!) ───
+    # ─── Шаг 3: Enrichment (Все метрики через правильные эндпоинты, без predictions) ───
     odds_enriched = 0
     stats_enriched = 0
     h2h_enriched = 0
@@ -395,48 +413,53 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     else:
                         enrichment_errors += 1
 
-            # ─── Odds (Многорыночные коэффициенты: 1X2, тоталы, BTTS и др.) ───
-            odds_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/odds"
+            # ─── Odds (Через глобальный эндпоинт /odds/?event_id=...) ───
+            odds_url = f"{BZZOIRO_BASE}/odds/?event_id={bzzoiro_id}"
             odds_data = _fetch_bzzoiro(odds_url, headers, max_retries=MAX_RETRIES)
 
-            if odds_data is _NOT_FOUND:
-                not_found += 1
-            elif odds_data and isinstance(odds_data, dict):
-                comprehensive_odds = _extract_comprehensive_odds(odds_data)
-                if comprehensive_odds:
-                    success_odds = True
-                    # Патчим базовый 1x2 отдельно в блок odds для совместимости со схемой v710
-                    if "odds_1x2" in comprehensive_odds:
-                        if not patch_match(cid, "odds", comprehensive_odds["odds_1x2"], source="bzzoiro", upstream="opta"):
-                            success_odds = False
-                    
-                    # Патчим расширенные рынки (тоталы, btts и т.д.)
-                    for m_key, m_val in comprehensive_odds.items():
-                        if m_key != "odds_1x2":
-                            patch_match(cid, m_key, m_val, source="bzzoiro")
+            if odds_data is _NOT_FOUND or not odds_data:
+                # Fallback на детальный эндпоинт события
+                detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
+                detail_data = _fetch_bzzoiro(detail_url, headers, max_retries=MAX_RETRIES)
+                if isinstance(detail_data, dict):
+                    odds_data = detail_data.get("odds", detail_data)
 
-                    if success_odds:
+            if odds_data is _NOT_FOUND or not odds_data:
+                not_found += 1
+            else:
+                flat_1x2, extended_markets = _process_odds_payload(odds_data)
+                success_enrich = True
+                if flat_1x2:
+                    if patch_match(cid, "odds", flat_1x2, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
                     else:
-                        enrichment_errors += 1
-                else:
+                        success_enrich = False
+                
+                for m_key, m_val in extended_markets.items():
+                    patch_match(cid, m_key, m_val, source="bzzoiro")
+
+                if not flat_1x2 and not extended_markets:
                     not_found += 1
-            else:
-                enrichment_errors += 1
+                elif not success_enrich:
+                    enrichment_errors += 1
 
             time.sleep(ENRICH_DELAY)
 
-            # ─── H2H (с обязательным маркером source §1.29a) ───
-            h2h_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h"
-            h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
+            # ─── H2H (Через детальную информацию матча или /events/{id}/) ───
+            event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
+            ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
+            
+            h2h_data = None
+            if isinstance(ev_detail, dict):
+                h2h_data = ev_detail.get("h2h", ev_detail.get("head_to_head"))
 
-            if h2h_data is _NOT_FOUND:
-                h2h_url_legacy = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/head_to_head"
-                h2h_data = _fetch_bzzoiro(h2h_url_legacy, headers, max_retries=MAX_RETRIES)
+            if not h2h_data or h2h_data is _NOT_FOUND:
+                h2h_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h"
+                h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
 
-            if h2h_data is _NOT_FOUND:
+            if h2h_data is _NOT_FOUND or not h2h_data:
                 not_found += 1
-            elif h2h_data and isinstance(h2h_data, dict):
+            elif isinstance(h2h_data, dict):
                 inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
                 if isinstance(inner_h2h, dict) and inner_h2h:
                     inner_h2h["source"] = "bzzoiro"  # Строго по правилу §1.29a
@@ -453,12 +476,17 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
             # ─── Stats (для завершенных матчей) ───
             if not is_prematch:
-                stats_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/stats"
-                stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
+                stats_data = None
+                if isinstance(ev_detail, dict):
+                    stats_data = ev_detail.get("stats")
 
-                if stats_data is _NOT_FOUND:
+                if not stats_data or stats_data is _NOT_FOUND:
+                    stats_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/stats"
+                    stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
+
+                if stats_data is _NOT_FOUND or not stats_data:
                     not_found += 1
-                elif stats_data and isinstance(stats_data, dict):
+                elif isinstance(stats_data, dict):
                     inner_stats = stats_data.get("stats", stats_data)
                     if isinstance(inner_stats, dict) and inner_stats:
                         flat_stats = _flatten_stats(inner_stats)
@@ -513,4 +541,4 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 if __name__ == "__main__":
     events_only = "--events-only" in sys.argv
     collect_bzzoiro(events_only=events_only)
-        
+                
