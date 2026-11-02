@@ -76,11 +76,15 @@ def _scan_redis():
         all_fields = get_all_fields()
         if isinstance(all_fields, dict):
             result["hash_fields"] = all_fields
+            # Дополнительно проверяем, не попали ли ключи истории внутрь хэша
+            for k in all_fields.keys():
+                if k.startswith("history:match:") and k not in result["standalone_keys"]:
+                    result["standalone_keys"].append(k)
     except Exception as e:
         logger.warning("get_all_fields() error: %s", e)
 
     # Замена битого scan_keys на прямой вызов SCAN с итерацией по курсору
-    for pattern in ("history:match:*", "system:*", "index:*", "search:results:*"):
+    for pattern in ("history:match:*", "history:*", "system:*", "index:*", "search:results:*"):
         try:
             cursor = "0"
             while True:
@@ -319,3 +323,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
