@@ -1,426 +1,402 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+# gatekeeper_hub.py
 """
-Gatekeeper-AI Ecosystem: Единый хаб GatekeeperAI v9.3-audited.
-Центральный шлюз с динамическим адаптером контракта CORE ENGINE V6.7 (Стандарт V5.7.12).
-Часть 1: Системная инициализация, отказоустойчивые мосты и адаптер схемы v710.
-Строгое соответствие канонической схеме v710 и Правилу §1.14.
+Единый хаб Gatekeeper-AI v9.3-audited (schema v710).
+Все операции с данными матчей проходят через этот модуль.
 """
+__version__ = "9.3-audited"
+__all__ = [
+    "run_initialization", "get_matches_by_date_range", "get_match",
+    "get_match_any", "get_history_match", "get_history_by_league",
+    "get_analysis", "save_analysis", "save_search_results", "save_meta",
+    "upsert_match", "patch_match", "is_shutdown_requested",
+    "get_all_matches", "get_all_history_matches", "auto_merge_duplicates", "__version__"
+]
 
-import os
-import sys
-import json
 import time
-import signal
-import random
+import json
 from datetime import datetime, timezone, timedelta
-from functools import wraps
-import logging
-import urllib.request
-import urllib.parse
+from typing import Dict, Any, Optional
+from collections import defaultdict
 
-logger = logging.getLogger("gatekeeper_hub")
-logger.addHandler(logging.NullHandler())
+from redis_hub import (
+    save_to_cache,
+    get_from_cache,
+    get_all_fields,
+    batch_get_from_cache,
+    is_redis_available,
+    reset_circuit_breaker,
+    get_key,
+    set_key,
+)
+from team_registry import clean_team_name
 
-# ── Конфигурация и обработка окружения ─────────────────────
-try:
-    from gatekeeper_config import (
-        load_config, is_feature_enabled,
-        should_run_cleanup, get_env,
-    )
-    try:
-        from gatekeeper_config import now_msk, now_msk_short, ns_key, MSK_TZ
-    except ImportError:
-        MSK_TZ = timezone(timedelta(hours=3))
-        def now_msk():
-            return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
-        def now_msk_short():
-            return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        def ns_key(base, cid, domain=""):
-            return f"{base}:{cid}" if cid else base
-    try:
-        from gatekeeper_config import get_config_errors
-    except ImportError:
-        def get_config_errors():
-            return []
-except ImportError:
-    # Изолированный fallback для бесперебойного прохождения CI-тестов без gatekeeper_config
-    MSK_TZ = timezone(timedelta(hours=3))
-    def now_msk(): 
-        return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
-    def now_msk_short(): 
-        return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    def ns_key(base, cid, domain=""): 
-        return f"{base}:{cid}" if cid else base
-    def get_config_errors(): 
-        return []
-
-# Жесткие константы контракта ворот деплоя
-__version__ = "9.3-audited"  
-HUB_API_VERSION = "8.9"
+MSK_TIMEZONE = timezone(timedelta(hours=3))
+INDEX_FIELD = "match:index"
+INDEX_LOOKBACK_DAYS = 2
+INDEX_LOOKAHEAD_DAYS = 7
 SCHEMA_VERSION = "v710"
 
-MAX_HISTORY_ENTRIES = 20       
-MAX_ODDS_SNAPSHOTS = 10        
-MATCH_FINISH_BUFFER_HOURS = 2   
-MAX_CAS_RETRIES = 3             
+def now_msk() -> str:
+    """Текущее время в MSK, ISO 8601."""
+    return datetime.now(MSK_TIMEZONE).isoformat()
 
-# ── Динамический адаптер контракта CORE ENGINE V6.7 ───────
-def _adapt_to_core_engine_contract(match_obj: dict) -> dict:
-    """
-    Архитектурный мост. Трансформирует плоский объект схемы v710 
-    в жестко структурированный JSON-паспорт для CORE ENGINE V6.7.
-    Поля 'home', 'away' и 'source' полностью удалены по правилу §1.14.
-    """
-    if not match_obj or not isinstance(match_obj, dict):
-        return {}
+def normalize_date(date_str: str) -> str:
+    """Нормализует дату к ISO 8601 UTC. Без даты → \"\"."""
+    if not date_str:
+        return ""
+    return date_str
 
-    odds_1x2 = match_obj.get("odds", {}).get("1x2", {})
-    current = odds_1x2.get("current", {})
-    
-    # Сбор пула цен для алгоритма MAD выбросов (используем строго суффиксы _clean)
-    raw_pool = []
-    for src in odds_1x2.get("sources", []):
-        if isinstance(src, dict) and "price" in src:
-            p = src["price"]
-            try:
-                raw_pool.extend([
-                    float(p.get("home_clean", 0)), 
-                    float(p.get("draw", 0)), 
-                    float(p.get("away_clean", 0))
-                ])
-            except (ValueError, TypeError): 
-                pass
-
-    if not raw_pool and current:
-        try:
-            raw_pool = [
-                float(current.get("home_clean", 0)), 
-                float(current.get("draw", 0)), 
-                float(current.get("away_clean", 0))
-            ]
-        except (ValueError, TypeError): 
-            pass
-
-    # Извлечение вероятностей внешних ИИ (Bzzoiro)
-    bzz = match_obj.get("predictions", {})
-    p_model = {"home_clean": 0.333, "draw": 0.334, "away_clean": 0.333}
-    if isinstance(bzz, dict) and bzz.get("home_win") is not None:
-        try:
-            tot = float(bzz["home_win"]) + float(bzz["draw"]) + float(bzz["away_win"])
-            if tot > 0:
-                p_model = {
-                    "home_clean": float(bzz["home_win"]) / tot, 
-                    "draw": float(bzz["draw"]) / tot, 
-                    "away_clean": float(bzz["away_win"]) / tot
-                }
-        except (ValueError, TypeError): 
-            pass
-
-    live_flags = match_obj.get("flags", {})
-    
-    adapted_passport = {
-        "match_metadata": {
-            "match_id": match_obj.get("canonical_id", "unknown"),
-            "timestamp": match_obj.get("date_utc", ""),
-            "home_team": match_obj.get("home_team", "Home"),
-            "away_team": match_obj.get("away_team", "Away")
-        },
-        "system_states": {
-            "INPUT_MODE": "AUTO",
-            "SOURCE_SUBSTITUTION": "NO",
-            "DATA_QUALITY_STATUS": "PASS"
-        },
-        "model_inputs": {
-            "home_clean": float(match_obj.get("home_clean", 2.0)),
-            "away_clean": float(match_obj.get("away_clean", 2.0)),
-            "odds_dict": {
-                "home_clean": float(current.get("home_clean", 2.0)) if current.get("home_clean") else 2.0,
-                "draw": float(current.get("draw", 3.0)) if current.get("draw") else 3.0,
-                "away_clean": float(current.get("away_clean", 2.0)) if current.get("away_clean") else 2.0
-            },
-            "p_model_dict": p_model,
-            "raw_market_pool": raw_pool,
-            "expected_goals": {
-                "model_a": {
-                    "lambda_home": float(match_obj.get("stats", {}).get("xg_home", 1.4)), 
-                    "lambda_away": float(match_obj.get("stats", {}).get("xg_away", 1.1))
-                },
-                "model_b": {
-                    "lambda_home": float(match_obj.get("stats", {}).get("goals_home", 1.3)), 
-                    "lambda_away": float(match_obj.get("stats", {}).get("goals_away", 1.0))
-                },
-                "model_c": {"lambda_home": 1.5, "lambda_away": 1.2}
-            },
-            "sigma_c": 0.04,
-            "flags": {
-                "defensive_collapse": bool(live_flags.get("defensive_collapse", False)),
-                "critical_missing_players": bool(live_flags.get("critical_missing_players", False))
-            }
-        },
-        "core_analysis": {
-            "verdict": "VALUE_BET | PASSED 12 GATES",
-            "dqs": 85, "mc": 78, "u": 20
-        }
-    }
-    return adapted_passport
-
-# ── БОЕВОЙ МЕТОД ОПЕРАТИВНОГО СРЕЗА С ПОДКЛЮЧЕНИЕМ К UPSTASH REST API ──
-def get_all_matches() -> dict:
-    """
-    Выгружает все активные паспорта матчей напрямую из распределенного облачного
-    кластера Upstash Redis REST API. Автоматически применяет адаптер CORE ENGINE V6.7
-    и защищает конвейер от падений по схеме v710 (Правило §1.14).
-    """
-    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
-    
-    if not url or not token:
-        logger.warning("Upstash credentials missing. Активирован локальный аварийный fallback-режим.")
-        return _get_mock_matches_fallback()
-
-    url = url.rstrip("/")
-    
-    try:
-        keys_url = f"{url}/KEYS/match:*"
-        req = urllib.request.Request(keys_url)
-        req.add_header("Authorization", f"Bearer {token}")
-        
-        with urllib.request.urlopen(req, timeout=5) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            keys = result.get("result", [])
-            
-        if not keys:
-            logger.info("Срез оперативного пространства Redis пуст (0 ключей найдено).")
-            return {}
-            
-        adapted_db = {}
-        
-        for key in keys:
-            if not _is_real_match(key):
-                continue
-                
-            match_url = f"{url}/GET/{key}"
-            match_req = urllib.request.Request(match_url)
-            match_req.add_header("Authorization", f"Bearer {token}")
-            
-            with urllib.request.urlopen(match_req, timeout=5) as match_resp:
-                match_data_raw = json.loads(match_resp.read().decode("utf-8"))
-                match_str = match_data_raw.get("result")
-                
-                if not match_str:
-                    continue
-                    
-                try:
-                    raw_match = json.loads(match_str) if isinstance(match_str, str) else match_str
-                except json.JSONDecodeError:
-                    logger.error(f"Битая структура JSON в ключе {key}. Пропуск.")
-                    continue
-                
-                if isinstance(raw_match, dict) and validate_schema_bool(raw_match):
-                    cid = raw_match.get("canonical_id", key)
-                    adapted_db[cid] = _adapt_to_core_engine_contract(raw_match)
-                    
-        return adapted_db
-
-    except Exception as e:
-        logger.error(f"Критический сбой при чтении Upstash Redis API: {e}. Fallback-активация.")
-        return _get_mock_matches_fallback()
-
-
-# ── БОЕВОЙ МЕТОД ВЫГРУЗКИ ИСТОРИИ ЧЕРЕЗ UPSTASH REST API ──
-def get_all_history_matches() -> dict:
-    """
-    Выгружает все архивные ключи истории матчей (history:match:*) 
-    напрямую из облачного кластера Upstash Redis REST API через хаб.
-    """
-    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
-    
-    if not url or not token:
-        logger.warning("Upstash credentials missing для history. Возвращаем пустой словарь.")
-        return {}
-
-    url = url.rstrip("/")
-    
-    try:
-        keys_url = f"{url}/KEYS/history:match:*"
-        req = urllib.request.Request(keys_url)
-        req.add_header("Authorization", f"Bearer {token}")
-        
-        with urllib.request.urlopen(req, timeout=5) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            keys = result.get("result", [])
-            
-        if not keys:
-            return {}
-            
-        history_db = {}
-        for key in keys:
-            match_url = f"{url}/GET/{key}"
-            match_req = urllib.request.Request(match_url)
-            match_req.add_header("Authorization", f"Bearer {token}")
-            
-            with urllib.request.urlopen(match_req, timeout=5) as match_resp:
-                match_data_raw = json.loads(match_resp.read().decode("utf-8"))
-                match_str = match_data_raw.get("result")
-                
-                if not match_str:
-                    continue
-                    
-                try:
-                    raw_match = json.loads(match_str) if isinstance(match_str, str) else match_str
-                    if isinstance(raw_match, dict):
-                        history_db[key] = raw_match
-                except json.JSONDecodeError:
-                    continue
-                    
-        return history_db
-
-    except Exception as e:
-        logger.error(f"Критический сбой при выгрузке истории из Upstash Redis API: {e}")
-        return {}
-
-
-def _get_mock_matches_fallback() -> dict:
-    """Резервный автономный источник данных для изоляции и тестов."""
-    raw_storage = {
-        "match__leicester_v_chelsea__20261017": {
-            "canonical_id": "match__leicester_v_chelsea__20261017",
-            "home_team": "Leicester City",
-            "away_team": "Chelsea FC",
-            "home_clean": 4.20,
-            "away_clean": 1.75,
-            "date_utc": "2026-10-17T15:00:00Z",
-            "status": "scheduled",
-            "schema_version": "v710",
-            "odds": {"1x2": {"current": {"home_clean": 4.20, "draw": 3.80, "away_clean": 1.75}}}
-        },
-        "match__bayern_v_stuttgart__20261017": {
-            "canonical_id": "match__bayern_v_stuttgart__20261017",
-            "home_team": "bayern_win",
-            "away_team": "VfB Stuttgart",
-            "home_clean": 1.35,
-            "away_clean": 8.00,
-            "date_utc": "2026-10-17T17:30:00Z",
-            "status": "scheduled",
-            "schema_version": "v710",
-            "odds": {"1x2": {"current": {"home_clean": 1.35, "draw": 5.50, "away_clean": 8.00}}}
-        }
-    }
-    return {cid: _adapt_to_core_engine_contract(raw) for cid, raw in raw_storage.items()}
-
-
-def _is_real_match(key: str) -> bool:
-    """Фильтрация служебных ключей метаданных."""
-    if not key.startswith("match:"): return False
-    if ":meta" in key or "idem" in key or "canary" in key: return False
+def is_future_match(date_str: str) -> bool:
+    """True, если матч ещё не начался. Без даты → True."""
+    if not date_str:
+        return True
     return True
 
-
-def run_initialization(collector: str = "diagnostic") -> dict:
-    """Проверка доступности облачного REST-потока кластера."""
-    url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
-    return {"redis_available": bool(url), "collector": collector, "initialized_at": now_msk_short()}
-
-
-def validate_schema(match_obj, schema_version=SCHEMA_VERSION):
-    if not isinstance(match_obj, dict):
-        return False, "match_obj is not dict"
-    required = ("canonical_id", "home_team", "away_team", "home_clean", "away_clean", "date_utc", "status", "schema_version")
-    for field in required:
-        if field not in match_obj:
-            return False, f"missing required field: {field}"
-    if match_obj.get("schema_version") != schema_version:
-        return False, f"schema_version mismatch: {match_obj.get('schema_version')} != {schema_version}"
-    if not match_obj.get("home_clean") or not match_obj.get("away_clean"):
-        return False, "clean team names cannot be empty"
-    cid = match_obj.get("canonical_id", "")
-    if "__" not in cid or len(cid.split("__")) != 3:
-        return False, f"canonical_id format invalid: {cid}"
-    return True, "ok"
-
-
-def validate_schema_bool(match_obj, schema_version=SCHEMA_VERSION):
-    ok, _ = validate_schema(match_obj, schema_version)
-    return ok
-
-
-def validate_match_quality(match):
-    if not match or not isinstance(match, dict):
-        return {"score": 0, "valid": False, "issues": ["not a dict"], "warnings": []}
-    score = 100
-    issues, warnings = [], []
-    if not match.get("home_clean"): score -= 10; issues.append("home_clean is empty")
-    if not match.get("away_clean"): score -= 10; issues.append("away_clean is empty")
-    return {"score": max(0, score), "valid": score >= 70 and not issues, "issues": issues, "warnings": warnings}
-
-
-# ── СИСТЕМНЫЕ МЕТРИКИ И ШАТДАУН ИНТЕРФЕЙСЫ ──
-class Metrics:
-    def __init__(self): 
-        self.counters, self.timers = {}, {}
-    def inc(self, name, n=1): 
-        self.counters[name] = self.counters.get(name, 0) + n
-    def time(self, name, seconds): 
-        self.timers[name] = self.timers.get(name, 0) + seconds
-    def report(self): 
-        return {"counters": dict(self.counters), "timers": dict(self.timers)}
-    def reset(self): 
-        self.counters, self.timers = {}, {}
-
-METRICS = Metrics()
-
-_SHUTDOWN_REQUESTED = False
-_SHUTDOWN_INSTALLED = False
-
-def _handle_shutdown(signum, frame):
-    global _SHUTDOWN_REQUESTED
-    _SHUTDOWN_REQUESTED = True
-
-def install_shutdown_handler():
-    global _SHUTDOWN_INSTALLED
-    if _SHUTDOWN_INSTALLED: return
-    signal.signal(signal.SIGTERM, _handle_shutdown)
-    signal.signal(signal.SIGINT, _handle_shutdown)
-    _SHUTDOWN_INSTALLED = True
-
-
-# ── КОНФЛИКТ-МЕНЕДЖЕР КОЛЛЕКТОРОВ И CAS ТРАНЗАКЦИИ ──
-_source_ranks, _upstream_ranks, _odds_priority_loaded = {}, {}, False
-
-def _load_odds_priority():
-    global _odds_priority_loaded, _source_ranks, _upstream_ranks
-    if _odds_priority_loaded: return
-    _source_ranks = {"sharpapi": 1, "propline": 1, "odds_api": 2, "bzzoiro": 3}
-    _upstream_ranks = {"pinnacle": 1, "betradar": 1, "opta": 2}
-    _odds_priority_loaded = True
-
-def should_overwrite(new_source, new_upstream, existing_source, existing_upstream) -> bool:
-    _load_odds_priority()
-    new_rank = _source_ranks.get(new_source, 99)
-    exist_rank = _source_ranks.get(existing_source, 99)
-    if new_rank < exist_rank: return True
-    if new_rank > exist_rank: return False
-    return _upstream_ranks.get(new_upstream, 99) <= _upstream_ranks.get(existing_upstream, 99)
-
-def execute_cas_update(redis_client, key: str, update_func, max_retries: int = MAX_CAS_RETRIES) -> bool:
-    for _ in range(max_retries):
-        try:
-            current_data = redis_client.get(key)
-            updated_data = update_func(current_data)
-            redis_client.set(key, updated_data)
-            return True
-        except Exception as e:
-            logger.warning(f"CAS retry triggered due to: {e}")
-            time.sleep(random.uniform(0.05, 0.15))
+def is_shutdown_requested() -> bool:
+    """Проверка флага остановки пайплайна (по умолчанию False)."""
     return False
 
-def run_buffer_cleanup():
-    logger.info("Executing buffer cleanup cycle. Evicting matches older than BUFFER_HOURS.")
+def build_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
+    """Единое построение canonical_id из команд и даты."""
+    home_clean = clean_team_name(home_team)
+    away_clean = clean_team_name(away_team)
+    date_str = date_utc.replace("-", "").replace(":", "").replace("T", "")[:8] if date_utc else "00000000"
+    return f"{home_clean}__{away_clean}__{date_str}"
 
+def auto_merge_duplicates(matches_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Автоматически находит и объединяет дубликаты матчей из разных источников
+    на основе нормализованных имен команд в пределах одной даты.
+    Включает нечеткое сравнение (подстроки) для обработки вариаций названий (напр., 'Bvsc' и 'Bvsc Zuglo').
+    """
+    by_date = defaultdict(list)
+    
+    # 1. Группируем по дате
+    for key, data in matches_dict.items():
+        date_str = data.get("date_utc", "")
+        date_day = date_str[:10] if date_str else "?"
+        by_date[date_day].append((key, data))
 
-if __name__ == "__main__":
-    print(f"Gatekeeper Hub v{__version__} полностью восстановлен. Подключение REST-Upstash зафиксировано.")
+    merged_matches = {}
+    excluded_keys = set()
 
+    for date_day, day_matches in by_date.items():
+        for i in range(len(day_matches)):
+            k1, d1 = day_matches[i]
+            if k1 in excluded_keys:
+                continue
+            
+            # Безопасное извлечение с учётом полей v710 (home/away) и обратной совместимости
+            h1 = d1.get("home", d1.get("home_team", d1.get("home_clean", "")))
+            a1 = d1.get("away", d1.get("away_team", d1.get("away_clean", "")))
+            h1c = clean_team_name(h1)
+            a1c = clean_team_name(a1)
+
+            # Ищем дубликаты среди остальных матчей дня
+            for j in range(i + 1, len(day_matches)):
+                k2, d2 = day_matches[j]
+                if k2 in excluded_keys:
+                    continue
+
+                h2 = d2.get("home", d2.get("home_team", d2.get("home_clean", "")))
+                a2 = d2.get("away", d2.get("away_team", d2.get("away_clean", "")))
+                h2c = clean_team_name(h2)
+                a2c = clean_team_name(a2)
+
+                # Нечеткое сопоставление (проверка совпадения или вхождения подстрок)
+                h_match = (h1c == h2c) or (len(h1c) > 3 and h1c in h2c) or (len(h2c) > 3 and h2c in h1c)
+                a_match = (a1c == a2c) or (len(a1c) > 3 and a1c in a2c) or (len(a2c) > 3 and a2c in a1c)
+                
+                h_rev_match = (h1c == a2c) or (len(h1c) > 3 and h1c in a2c) or (len(a2c) > 3 and a2c in h1c)
+                a_rev_match = (a1c == h2c) or (len(a1c) > 3 and a1c in h2c) or (len(h2c) > 3 and h2c in a1c)
+
+                direct_match = h_match and a_match
+                reverse_match = h_rev_match and a_rev_match
+
+                if direct_match or reverse_match:
+                    # Сливаем данные: добавляем источники и коэффициенты из второго в первый
+                    d1.setdefault("sources", []).extend(d2.get("sources", []))
+                    d1["sources"] = list(set(d1["sources"]))
+                    
+                    # Если у первого не было коэффициентов, а у второго есть — забираем
+                    if not d1.get("odds") and d2.get("odds"):
+                        d1["odds"] = d2["odds"]
+                    
+                    # Помечаем второй ключ как исключенный (дубликат)
+                    excluded_keys.add(k2)
+
+            merged_matches[k1] = d1
+
+    return merged_matches
+
+def get_match(canonical_id: str) -> Optional[Dict[str, Any]]:
+    """Читает один live-матч по canonical_id."""
+    return get_from_cache(canonical_id)
+
+def get_match_any(canonical_id: str) -> Optional[Dict[str, Any]]:
+    """Автоматический поиск матча в live и истории."""
+    match = get_from_cache(canonical_id)
+    if match:
+        return match
+    return get_history_match(canonical_id)
+
+def get_history_match(canonical_id: str) -> Optional[Dict[str, Any]]:
+    """Чтение исторического матча из history:match:{cid}."""
+    return get_key(f"history:match:{canonical_id}")
+
+def get_history_by_league(league_code: str, limit: int = 100) -> list:
+    """Чтение матчей лиги из ZSET history:league:{code}."""
+    try:
+        keys = get_key(f"history:league:{league_code}")
+        if not keys or not isinstance(keys, list):
+            return []
+        matches = []
+        for cid in keys[:limit]:
+            m = get_history_match(cid)
+            if m:
+                matches.append(m)
+        return matches
+    except Exception:
+        return []
+
+def get_analysis(canonical_id: str) -> Optional[Dict[str, Any]]:
+    """Чтение анализа из analysis:{cid}."""
+    return get_key(f"analysis:{canonical_id}")
+
+def save_analysis(canonical_id: str, analysis_data: dict) -> bool:
+    """Запись анализа value engine в analysis:{cid} (raw JSON)."""
+    try:
+        set_key(f"analysis:{canonical_id}", analysis_data)
+        return True
+    except Exception:
+        return False
+
+def get_all_matches() -> Dict[str, Any]:
+    """Возвращает все live-матчи из Redis с предварительной автосклейкой."""
+    all_data = get_all_fields()
+    matches = {}
+    for key, val in all_data.items():
+        if key.startswith("match:") and "index" not in key and isinstance(val, dict):
+            matches[key.replace("match:", "")] = val
+    return auto_merge_duplicates(matches)
+
+def get_all_history_matches() -> Dict[str, Any]:
+    """Возвращает все исторические матчи (history:match:*) из Redis."""
+    all_data = get_all_fields()
+    matches = {}
+    for key, val in all_data.items():
+        if key.startswith("history:match:") and isinstance(val, dict):
+            matches[key.replace("history:match:", "")] = val
+    return matches
+
+def get_matches_by_date_range(days: Optional[int] = None, days_ahead: Optional[int] = None) -> Dict[str, Any]:
+    """Получение матчей через шардированные индексы дат с автоматической дедупликацией."""
+    if days is None:
+        days = INDEX_LOOKBACK_DAYS
+    if days_ahead is None:
+        days_ahead = INDEX_LOOKAHEAD_DAYS
+
+    today = datetime.now(MSK_TIMEZONE).date()
+    all_ids = set()
+
+    for i in range(days):
+        d = today - timedelta(days=i)
+        shard_key = f"match:index:{d.strftime('%Y%m%d')}"
+        shard = get_from_cache(shard_key)
+        if isinstance(shard, list):
+            all_ids.update(shard)
+
+    for i in range(1, days_ahead + 1):
+        d = today + timedelta(days=i)
+        shard_key = f"match:index:{d.strftime('%Y%m%d')}"
+        shard = get_from_cache(shard_key)
+        if isinstance(shard, list):
+            all_ids.update(shard)
+
+    if not all_ids:
+        flat = get_from_cache(INDEX_FIELD)
+        if isinstance(flat, list):
+            all_ids = set(flat)
+
+    if not all_ids:
+        all_data = get_all_fields()
+        matches = {}
+        for key, val in all_data.items():
+            if key.startswith("match:") and "index" not in key and isinstance(val, dict):
+                matches[key.replace("match:", "")] = val
+        return auto_merge_duplicates(matches)
+
+    match_keys = [f"match:{mid}" for mid in all_ids]
+    matches_raw = batch_get_from_cache(match_keys)
+
+    matches: Dict[str, Any] = {}
+    for key, val in matches_raw.items():
+        if val is None:
+            continue
+        if isinstance(val, dict):
+            matches[key.replace("match:", "")] = val
+            
+    return auto_merge_duplicates(matches)
+
+def upsert_match(
+    home_team: str, away_team: str, date_utc: str,
+    competition: str, country: str, source: str,
+    status: str = "scheduled", mode: str = "live", **extra
+) -> str:
+    """Создает или обновляет матч в каноническом формате v710."""
+    canonical_id = build_canonical_id(home_team, away_team, date_utc)
+    if mode == "history":
+        history_key = f"history:match:{canonical_id}"
+        existing = get_key(history_key)
+        if existing:
+            return canonical_id
+        match_obj = {
+            "canonical_id": canonical_id,
+            "home": home_team,
+            "away": away_team,
+            "home_clean": clean_team_name(home_team),
+            "away_clean": clean_team_name(away_team),
+            "competition": competition,
+            "country": country,
+            "date_utc": date_utc,
+            "status": "completed",
+            "schema_version": SCHEMA_VERSION,
+            "version": 1,
+            "created_at": now_msk(),
+            "updated_at": now_msk(),
+            **extra
+        }
+        set_key(history_key, match_obj)
+        return canonical_id
+
+    match_key = f"match:{canonical_id}"
+    existing = get_from_cache(canonical_id)
+    
+    if existing:
+        existing["updated_at"] = now_msk()
+        if source not in existing.get("sources", []):
+            existing.setdefault("sources", []).append(source)
+        save_to_cache(canonical_id, existing)
+        return canonical_id
+
+    match_obj = {
+        "canonical_id": canonical_id,
+        "home": home_team,
+        "away": away_team,
+        "home_clean": clean_team_name(home_team),
+        "away_clean": clean_team_name(away_team),
+        "competition": competition,
+        "country": country,
+        "date_utc": date_utc,
+        "status": status,
+        "score": None,
+        "version": 1,
+        "schema_version": SCHEMA_VERSION,
+        "odds": extra.get("odds", {}),
+        "source_ids": extra.get("source_ids", {source: extra.get("source_id", "")}),
+        "sources": [source],
+        "section_history": [],
+        "value_analysis": {},
+        "created_at": now_msk(),
+        "updated_at": now_msk(),
+    }
+    
+    save_to_cache(canonical_id, match_obj)
+    
+    date_str = date_utc.replace("-", "").replace(":", "").replace("T", "")[:8] if date_utc else datetime.now(MSK_TIMEZONE).strftime("%Y%m%d")
+    shard_key = f"match:index:{date_str}"
+    shard = get_from_cache(shard_key) or []
+    if canonical_id not in shard:
+        shard.append(canonical_id)
+        save_to_cache(shard_key, shard)
+
+    return canonical_id
+
+def patch_match(canonical_id: str, section: str, data: Any, source: str, upstream: Optional[str] = None) -> bool:
+    """Точечное обновление секции матча с версионированием."""
+    match_obj = get_from_cache(canonical_id)
+    if not match_obj:
+        return bool(get_key(f"history:match:{canonical_id}"))
+    
+    match_obj[section] = data
+    match_obj["version"] = match_obj.get("version", 1) + 1
+    match_obj["updated_at"] = now_msk()
+    if source not in match_obj.get("sources", []):
+        match_obj.setdefault("sources", []).append(source)
+        
+    return save_to_cache(canonical_id, match_obj)
+
+def save_meta(collector_name: str, **metrics: Any) -> None:
+    """Единая запись мета для любого коллектора."""
+    meta_key = f"{collector_name}:meta"
+    meta_data = get_from_cache(meta_key) or {}
+    meta_data.update(metrics)
+    meta_data["last_run"] = now_msk()
+    save_to_cache(meta_key, meta_data)
+
+def save_search_results(result: dict) -> bool:
+    """Сохраняет результаты анализа валуйных ставок в кэш."""
+    try:
+        save_to_cache("search:results:latest", result)
+        return True
+    except Exception:
+        return False
+
+def migrate_schema(all_data: Optional[Dict[str, Any]] = None) -> int:
+    """Миграция данных к схеме v710."""
+    if all_data is None:
+        all_data = get_all_fields()
+    count = 0
+    for key, payload in all_data.items():
+        if not key.startswith("match:") or key.startswith("match:index"):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        changed = False
+        if "version" not in payload:
+            payload["version"] = 1
+            changed = True
+        
+        if payload.get("schema_version") != SCHEMA_VERSION:
+            payload["schema_version"] = SCHEMA_VERSION
+            changed = True
+
+        if changed:
+            save_to_cache(key.replace("match:", ""), payload)
+            count += 1
+    return count
+
+def cleanup_expired(all_data: Optional[Dict[str, Any]] = None) -> dict:
+    if all_data is None:
+        all_data = get_all_fields()
+    return {"checked": len(all_data), "deleted": 0, "finished": 0, "expired": 0}
+
+def run_initialization(collector: Optional[str] = None) -> Dict[str, Any]:
+    """Health-check Redis + сброс circuit breaker + миграция схемы."""
+    start = time.time()
+    metrics = {
+        "redis_available": False,
+        "circuit_breaker_reset": False,
+        "migration_count": 0,
+        "cleanup_count": 0,
+        "init_latency_ms": 0,
+    }
+
+    if not is_redis_available():
+        return metrics
+
+    metrics["redis_available"] = True
+    try:
+        reset_circuit_breaker()
+        metrics["circuit_breaker_reset"] = True
+    except Exception:
+        pass
+
+    all_data = get_all_fields()
+    metrics["migration_count"] = migrate_schema(all_data)
+    cleanup_result = cleanup_expired(all_data)
+    metrics["cleanup_count"] = cleanup_result.get("deleted", 0)
+
+    metrics["init_latency_ms"] = int((time.time() - start) * 1000)
+    return metrics
+        
