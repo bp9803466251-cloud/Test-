@@ -30,31 +30,34 @@ def generate_stress_fixtures_v710(count: int = 550) -> List[Dict[str, Any]]:
     """
     logger.info(f"Инициализация генерации {count} нагрузочных паспортов схемы v710...")
     pool = []
-    
+
     # Список базовых команд для генерации пар
     teams = ["Arsenal", "Chelsea", "Liverpool", "Man_City", "Real_Madrid", "Barcelona", "Milan", "Inter"]
-    
+
     for i in range(count):
         cid = f"match__stress_h_{i}__stress_a_{i}__20261017"
-        
+
         # Случайный выбор команд с защитой от дублирования
         h_team, a_team = random.sample(teams, 2)
-        
-        # Дефолтные очищенные метрики
-        home_clean = 1.5 + random.random() * 2
-        away_clean = 1.5 + random.random() * 2
-        
-        # Сборка структуры котировок
-        current_odds = {"home_clean": 2.10, "draw": 3.40, "away_clean": 2.90}
-        
+
+        # Очищенные имена команд — строки (контракт v710: *_clean = cleaned team name)
+        home_clean = f"stress_h_{i}"
+        away_clean = f"stress_a_{i}"
+
+        # Плоский базис v710: ключи "1"/"X"/"2"
+        current_odds = {"1": 2.10, "X": 3.40, "2": 2.90}
+
         # Внедрение контролируемых аномалий по индексам
         if i % 15 == 0:
             # Активация Safe-guard токена bayern_win
             h_team = "bayern_win"
         elif i % 25 == 0:
-            # Отрицательная или нулевая маржа (критический тест Ньютона-Рафсона)
-            current_odds = {"home_clean": 1.05, "draw": 1.02, "away_clean": 1.01}
-            
+            # Низкая маржа (критический тест Ньютона-Рафсона на модели Шина)
+            current_odds = {"1": 1.05, "X": 1.02, "2": 1.01}
+        elif i % 37 == 0:
+            # Валуйный перевес — активация ветки HOT VALUE_BET
+            current_odds = {"1": 2.60, "X": 3.40, "2": 2.90}
+
         match_obj = {
             "canonical_id": cid,
             "home_team": h_team,
@@ -65,23 +68,23 @@ def generate_stress_fixtures_v710(count: int = 550) -> List[Dict[str, Any]]:
             "status": "scheduled",
             "competition": "Stress Test League",
             "schema_version": "v710",
+            "odds_1x2": dict(current_odds),
             "odds": {
                 "1x2": {
-                    "current": current_odds,
+                    "current": dict(current_odds),
                     "sources": [
                         {
-                            "source_name": "propline", 
-                            "price": {"home_clean": current_odds["home_clean"], "draw": current_odds["draw"], "away_clean": current_odds["away_clean"]}
+                            "source_name": "propline",
+                            "price": dict(current_odds)
                         }
                     ]
                 }
             },
-            "predictions": {"home_win": 0.45, "draw": 0.25, "away_win": 0.30},
             "stats": {"xg_home": 1.6, "xg_away": 1.2, "goals_home": 1.4, "goals_away": 1.1},
             "flags": {"defensive_collapse": False, "critical_missing_players": False}
         }
         pool.append(match_obj)
-        
+
     logger.info(f"Генерация пула фикстур завершена. Создано {len(pool)} объектов.")
     return pool
 
