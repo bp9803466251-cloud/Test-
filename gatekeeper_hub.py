@@ -108,7 +108,7 @@ def auto_merge_duplicates(matches_dict: Dict[str, Any]) -> Dict[str, Any]:
                 a_match = (a1c == a2c) or (len(a1c) > 3 and a1c in a2c) or (len(a2c) > 3 and a2c in a1c)
                 
                 h_rev_match = (h1c == a2c) or (len(h1c) > 3 and h1c in a2c) or (len(a2c) > 3 and a2c in h1c)
-                a_rev_match = (a1c == h2c) or (len(a1c) > 3 and a1c in h2c) or (len(h2c) > 3 and h2c in a1c)
+                a_rev_match = (a1c == h2c) or (len(a1c) > 3 and a1c in h2c) or (len(a2c) > 3 and a2c in a1c)
 
                 direct_match = h_match and a_match
                 reverse_match = h_rev_match and a_rev_match
@@ -131,18 +131,21 @@ def auto_merge_duplicates(matches_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_match(canonical_id: str) -> Optional[Dict[str, Any]]:
     """Читает один live-матч по canonical_id."""
-    return get_from_cache(canonical_id)
+    match_key = canonical_id if canonical_id.startswith("match:") else f"match:{canonical_id}"
+    return get_from_cache(match_key)
 
 def get_match_any(canonical_id: str) -> Optional[Dict[str, Any]]:
     """Автоматический поиск матча в live и истории."""
-    match = get_from_cache(canonical_id)
+    raw_cid = canonical_id.replace("match:", "")
+    match = get_match(raw_cid)
     if match:
         return match
-    return get_history_match(canonical_id)
+    return get_history_match(raw_cid)
 
 def get_history_match(canonical_id: str) -> Optional[Dict[str, Any]]:
     """Чтение исторического матча из history:match:{cid}."""
-    return get_key(f"history:match:{canonical_id}")
+    raw_cid = canonical_id.replace("match:", "")
+    return get_key(f"history:match:{raw_cid}")
 
 def get_history_by_league(league_code: str, limit: int = 100) -> list:
     """Чтение матчей лиги из ZSET history:league:{code}."""
@@ -161,12 +164,14 @@ def get_history_by_league(league_code: str, limit: int = 100) -> list:
 
 def get_analysis(canonical_id: str) -> Optional[Dict[str, Any]]:
     """Чтение анализа из analysis:{cid}."""
-    return get_key(f"analysis:{canonical_id}")
+    raw_cid = canonical_id.replace("match:", "")
+    return get_key(f"analysis:{raw_cid}")
 
 def save_analysis(canonical_id: str, analysis_data: dict) -> bool:
     """Запись анализа value engine в analysis:{cid} (raw JSON)."""
     try:
-        set_key(f"analysis:{canonical_id}", analysis_data)
+        raw_cid = canonical_id.replace("match:", "")
+        set_key(f"analysis:{raw_cid}", analysis_data)
         return True
     except Exception:
         return False
@@ -226,7 +231,7 @@ def get_matches_by_date_range(days: Optional[int] = None, days_ahead: Optional[i
                 matches[key.replace("match:", "")] = val
         return auto_merge_duplicates(matches)
 
-    match_keys = [f"match:{mid}" for mid in all_ids]
+    match_keys = [f"match:{mid}" if not mid.startswith("match:") else mid for mid in all_ids]
     matches_raw = batch_get_from_cache(match_keys)
 
     matches: Dict[str, Any] = {}
@@ -243,7 +248,7 @@ def upsert_match(
     competition: str, country: str, source: str,
     status: str = "scheduled", mode: str = "live", **extra
 ) -> str:
-    """Создает или обновляет матч в каноническом формате v710."""
+    """Создает или обновляет матч в каноническом формате v710 с префиксом match:."""
     canonical_id = build_canonical_id(home_team, away_team, date_utc)
     if mode == "history":
         history_key = f"history:match:{canonical_id}"
@@ -270,13 +275,13 @@ def upsert_match(
         return canonical_id
 
     match_key = f"match:{canonical_id}"
-    existing = get_from_cache(canonical_id)
+    existing = get_from_cache(match_key)
     
     if existing:
         existing["updated_at"] = now_msk()
         if source not in existing.get("sources", []):
             existing.setdefault("sources", []).append(source)
-        save_to_cache(canonical_id, existing)
+        save_to_cache(match_key, existing)
         return canonical_id
 
     match_obj = {
@@ -301,7 +306,7 @@ def upsert_match(
         "updated_at": now_msk(),
     }
     
-    save_to_cache(canonical_id, match_obj)
+    save_to_cache(match_key, match_obj)
     
     date_str = date_utc.replace("-", "").replace(":", "").replace("T", "")[:8] if date_utc else datetime.now(MSK_TIMEZONE).strftime("%Y%m%d")
     shard_key = f"match:index:{date_str}"
@@ -313,10 +318,12 @@ def upsert_match(
     return canonical_id
 
 def patch_match(canonical_id: str, section: str, data: Any, source: str, upstream: Optional[str] = None) -> bool:
-    """Точечное обновление секции матча с версионированием."""
-    match_obj = get_from_cache(canonical_id)
+    """Точечное обновление секции матча с версионированием с учетом префикса match:."""
+    match_key = canonical_id if canonical_id.startswith("match:") else f"match:{canonical_id}"
+    match_obj = get_from_cache(match_key)
     if not match_obj:
-        return bool(get_key(f"history:match:{canonical_id}"))
+        raw_cid = canonical_id.replace("match:", "")
+        return bool(get_key(f"history:match:{raw_cid}"))
     
     match_obj[section] = data
     match_obj["version"] = match_obj.get("version", 1) + 1
@@ -324,7 +331,7 @@ def patch_match(canonical_id: str, section: str, data: Any, source: str, upstrea
     if source not in match_obj.get("sources", []):
         match_obj.setdefault("sources", []).append(source)
         
-    return save_to_cache(canonical_id, match_obj)
+    return save_to_cache(match_key, match_obj)
 
 def save_meta(collector_name: str, **metrics: Any) -> None:
     """Единая запись мета для любого коллектора."""
@@ -362,7 +369,7 @@ def migrate_schema(all_data: Optional[Dict[str, Any]] = None) -> int:
             changed = True
 
         if changed:
-            save_to_cache(key.replace("match:", ""), payload)
+            save_to_cache(key, payload)
             count += 1
     return count
 
@@ -399,4 +406,4 @@ def run_initialization(collector: Optional[str] = None) -> Dict[str, Any]:
 
     metrics["init_latency_ms"] = int((time.time() - start) * 1000)
     return metrics
-        
+                
