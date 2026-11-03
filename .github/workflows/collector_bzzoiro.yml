@@ -9,10 +9,14 @@ on:
         default: false
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12" # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
 
 permissions:
   contents: read
+
+concurrency:
+  group: collector-bzzoiro # [ADDED] Два ручных запуска конкурировали бы за квоты поставщика и гонки Redis
+  cancel-in-progress: false # Запущенный сбор данных не убиваем: повторный запуск встанет в очередь
 
 jobs:
   collect-bzzoiro:
@@ -24,24 +28,38 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "${{ env.PYTHON_VERSION }}"
+          cache: 'pip' # [ADDED] Кэш pip между запусками
 
       - name: Install dependencies
-        run: pip install curl_cffi
+        run: |
+          python -m pip install --upgrade pip
+          # [FIXED] Непривязанный "pip install curl_cffi" -> пин из патченного requirements
+          # (>=0.7.0,<1.0): профиль chrome110 завязан на совместимую линейку 0.7.x
+          pip install "curl_cffi>=0.7.0,<1.0"
 
       - name: Run collector
         env:
+          # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
+          # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+          SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
+          # Ключ поставщика и настройки квот/дилей (§1.35)
           BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY || '' }}
           BZZOIRO_RATE_DELAY: ${{ vars.BZZOIRO_RATE_DELAY || '0.5' }}
           BZZOIRO_ENRICH_DELAY: ${{ vars.BZZOIRO_ENRICH_DELAY || '0.2' }}
           BZZOIRO_MAX_RETRIES: ${{ vars.BZZOIRO_MAX_RETRIES || '1' }}
+          # [ADDED] Паритет с docker_compose.yml
+          GATEKEEPER_ENV: production
         run: |
+          # [FIXED] github.event_name избыточен: триггер один — workflow_dispatch
           ARGS=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.events_only }}" = "true" ]; then
+          if [ "${{ inputs.events_only }}" = "true" ]; then
             ARGS="--events-only"
           fi
-          python collector_bzzoiro.py $ARGS
+          # -u: небуферизированный вывод в логи Actions
+          python -u collector_bzzoiro.py $ARGS
           
