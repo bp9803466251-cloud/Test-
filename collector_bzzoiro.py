@@ -147,7 +147,7 @@ def _extract_score(ev: dict) -> Any:
 
 
 def _extract_best_odds(odds_data: Any) -> dict:
-    """Универсальный парсер котировок под строгие требования _validate_section хаба."""
+    """Парсер коэффициентов в строгом соответствии с _merge_odds и _validate_section хаба."""
     flat_1x2 = {}
     items = []
     if isinstance(odds_data, dict):
@@ -200,7 +200,7 @@ def _extract_best_odds(odds_data: Any) -> dict:
                 elif k in ("2", "away", "away_win") and v:
                     flat_1x2["away"] = float(v)
 
-    return flat_1x2
+    return {k: str(v) for k, v in flat_1x2.items() if v is not None}
 
 
 def _flatten_stats(stats_data: dict, parent_key: str = "", sep: str = "_") -> dict:
@@ -410,12 +410,9 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             elif odds_data and odds_data is not _NOT_FOUND:
                 best_odds = _extract_best_odds(odds_data)
                 if best_odds:
-                    if idx < 3:
-                        logger.info(f"DEBUG ODDS payload for match {cid}: {best_odds}")
                     if patch_match(cid, "odds", best_odds, source="bzzoiro"):
                         odds_enriched += 1
                     else:
-                        logger.warning(f"ODDS validation FAILED for match {cid} with data: {best_odds}")
                         enrichment_errors += 1
                 else:
                     not_found += 1
@@ -437,12 +434,9 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             elif h2h_data and isinstance(h2h_data, dict):
                 inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
                 if isinstance(inner_h2h, dict) and inner_h2h:
-                    if idx < 3:
-                        logger.info(f"DEBUG H2H payload for match {cid}: {list(inner_h2h.keys())}")
                     if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
                         h2h_enriched += 1
                     else:
-                        logger.warning(f"H2H validation FAILED for match {cid}")
                         enrichment_errors += 1
                 else:
                     not_found += 1
@@ -466,7 +460,6 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                             if patch_match(cid, "stats", flat_stats, source="bzzoiro"):
                                 stats_enriched += 1
                             else:
-                                logger.warning(f"STATS validation FAILED for match {cid}")
                                 enrichment_errors += 1
                         else:
                             not_found += 1
