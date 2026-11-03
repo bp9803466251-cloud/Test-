@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 collector_bzzoiro.py — PRIMARY Ingestion Collector для Bzzoiro (v9.6.8-patched).
-Сбор сетки матчей, расширенных коэффициентов, статистики и H2H с полной адаптацией под Schema v710.
+Сбор сетки матчей, коэффициентов, статистики и H2H с детальным дебагом для первых 10 матчей.
 """
 
 import os
@@ -12,15 +12,15 @@ import datetime as dt
 from typing import Any
 import logging
 
-# Использование curl_cffi с impersonate="chrome" для обхода WAF/Cloudflare внешних API (§1.3, §1.23)
+# Использование curl_cffi с impersonate="chrome" для обхода WAF/Cloudflare внешних API (§1.3, §1.23)[span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span)
 try:
     from curl_cffi import requests
 except ImportError:
-    import requests  # fallback
+    import requests  # fallback, но рекомендуется curl_cffi[span_2](start_span)[span_2](end_span)
 
-# ─── Logging setup ───
+# ─── Logging setup (DEBUG enabled) ───
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - [BZZOIRO] %(message)s'
 )
 logger = logging.getLogger("collector_bzzoiro")
@@ -40,8 +40,10 @@ except ImportError:
     logger.error("gatekeeper_hub не найден")
     sys.exit(1)
 
-# ─── Константы ───
+# ─── Константы и маркеры ───
 _NOT_FOUND = object()
+DEBUG_EVENT_COUNT = int(os.environ.get("DEBUG_EVENT_COUNT", "10"))
+
 BZZOIRO_BASE = os.environ.get("BZZOIRO_BASE_URL", "https://sports.bzzoiro.com/api/v2")
 BZZOIRO_API_KEY = os.environ.get("BZZOIRO_API_KEY", "")
 RATE_DELAY = float(os.environ.get("BZZOIRO_RATE_DELAY", "0.5"))
@@ -84,6 +86,7 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
+                logger.error(f"HTTP {resp.status_code} [BODY]: {resp.text[:300]}")
                 if attempt < max_retries:
                     time.sleep(RATE_DELAY * 2)
                     continue
@@ -95,6 +98,7 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
             return data
 
         except Exception as e:
+            logger.error(f"Request exception on {url}: {e}")
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue
@@ -143,10 +147,6 @@ def _extract_score(ev: dict) -> Any:
 
 
 def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
-    """
-    Приводит коэффициенты Bzzoiro к формату Schema v710 Gatekeeper.
-    Формирует корректные ключи для 'odds' (home, draw, away, 1, X, 2).
-    """
     flat_1x2 = {}
     extended_markets = {}
 
@@ -184,13 +184,10 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
         oc_upper = str(outcome).upper()
         if market in ("1x2", "match_result", "full_time"):
             if oc_upper in ("HOME", "1", "HOME_WIN"):
-                flat_1x2["home"] = val
                 flat_1x2["1"] = val
             elif oc_upper in ("DRAW", "X"):
-                flat_1x2["draw"] = val
                 flat_1x2["X"] = val
             elif oc_upper in ("AWAY", "2", "AWAY_WIN"):
-                flat_1x2["away"] = val
                 flat_1x2["2"] = val
         else:
             if market not in extended_markets:
@@ -202,70 +199,26 @@ def _process_odds_payload(odds_data: Any) -> tuple[dict, dict]:
         if isinstance(raw_odds, dict):
             for k, v in raw_odds.items():
                 if k in ("1", "home", "home_win") and v:
-                    val = float(v)
-                    flat_1x2["home"] = val
-                    flat_1x2["1"] = val
+                    flat_1x2["1"] = float(v)
                 elif k in ("X", "draw") and v:
-                    val = float(v)
-                    flat_1x2["draw"] = val
-                    flat_1x2["X"] = val
+                    flat_1x2["X"] = float(v)
                 elif k in ("2", "away", "away_win") and v:
-                    val = float(v)
-                    flat_1x2["away"] = val
-                    flat_1x2["2"] = val
+                    flat_1x2["2"] = float(v)
 
     return flat_1x2, extended_markets
 
 
-def _format_h2h_data(h2h_raw: Any) -> dict:
-    """
-    Нормализует H2H для сохранения в Gatekeeper Hub.
-    Гарантирует наличие 'matches' и служебного поля 'source'.
-    """
-    if not h2h_raw:
+def _flatten_stats(stats_data: dict, parent_key: str = "", sep: str = "_") -> dict:
+    items = []
+    if not isinstance(stats_data, dict):
         return {}
-
-    formatted = {"source": "bzzoiro"}
-
-    if isinstance(h2h_raw, dict):
-        matches = h2h_raw.get("recent_matches") or h2h_raw.get("matches") or h2h_raw.get("head_to_head")
-        if isinstance(matches, list):
-            formatted["matches"] = matches
+    for k, v in stats_data.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(_flatten_stats(v, new_key, sep=sep).items())
         else:
-            formatted["matches"] = []
-        
-        # Переносим агрегированные метрики, если присутствуют
-        for k in ("total_matches", "home_wins", "draws", "away_wins", "home_goals", "away_goals"):
-            if k in h2h_raw:
-                formatted[k] = h2h_raw[k]
-
-    elif isinstance(h2h_raw, list):
-        formatted["matches"] = h2h_raw
-
-    return formatted if formatted.get("matches") is not None else {}
-
-
-def _format_stats_data(stats_raw: Any) -> dict:
-    """
-    Форматирует статистику матча в структуру {'home': {...}, 'away': {...}}.
-    """
-    if not isinstance(stats_raw, dict):
-        return {}
-
-    inner = stats_raw.get("stats", stats_raw)
-    if not isinstance(inner, dict):
-        return {}
-
-    home_stats = inner.get("home") or {}
-    away_stats = inner.get("away") or {}
-
-    if home_stats or away_stats:
-        return {
-            "home": home_stats,
-            "away": away_stats
-        }
-
-    return {}
+            items.append((new_key, v))
+    return dict(items)
 
 
 # ─── League pre-fetch ───
@@ -299,7 +252,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
 
     logger.info("=" * 60)
-    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (Schema v710 Compliant) started.")
+    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (DEBUG FIRST 10 MATCHES) started.")
     logger.info("=" * 60)
 
     # ─── Шаг 0: Инициализация Redis ───
@@ -327,7 +280,10 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
         pages_fetched += 1
 
-        if data is None or data is _NOT_FOUND:
+        if data is None:
+            logger.error(f"Ошибка загрузки страницы {pages_fetched}")
+            break
+        if data is _NOT_FOUND:
             break
 
         if isinstance(data, dict):
@@ -438,8 +394,12 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         logger.info(f"Шаг 3: Обогащение {len(stored_matches)} матчей...")
 
         for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
+            is_first_ten = idx < 10
             status = ev.get("status", "")
             is_prematch = status in PREMATCH_STATUSES
+
+            if is_first_ten:
+                logger.debug(f"--- DEBUG MATCH #{idx+1} [ID: {bzzoiro_id}] ({ev.get('home_team')} vs {ev.get('away_team')}) ---")
 
             if not is_prematch:
                 score = _extract_score(ev)
@@ -456,12 +416,18 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 detail_data = _fetch_bzzoiro(detail_url, headers, max_retries=MAX_RETRIES)
                 if isinstance(detail_data, dict):
                     odds_data = detail_data.get("odds", detail_data)
+                    if is_first_ten:
+                        logger.debug(f"DEBUG MATCH #{idx+1} EVENT DETAIL KEYS: {list(detail_data.keys())}")
+
+            if is_first_ten:
+                logger.debug(f"DEBUG MATCH #{idx+1} ODDS DATA TYPE: {type(odds_data)} | CONTENT: {str(odds_data)[:500]}")
 
             if odds_data is _NOT_FOUND or not odds_data:
                 not_found += 1
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
                 if flat_1x2:
+                    # Требование Гейта 28 / §1.20: обязательный upstream="opta[span_3](start_span)"[span_3](end_span)
                     if patch_match(cid, "odds", flat_1x2, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
                     else:
@@ -479,20 +445,36 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
             ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
             
-            h2h_raw = None
+            h2h_data = None
             if isinstance(ev_detail, dict):
-                h2h_raw = ev_detail.get("h2h") or ev_detail.get("head_to_head") or ev_detail.get("headToHead")
+                h2h_data = ev_detail.get("h2h") or ev_detail.get("head_to_head") or ev_detail.get("headToHead")
 
-            if not h2h_raw or h2h_raw is _NOT_FOUND:
+            if not h2h_data or h2h_data is _NOT_FOUND:
                 h2h_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h"
-                h2h_raw = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
+                h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
 
-            if h2h_raw is _NOT_FOUND or not h2h_raw:
+            if is_first_ten:
+                logger.debug(f"DEBUG MATCH #{idx+1} H2H DATA: {str(h2h_data)[:400]}")
+
+            if h2h_data is _NOT_FOUND or not h2h_data:
                 not_found += 1
             else:
-                h2h_formatted = _format_h2h_data(h2h_raw)
-                if h2h_formatted:
-                    if patch_match(cid, "h2h", h2h_formatted, source="bzzoiro"):
+                inner_h2h = {}
+                if isinstance(h2h_data, dict):
+                    inner_h2h = (
+                        h2h_data.get("head_to_head") or 
+                        h2h_data.get("h2h") or 
+                        h2h_data.get("headToHead") or 
+                        h2h_data.get("data") or 
+                        h2h_data
+                    )
+                elif isinstance(h2h_data, list):
+                    inner_h2h = {"matches": h2h_data}
+
+                if isinstance(inner_h2h, dict) and inner_h2h:
+                    # Требование регламента §1.29a: обязательный инжекционный маркер source="bzzoiro[span_4](start_span)"[span_4](end_span)
+                    inner_h2h["source"] = "bzzoiro"
+                    if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
                         h2h_enriched += 1
                     else:
                         enrichment_errors += 1
@@ -503,20 +485,25 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
             # ─── Stats ───
             if not is_prematch:
-                stats_raw = None
+                stats_data = None
                 if isinstance(ev_detail, dict):
-                    stats_raw = ev_detail.get("stats")
+                    stats_data = ev_detail.get("stats")
 
-                if not stats_raw or stats_raw is _NOT_FOUND:
+                if not stats_data or stats_data is _NOT_FOUND:
                     stats_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/stats"
-                    stats_raw = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
+                    stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
 
-                if stats_raw is _NOT_FOUND or not stats_raw:
+                if is_first_ten:
+                    logger.debug(f"DEBUG MATCH #{idx+1} STATS DATA: {str(stats_data)[:400]}")
+
+                if stats_data is _NOT_FOUND or not stats_data:
                     not_found += 1
-                elif isinstance(stats_raw, dict):
-                    stats_formatted = _format_stats_data(stats_raw)
-                    if stats_formatted:
-                        if patch_match(cid, "stats", stats_formatted, source="bzzoiro"):
+                elif isinstance(stats_data, dict):
+                    inner_stats = stats_data.get("stats", stats_data)
+                    if isinstance(inner_stats, dict) and inner_stats:
+                        flat_stats = _flatten_stats(inner_stats)
+                        # Требование Гейта 28 / §1.20: обязательный upstream="opta[span_5](start_span)"[span_5](end_span)
+                        if patch_match(cid, "stats", flat_stats, source="bzzoiro", upstream="opta"):
                             stats_enriched += 1
                         else:
                             enrichment_errors += 1
