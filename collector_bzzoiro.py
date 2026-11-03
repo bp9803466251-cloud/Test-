@@ -407,7 +407,6 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     if patch_match(cid, "score", score, source="bzzoiro"):
                         score_enriched += 1
 
-            # Единый стабильный запрос детекта всей информации по матчу через /events/{id}/
             event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
             ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
 
@@ -416,7 +415,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 time.sleep(ENRICH_DELAY)
                 continue
 
-            # ─── Odds (Strict-Flat v710 / Гейт 28) ───
+            # ─── Odds (Strict-Flat Схема v710 / Гейт 28) ───
             odds_data = ev_detail.get("odds") or ev_detail
             if is_first_ten:
                 logger.debug(f"DEBUG MATCH #{idx+1} ODDS DATA TYPE: {type(odds_data)}")
@@ -426,13 +425,13 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
                 if flat_1x2:
-                    # Приводим к строго плоскому формату исходов "1", "X", "2" под Схему v710
                     flat_odds_v710 = {
                         "1": float(flat_1x2.get("1", flat_1x2.get("home", 0.0))),
                         "X": float(flat_1x2.get("X", flat_1x2.get("draw", 0.0))),
                         "2": float(flat_1x2.get("2", flat_1x2.get("away", 0.0)))
                     }
-                    if patch_match(cid, "odds", flat_odds_v710, source="bzzoiro", upstream="opta"):
+                    # Исправлено: имя секции строго "odds_1x2" согласно Схеме v710 (§1.21)
+                    if patch_match(cid, "odds_1x2", flat_odds_v710, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
                     else:
                         enrichment_errors += 1
