@@ -8,16 +8,16 @@ permissions:
 
 concurrency:
   group: gatekeeper-pipeline # Изолированная concurrency-группа (§12)
-  cancel-in-progress: false
+  cancel-in-progress: false # Запущенный конвейер не убиваем посреди сбора данных
 
 env:
-  PYTHON_VERSION: '3.11' # Единая Python-версия по стандарту §1.33
+  PYTHON_VERSION: '3.12' # [FIXED] Синхронизировано с патч-циклом 9.6.8 и Dockerfile (python:3.12-slim)
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # Синхронизировано со спецификацией gatekeeper_config.py
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # Защита от зависаний по правилу §1.10
+    timeout-minutes: 45 # [FIXED] 15 -> 45: коллекторы (§1.35-1.37) с квотами и бэкоффом легально превышают 15 минут
 
     steps:
       - name: Checkout Repository
@@ -29,30 +29,38 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      - name: Install Mathematics Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Принудительно гарантируем наличие NumPy и SciPy для CORE ENGINE V6.7
-          pip install numpy scipy
+          # [REMOVED] Принудительный "pip install numpy scipy" без пинов:
+          # он мог поднять numpy 2.x поверх пина numpy<2.0.0 (ABI-конфликт со scipy>=1.10,<1.14).
+          # Все версии уже зафиксированы в requirements.txt — второй установки не требуется.
 
       - name: Execute CORE ENGINE V6.7
         run: python main.py
         env:
           # Сетевой транспорт кэш-слоя Redis (redis_config.py)
+          # [FIXED] Прокинуты ВСЕ три пары имен по приоритетам §1.10:
+          # SHARED_UPSTASH_* -> SHARED_REDIS_REST_* -> UPSTASH_REDIS_REST_*
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN }}
+          SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL }}
+          SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
 
           # Ключи поставщиков данных для DATA ENGINE V6.7
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
           APIFY_SCRAPER_KEY: ${{ secrets.APIFY_SCRAPER_KEY }}
 
-          # [SYNCHRONIZED] Направлен секрет группы на ожидаемую транспортом переменную TELEGRAM_CHAT_ID
+          # [SYNCHRONIZED] Env-переменная TELEGRAM_CHAT_ID (ожидается транспортом)
+          # получает значение из секрета группы TELEGRAM_GROUP_ID
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-          
+
           # Системное окружение конфигурации
           GATEKEEPER_CONFIG_FILE: ${{ env.GATEKEEPER_CONFIG_FILE }}
-          GATEKEEPER_ENV: prod
+          GATEKEEPER_ENV: production # [FIXED] prod -> production: синхрон с docker_compose.yml
           
