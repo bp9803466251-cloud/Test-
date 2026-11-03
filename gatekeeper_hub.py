@@ -310,7 +310,12 @@ def upsert_match(
     
     date_str = date_utc.replace("-", "").replace(":", "").replace("T", "")[:8] if date_utc else datetime.now(MSK_TIMEZONE).strftime("%Y%m%d")
     shard_key = f"match:index:{date_str}"
-    shard = get_from_cache(shard_key) or []
+    
+    # Защита от поврежденного типа данных в кэше индекса (dict вместо list)
+    shard = get_from_cache(shard_key)
+    if not isinstance(shard, list):
+        shard = []
+        
     if canonical_id not in shard:
         shard.append(canonical_id)
         save_to_cache(shard_key, shard)
@@ -406,4 +411,4 @@ def run_initialization(collector: Optional[str] = None) -> Dict[str, Any]:
 
     metrics["init_latency_ms"] = int((time.time() - start) * 1000)
     return metrics
-        
+                
