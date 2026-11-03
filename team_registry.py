@@ -2666,7 +2666,7 @@ TEAM_ALIASES = {
     "everton cd": "everton",
     "everton de vina del mar": "everton",
     "everton de viña del mar": "everton",
-    "everton fc county cup": "everton", от
+    "everton fc county cup": "everton",
     "everton football club": "everton",
     "everton de vina": "everton_vina",
     "everton vina": "everton_vina",

@@ -23,19 +23,27 @@ cb_failure_threshold: 15       # Общий лимит штрафных балл
 cb_decay_interval_seconds: 60  # Интервал применения механизма затухания ошибок
 cb_decay_step_score: 2         # Количество баллов, списываемых за каждую минуту бездействия
 
-# Синхронизировано с Гейтом 20, 21, 27 и 28 в test_contracts.py и network_harvest_runtime.py
+# Синхронизировано с Гейтами 20, 21, 27 и 28 в test_contracts.py и network_harvest_runtime.py
+# [NOTE v9.6.8] Значения читаются hardcoded в патченных модулях (harvest, chaos_monkey):
+# изменение весов в этом YAML на поведение модулей НЕ влияет — здесь справочный реестр.
 penalty_weights:
   cascade_fallback_success: 1  # Сбой curl_cffi, но успешный перехват нативным urllib (деградация)
   total_pipeline_crash: 3      # Полный отказ сетевого конвейера (curl_cffi + urllib упали)
   schema_corruption: 5         # Нарушение структуры входящего пакета по правилу jsonschema v710
   redis_transaction_deadlock: 4 # Сбой транзакционного контекста при коммите в Redis Hub
-  feed_structure_drift_g28: 3   # [ADDED v9.6.8] Критическое нарушение плоской структуры фида v710
+  feed_structure_drift_g28: 3  # [ADDED v9.6.8] Критическое нарушение плоской структуры фида v710
 
 value_engine:
-  # Системные пороги обсчета (Синхронизировано с get_value_threshold в тесте)
-  value_threshold: 1.08        # Жесткий барьер отсечения 12 гейтов безопасности
-  threshold: 0.03              # Базовый дефолтный уровень (переопределяется get_adaptive_thresholds)
-  warm_threshold: 0.015        # Базовый дефолтный уровень
+  # [FIXED v9.6.8] Устранён конфликт двойного ключа: раньше threshold=0.03 и
+  # value_threshold=1.08 давали разные пороги (патченный gatekeeper_config.py
+  # читает threshold первым -> движок получал 1.03 вместо барьера 1.08).
+  # Семантика нормализации в патченном конфиг-модуле: значение <= 1.0 трактуется
+  # как доля эджа и конвертируется в множитель (0.08 -> 1.08); > 1.0 — как есть.
+  threshold: 1.08              # Системный порог отсечения — множитель EV
+  value_threshold: 1.08        # Легаси-алиас того же порога для читателей старой конвенции
+  # [NOTE] warm_threshold задан в ДОЛЯХ ЭДЖА (1.5%); потребитель обязан
+  # нормализовать в множитель при чтении напрямую (сверка по value_engine pending).
+  warm_threshold: 0.015
   mad_threshold: 2.5           # [ADDED v9.6.8] Адаптивный коэффициент фильтрации MAD ядра ценности
   poisson_nan_protection: true # [ADDED v9.6.8] Защита распределения Пуассона от NaN-инжекций
 

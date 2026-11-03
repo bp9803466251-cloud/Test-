@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
 match_linker.py — Модуль связывания реальных/актуальных матчей с историей из Redis
-и отправки сводного дашборда в Telegram (Gatekeeper-AI v9.6.1-audited).
+и отправки сводного дашборда в Telegram (Gatekeeper-AI v9.6.8-patched).
 """
 
 import os
-import sys
 import json
 import logging
 from datetime import datetime, timezone
 
-__version__ = "9.6.1-audited"
+__version__ = "9.6.8-patched"
 __all__ = ["link_match_with_history", "process_upcoming_matches", "__version__"]
 
 logger = logging.getLogger("match_linker")
@@ -39,18 +38,30 @@ def _get_value_engine():
 
 
 def fetch_all_history_pool():
-    """Загружает всю историю матчей из хэш-таблицы GatekeeperAI в Redis."""
+    """История: Root-ключи history:match:* (v9.6.8 §1.7d) + hash-фолбэк (легаси)."""
     redis_hub = _get_redis_hub()
     if not redis_hub:
         return []
 
+    matches = []
+
+    # Уровень 1: Root-ключи (новая топология v9.6.8)
+    scan_keys = getattr(redis_hub, "scan_keys", None)
+    get_history_match = getattr(redis_hub, "get_history_match", None)
+    if scan_keys and get_history_match:
+        try:
+            for key in scan_keys("history:match:*"):
+                cid = key.replace("history:match:", "") if isinstance(key, str) else key
+                m = get_history_match(cid)
+                if isinstance(m, dict):
+                    matches.append(m)
+        except Exception as e:
+            logger.warning(f"Root-скан истории недоступен: {e}")
+
+    # Уровень 2: hash-фолбэк (легаси-записи до миграции)
     try:
         all_fields = redis_hub.get_all_fields()
-        if not all_fields:
-            return []
-        
-        matches = []
-        for key, raw in all_fields.items():
+        for key, raw in (all_fields or {}).items():
             if not key.startswith("history:match:"):
                 continue
             try:
@@ -59,12 +70,16 @@ def fetch_all_history_pool():
                     matches.append(match)
             except Exception:
                 continue
-
-        matches.sort(key=lambda m: m.get("date_utc", ""))
-        return matches
     except Exception as e:
         logger.error(f"Ошибка получения истории из Redis: {e}")
-        return []
+
+    # Дедупликация по canonical_id: Root-ключи приоритетнее легаси
+    dedup = {}
+    for m in matches:
+        cid = m.get("canonical_id") or f"{m.get('home_clean')}__{m.get('away_clean')}__{m.get('date_utc')}"
+        if cid not in dedup:
+            dedup[cid] = m
+    return sorted(dedup.values(), key=lambda m: m.get("date_utc", ""))
 
 
 def build_team_history_map(target_match, history_pool, lookback=200):
@@ -84,7 +99,7 @@ def build_team_history_map(target_match, history_pool, lookback=200):
         m_home = m.get("home_clean") or m.get("home", "").lower().strip()
         m_away = m.get("away_clean") or m.get("away", "").lower().strip()
 
-        if home in (m_home, m_away) or away in (m_home, m_away):
+        if home == m_home or home == m_away or away == m_home or away == m_away:
             history.append(m)
             if len(history) >= lookback:
                 break
@@ -110,6 +125,44 @@ def link_match_with_history(match_data, history_pool=None, lookback=200):
         return None
 
 
+def _load_live_matches():
+    """Единое чтение live-контура через gatekeeper_hub (§1.4) с легаси-фолбэком."""
+    try:
+        import gatekeeper_hub
+        get_all = getattr(gatekeeper_hub, "get_all_matches", None)
+        if get_all:
+            data = get_all()
+            if isinstance(data, dict) and data:
+                return data
+            logger.warning("Live-контур пуст (индекс + шарды).")
+            return {}
+    except ImportError as e:
+        logger.warning(f"gatekeeper_hub недоступен, легаси-фолбэк на HGETALL: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка чтения через gatekeeper_hub: {e}")
+
+    # Легаси-фолбэк: прямой HGETALL (старый хаб до деплоя)
+    redis_hub = _get_redis_hub()
+    if not redis_hub:
+        return {}
+    try:
+        raw_all = redis_hub.get_all_fields() or {}
+        result = {}
+        for key, raw in raw_all.items():
+            if key.startswith("history:match:") or key.startswith("system:"):
+                continue
+            try:
+                m = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(m, dict):
+                    result[key] = m
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка чтения Redis: {e}")
+        return {}
+
+
 def process_upcoming_matches():
     """Находит актуальные матчи в Redis, связывает с историей, анализирует и отправляет сводный дашборд."""
     redis_hub = _get_redis_hub()
@@ -118,14 +171,9 @@ def process_upcoming_matches():
         return
 
     logger.info("=== ЗАПУСК ЛИНКОВКИ И АНАЛИЗА АКТУАЛЬНЫХ МАТЧЕЙ ===")
-    
-    try:
-        all_fields = redis_hub.get_all_fields()
-        if not all_fields:
-            logger.warning("Хэш-таблица GatekeeperAI пуста.")
-            return
-    except Exception as e:
-        logger.error(f"Ошибка чтения Redis: {e}")
+
+    all_matches = _load_live_matches()
+    if not all_matches:
         return
 
     history_pool = fetch_all_history_pool()
@@ -138,17 +186,14 @@ def process_upcoming_matches():
     
     analyzed_results = []
 
-    for key, raw in all_fields.items():
-        if key.startswith("history:match:"):
-            continue
-
+    for cid, match_data in all_matches.items():
         try:
-            match_data = json.loads(raw) if isinstance(raw, str) else raw
             if not isinstance(match_data, dict):
                 continue
 
             status = match_data.get("status", "").lower()
-            if status in ("ft", "finished", "aet"):
+            if status in ("completed", "postponed", "cancelled",
+                          "ft", "finished", "aet", "ended"):
                 continue
 
             result = link_match_with_history(match_data, history_pool)
@@ -227,8 +272,8 @@ def _send_custom_dashboard(analyzed_results, stats):
         best_side = res.get("best_side", "N/A")
         u_factor = res.get("u_factor", 0)
         
-        odds = res.get("odds", {})
-        o_home = odds.get("home", 0)
+        odds = res.get("odds", {}) or res.get("_match", {}).get("odds_1x2", {})
+        o_home = odds.get("1", odds.get("home", 0))
         p_home = res.get("p_home", 0) * 100
         p_draw = res.get("p_draw", 0) * 100
         p_away = res.get("p_away", 0) * 100

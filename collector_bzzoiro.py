@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-Collector Bzzoiro v600-prod-fix11 (API v2 — predictions for pre-match + league pre-fetch)
+Collector Bzzoiro v9.6.8-patched
+PRIMARY Ingestion-коллектор (§17.4): первичный upsert_match каркаса матчей,
+bulk-загрузка котировок через /odds/ (§1.33-1.34), per-event H2H (§1.34),
+stats для прошедших матчей.
+Контур внешних predictions полностью деактивирован (§1.2, §1.29).
+Транспорт: curl_cffi impersonate="chrome" (§1.23), Redis-слой не затронут (§1.3).
+Rate limiting: BZZOIRO_RATE_DELAY=0.5, BZZOIRO_ENRICH_DELAY=0.2, BZZOIRO_MAX_RETRIES=1,
+BZZOIRO_HTTP_TIMEOUT=10, глобальный abort по N подряд 429 (§1.8) + внутренний дедлайн
+fetch-фазы (BZZOIRO_FETCH_DEADLINE, сек) во избежание простоя до внешнего таймаута.
+Мета (§1.26): last_run, error_count, total_events, stored_matches, h2h_count.
 """
 
 import os
@@ -10,15 +19,26 @@ import json
 import datetime as dt
 from typing import Any
 import logging
-from collections import defaultdict
-
-import requests
 
 # ─── Logging setup ───
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [BZZOIRO] %(message)s'
 )
+
+# ─── HTTP-транспорт для внешних фидов (§1.23) ───
+try:
+    from curl_cffi import requests as http_requests
+    _HTTP_IMPL = "curl_cffi"
+except ImportError:
+    try:
+        import requests as http_requests  # fallback
+        _HTTP_IMPL = "requests"
+        logging.warning("curl_cffi недоступен — fallback на requests. "
+                        "Для обхода Cloudflare/WAF рекомендуется curl_cffi impersonate='chrome' (§1.23)")
+    except ImportError:
+        logging.error("Ни curl_cffi, ни requests не установлены")
+        sys.exit(1)
 
 try:
     from gatekeeper_hub import (
@@ -41,9 +61,12 @@ DEBUG_EVENT_COUNT = int(os.environ.get("DEBUG_EVENT_COUNT", "3"))
 
 BZZOIRO_BASE = os.environ.get("BZZOIRO_BASE_URL", "https://sports.bzzoiro.com/api/v2")
 BZZOIRO_API_KEY = os.environ.get("BZZOIRO_API_KEY", "")
-RATE_DELAY = float(os.environ.get("BZZOIRO_RATE_DELAY", "0.3"))
+RATE_DELAY = float(os.environ.get("BZZOIRO_RATE_DELAY", "0.5"))     # v9.6.8: 0.5 (§1.8, config)
 ENRICH_DELAY = float(os.environ.get("BZZOIRO_ENRICH_DELAY", "0.2"))
 MAX_RETRIES = int(os.environ.get("BZZOIRO_MAX_RETRIES", "1"))
+HTTP_TIMEOUT = int(os.environ.get("BZZOIRO_HTTP_TIMEOUT", "10"))    # v9.6.8: контролирующая переменная (§1.8)
+ABORT_THRESHOLD = int(os.environ.get("BZZOIRO_429_ABORT_THRESHOLD", "3"))  # подряд 429 → abort (§1.8)
+FETCH_DEADLINE = int(os.environ.get("BZZOIRO_FETCH_DEADLINE", "1200"))     # сек, внутренний дедлайн fetch-фазы
 DAYS_AHEAD = 7
 PAGE_LIMIT = 200
 
@@ -51,52 +74,97 @@ FINISHED_STATUSES = {"finished", "completed", "ended", "cancelled", "awarded", "
 PREMATCH_STATUSES = ("notstarted", "", "scheduled", "postponed")
 
 # ─── Кэширование ───
-_cache = {}
+_cache: dict[str, Any] = {}
 
-def _cache_response(url: str, data: dict):
+def _cache_response(url: str, data: Any):
     _cache[url] = data
 
 def _check_cache(url: str) -> Any:
     return _cache.get(url)
 
+# ─── Глобальный 429-abort (§1.8) ───
+class RateLimitAbort(Exception):
+    """Стабильный 429 от апстрима — немедленное прерывание внешнего контура (§1.8)."""
 
-def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
-    cached_data = _check_cache(url)
-    if cached_data is not None:
-        return cached_data
+_consecutive_429 = 0
+_deadline_ts: float | None = None
 
-    for attempt in range(max_retries + 1):
+def _start_fetch_deadline():
+    global _deadline_ts
+    _deadline_ts = time.monotonic() + FETCH_DEADLINE
+
+def _deadline_exceeded() -> bool:
+    return _deadline_ts is not None and time.monotonic() > _deadline_ts
+
+def _429_wait(resp: Any, attempt: int) -> int:
+    """Пауза при 429: уважаем Retry-After, иначе экспонента 2/4 с (§1.35)."""
+    headers = getattr(resp, "headers", None) or {}
+    ra = headers.get("Retry-After") or headers.get("retry-after")
+    if ra:
         try:
-            resp = requests.get(url, headers=headers, timeout=30)
+            return max(1, int(float(ra)))
+        except (ValueError, TypeError):
+            pass
+    return 2 ** (attempt + 1)
 
-            if resp.status_code == 404:
-                _cache_response(url, _NOT_FOUND)
-                return _NOT_FOUND
-            if resp.status_code == 429:
-                wait = 2 ** (attempt + 2)
-                logging.warning(f"Rate limit. Waiting {wait}s")
-                time.sleep(wait)
+
+def _fetch_bzzoiro(url: str, headers: dict, max_retries: int | None = None) -> Any:
+    """Изолированный fetch (§1.24). При N подряд 429 — RateLimitAbort (§1.8)."""
+    max_retries = MAX_RETRIES if max_retries is None else max_retries
+    cached = _check_cache(url)
+    if cached is not None:
+        return cached
+
+    global _consecutive_429
+    for attempt in range(max_retries + 1):
+        if _deadline_exceeded():
+            raise RateLimitAbort("внутренний дедлайн fetch-фазы")
+        try:
+            kwargs: dict = dict(headers=headers, timeout=HTTP_TIMEOUT)
+            if _HTTP_IMPL == "curl_cffi":
+                kwargs["impersonate"] = "chrome"
+            resp = http_requests.get(url, **kwargs)
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(2)
                 continue
-            if resp.status_code != 200:
-                if attempt < max_retries:
-                    time.sleep(RATE_DELAY * 2)
-                    continue
-                logging.error(f"HTTP {resp.status_code}: {url}")
-                return None
+            logging.error(f"[BZZOIRO] Request error: {type(e).__name__}")
+            return None
 
-            data = resp.json()
-            _cache_response(url, data)
-            time.sleep(RATE_DELAY)
-            return data
+        if resp.status_code == 404:
+            _cache_response(url, _NOT_FOUND)
+            return _NOT_FOUND
 
-        except (requests.RequestException, json.JSONDecodeError) as e:
+        if resp.status_code == 429:
+            _consecutive_429 += 1
+            if _consecutive_429 >= ABORT_THRESHOLD:
+                raise RateLimitAbort(f"{_consecutive_429} подряд 429 от апстрима")
+            wait = _429_wait(resp, attempt)
+            logging.warning(f"[BZZOIRO] Rate limit 429. Waiting {wait}s ({_consecutive_429}/{ABORT_THRESHOLD})")
+            time.sleep(wait)
+            continue
+
+        _consecutive_429 = 0
+
+        if resp.status_code != 200:
             if attempt < max_retries:
                 time.sleep(RATE_DELAY * 2)
                 continue
-            logging.error(f"Request error: {e}")
+            logging.error(f"[BZZOIRO] HTTP {resp.status_code}: {url}")
             return None
 
+        try:
+            data = resp.json()
+        except Exception:
+            logging.error("[BZZOIRO] JSON decode error")
+            return None
+        _cache_response(url, data)
+        time.sleep(RATE_DELAY)
+        return data
+    return None
 
+
+# ─── Извлечение полей события ───
 def _parse_event_date(ev: dict) -> dt.datetime:
     """Парсит дату события для сортировки."""
     date_str = _extract_date(ev)
@@ -112,7 +180,7 @@ def _parse_event_date(ev: dict) -> dt.datetime:
 
 
 def _extract_date(ev: dict) -> str:
-    """Извлекает дату матча в формате ISO или UTC строку."""
+    """Извлекает дату матча в формате ISO или UTC строку (date_utc — единственный источник, §1.18)."""
     for key in ("event_date", "date", "date_utc", "match_date", "time", "start_time", "datetime"):
         val = ev.get(key)
         if val:
@@ -127,14 +195,13 @@ def _extract_date(ev: dict) -> str:
 
 
 def _extract_score(ev: dict) -> Any:
-    """Извлекает счет матча."""
+    """Извлекает счет матча (плоский вид home/away, §1.18)."""
     score = ev.get("score") or ev.get("scores")
     if isinstance(score, dict):
         return {
             "home": score.get("home", score.get("home_score")),
             "away": score.get("away", score.get("away_score"))
         }
-    # Fallback: top-level fields (API v2)
     home_score = ev.get("home_score")
     away_score = ev.get("away_score")
     if home_score is not None or away_score is not None:
@@ -142,40 +209,46 @@ def _extract_score(ev: dict) -> Any:
     return None
 
 
-def _extract_best_odds(odds_data: dict) -> dict:
-    """Извлекает лучшие коэффициенты из ответа API."""
+def _extract_best_odds(odds_data: Any) -> dict:
+    """Плоский odds_1x2 с ключами '1'/'X'/'2' (Схема v710 / Гейт 28, §1.21).
+    Текстовые маркеры home/draw/away не производятся — только числовые исходы."""
     if not isinstance(odds_data, dict):
         return {}
     odds = odds_data.get("odds", odds_data)
     if not isinstance(odds, dict):
         return {}
 
-    result = {}
     mapping = {
-        "home": ("home_win", "home", "1"),
-        "draw": ("draw", "X"),
-        "away": ("away_win", "away", "2")
+        "1": ("home_win", "home", "1"),
+        "X": ("draw", "X"),
+        "2": ("away_win", "away", "2"),
     }
-
+    result: dict = {}
     for target_key, keys in mapping.items():
         val = None
         for k in keys:
             if k in odds and odds[k] is not None:
                 val = odds[k]
                 break
-
-        if val is not None and val != "-" and val != "":
-            try:
-                result[target_key] = float(val)
-            except (ValueError, TypeError):
-                pass
-
+        if val in (None, "-", ""):
+            continue
+        try:
+            f = float(val)
+            if f > 0:
+                result[target_key] = f
+        except (ValueError, TypeError):
+            pass
     return result
+
+
+def _bulk_event_id(item: dict) -> str:
+    """Извлечение ID события из bulk-ответа с учетом вложенности (§1.39)."""
+    return str(item.get("event_id") or (item.get("event") or {}).get("id") or item.get("id", ""))
 
 
 def _flatten_stats(stats_data: dict, parent_key: str = "", sep: str = "_") -> dict:
     """Превращает вложенный словарь статистики в плоский."""
-    items = []
+    items: list = []
     if not isinstance(stats_data, dict):
         return {}
     for k, v in stats_data.items():
@@ -194,22 +267,75 @@ def _fetch_league_info(league_id: int, headers: dict) -> dict:
     """Получает информацию о лиге (name, country) через /leagues/{id}."""
     if not league_id:
         return {"name": "", "country": ""}
-
     if league_id in _league_cache:
         return _league_cache[league_id]
 
     url = f"{BZZOIRO_BASE}/leagues/{league_id}"
-    data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
+    data = _fetch_bzzoiro(url, headers)
 
-    if data is _NOT_FOUND or not data or not isinstance(data, dict):
+    if data is _NOT_FOUND or not isinstance(data, dict):
         result = {"name": "", "country": ""}
     else:
-        name = data.get("name", "") or ""
-        country = data.get("country", "") or ""
-        result = {"name": name, "country": country}
+        result = {"name": data.get("name", "") or "", "country": data.get("country", "") or ""}
 
     _league_cache[league_id] = result
     return result
+
+
+# ─── Pre-flight /coverage/ (документация BSD) ───
+def _coverage_preflight(headers: dict) -> bool:
+    """Один бесплатный вызов /coverage/: True — события впереди есть, H2H-контур целесообразен.
+    При недоступности эндпоинта не блокируем пайплайн (возвращаем True)."""
+    data = _fetch_bzzoiro(f"{BZZOIRO_BASE}/coverage/", headers)
+    if data is _NOT_FOUND or not isinstance(data, dict):
+        return True
+    fb = data.get("football", data)
+    if isinstance(fb, dict):
+        nxt = fb.get("events_next_7d", fb.get("priced_next_7d"))
+        if nxt is not None:
+            try:
+                return int(nxt) > 0
+            except (ValueError, TypeError):
+                pass
+    return True
+
+
+# ─── Bulk odds (§1.33-1.34) ───
+def _load_bulk_odds(headers: dict) -> dict:
+    """Bulk-загрузка котировок через /odds/?date_from=&date_to=.
+    Возвращает {bzzoiro_event_id: odds_1x2_flat}. Пустой ответ → {} (per-event fallback, §1.33)."""
+    now = dt.datetime.now(dt.timezone.utc)
+    bulk: dict = {}
+    url = (f"{BZZOIRO_BASE}/odds/?date_from={now:%Y-%m-%d}"
+           f"&date_to={(now + dt.timedelta(days=DAYS_AHEAD)):%Y-%m-%d}")
+
+    while url:
+        if _deadline_exceeded():
+            raise RateLimitAbort("внутренний дедлайн bulk-odds")
+        data = _fetch_bzzoiro(url, headers)
+        if data is None or data is _NOT_FOUND:
+            break
+        if isinstance(data, dict):
+            items = data.get("results", data.get("data", data.get("events", [])))
+        elif isinstance(data, list):
+            items = data
+        else:
+            break
+        if not isinstance(items, list):
+            break
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            eid = _bulk_event_id(item)
+            if not eid:
+                continue
+            flat = _extract_best_odds(item)
+            if flat:
+                bulk[eid] = flat
+        url = data.get("next") if isinstance(data, dict) else None
+        if url and len(bulk):
+            pass  # пагинация допускается; пустой bulk не пагинируем
+    return bulk
 
 
 def collect_bzzoiro(events_only: bool = False) -> dict:
@@ -219,8 +345,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
 
     print("=" * 60)
-    print("[BZZOIRO] Collector Bzzoiro v600-prod-fix11 (API v2 — predictions for pre-match) started.")
+    print("[BZZOIRO] Collector Bzzoiro v9.6.8-patched started "
+          f"(HTTP: {_HTTP_IMPL}, bulk odds §1.33, no predictions §1.29)")
     print("=" * 60)
+
+    _start_fetch_deadline()
 
     # ─── Шаг 0: Инициализация Redis ───
     print("[BZZOIRO] Шаг 0: Инициализация Redis...")
@@ -234,9 +363,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
     existing_keys = set(get_all_fields().keys())
 
-    # ─── Шаг 1: Загрузка событий ───
-    print("[BZZOIRO] Шаг 1: Загрузка событий...")
     now = dt.datetime.now(dt.timezone.utc)
+    rate_limited = False
+
+    # ─── Шаг 1: Загрузка событий (§1.33: bulk-маршруты, per-event — fallback) ───
+    print("[BZZOIRO] Шаг 1: Загрузка событий...")
     date_from = now.strftime("%Y-%m-%d")
     date_to = (now + dt.timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
 
@@ -244,53 +375,46 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     pages_fetched = 0
     url = f"{BZZOIRO_BASE}/events?date_from={date_from}&date_to={date_to}&limit={PAGE_LIMIT}"
 
-    while url:
-        data = _fetch_bzzoiro(url, headers, max_retries=MAX_RETRIES)
-        pages_fetched += 1
+    try:
+        while url:
+            if _deadline_exceeded():
+                raise RateLimitAbort("дедлайн fetch-фазы на загрузке страниц")
+            data = _fetch_bzzoiro(url, headers)
+            pages_fetched += 1
 
-        if data is None:
-            print(f"[BZZOIRO] Ошибка загрузки страницы {pages_fetched}")
-            break
-        if data is _NOT_FOUND:
-            break
+            if data is None:
+                print(f"[BZZOIRO] Ошибка загрузки страницы {pages_fetched}")
+                break
+            if data is _NOT_FOUND:
+                break
 
-        if pages_fetched == 1:
-            print(f"[BZZOIRO DEBUG] Raw response type: {type(data).__name__}")
             if isinstance(data, dict):
-                print(f"[BZZOIRO DEBUG] Raw response keys: {list(data.keys())}")
-            print(f"[BZZOIRO DEBUG] Raw response (1000 chars): {json.dumps(data, ensure_ascii=False)[:1000]}")
+                items = data.get("results", data.get("data", data.get("events", [])))
+            elif isinstance(data, list):
+                items = data
+            else:
+                print(f"[BZZOIRO] Неожиданный тип ответа страницы: {type(data).__name__}")
+                break
 
-        if isinstance(data, dict):
-            items = data.get("results", data.get("data", data.get("events", [])))
-        elif isinstance(data, list):
-            items = data
-        else:
-            print(f"[BZZOIRO DEBUG] Не удалось распарсить items. Type: {type(data)}")
-            break
+            if not isinstance(items, list) or not items:
+                break
 
-        if not isinstance(items, list) or not items:
-            print(f"[BZZOIRO DEBUG] items пустой на странице {pages_fetched}")
-            break
+            all_events.extend(items)
+            total_count = data.get("count", 0) if isinstance(data, dict) else 0
+            print(f"[BZZOIRO] Загружено: {len(all_events)}/{total_count}")
 
-        all_events.extend(items)
-        total_count = data.get("count", 0) if isinstance(data, dict) else 0
-        print(f"[BZZOIRO] Загружено: {len(all_events)}/{total_count}")
-
-        if isinstance(data, dict):
-            url = data.get("next")
-        else:
-            url = None
-
-        if not url:
-            break
-
-        if total_count and len(all_events) >= total_count:
-            break
+            url = data.get("next") if isinstance(data, dict) else None
+            if not url:
+                break
+            if total_count and len(all_events) >= total_count:
+                break
+    except RateLimitAbort as e:
+        rate_limited = True
+        logging.warning(f"[BZZOIRO] Внешний контур прерван ({e}) — переход на кэш (§1.8)")
 
     # ─── Сортировка по дате (ближайшие первыми) ───
     all_events.sort(key=_parse_event_date)
     print(f"[BZZOIRO] Всего событий: {len(all_events)} (страниц: {pages_fetched})")
-    print(f"[BZZOIRO] Сортировка по дате: ближайшие первыми")
 
     # ─── Шаг 1.5: Pre-fetch лиг ───
     league_ids = set()
@@ -299,12 +423,18 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         if lid:
             league_ids.add(lid)
 
-    if league_ids:
+    if league_ids and not rate_limited:
         print(f"[BZZOIRO] Шаг 1.5: Pre-fetch {len(league_ids)} лиг...")
-        for lid in league_ids:
-            _fetch_league_info(lid, headers)
-            time.sleep(RATE_DELAY)
-        print(f"[BZZOIRO] Pre-fetch лиг завершён: {len(_league_cache)} в кэше")
+        try:
+            for lid in league_ids:
+                if _deadline_exceeded():
+                    raise RateLimitAbort("дедлайн на pre-fetch лиг")
+                _fetch_league_info(lid, headers)
+                time.sleep(RATE_DELAY)
+            print(f"[BZZOIRO] Pre-fetch лиг завершён: {len(_league_cache)} в кэше")
+        except RateLimitAbort as e:
+            rate_limited = True
+            logging.warning(f"[BZZOIRO] Внешний контур прерван ({e}) — переход на кэш (§1.8)")
 
     # ─── Шаг 2: Запись матчей ───
     print("[BZZOIRO] Шаг 2: Запись матчей в Redis...")
@@ -329,7 +459,6 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
         status = ev.get("status", "scheduled") or "scheduled"
 
-        # Фильтр завершённых матчей
         if status in FINISHED_STATUSES:
             skipped_finished += 1
             continue
@@ -349,10 +478,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             continue
 
         if idx < DEBUG_EVENT_COUNT:
-            print(f"[BZZOIRO DEBUG] Событие #{idx}: keys={list(ev.keys())}")
-            print(f"[BZZOIRO DEBUG] Событие #{idx}: {json.dumps(ev, ensure_ascii=False)[:500]}")
+            print(f"[BZZOIRO DEBUG] Событие #{idx}: поля={sorted(ev.keys())}")
 
-        # League info из pre-fetch кэша
         league_id = ev.get("league_id")
         league_info = _fetch_league_info(league_id, headers) if league_id else {"name": "", "country": ""}
 
@@ -382,72 +509,76 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         else:
             skipped_past += 1
 
-    print(f"[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}")
+    print(f"[BZZOIRO] Записано {len(stored_matches)} матчей (создано {created}, обновлено {updated}), "
+          f"пропущено past={skipped_past}, finished={skipped_finished}, дубликатов={deduped}")
     if no_date_count:
         print(f"[BZZOIRO] Без даты: {no_date_count} событий")
 
-    # ─── Шаг 3: Enrichment ───
+    # ─── Шаг 3: Enrichment (bulk odds §1.33 + per-event H2H §1.34) ───
     odds_enriched = 0
-    pred_enriched = 0
     stats_enriched = 0
     h2h_enriched = 0
     score_enriched = 0
     enrichment_errors = 0
     not_found = 0
+    h2h_count = 0
+    bulk_odds: dict = {}
 
     if events_only:
         print("[BZZOIRO] Режим events-only — enrichment пропущен")
-    elif stored_matches:
+    elif stored_matches and not rate_limited:
         print(f"[BZZOIRO] Шаг 3: Обогащение {len(stored_matches)} матчей...")
+        try:
+            if not _coverage_preflight(headers):
+                print("[BZZOIRO] /coverage/: событий впереди нет — per-event H2H пропущен")
+                stored_matches = []
+            else:
+                bulk_odds = _load_bulk_odds(headers)
+                print(f"[BZZOIRO] Bulk odds: линий получено {len(bulk_odds)} (§1.33)")
 
-        for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
-            status = ev.get("status", "")
-            is_prematch = status in PREMATCH_STATUSES
+            for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
+                if _deadline_exceeded():
+                    raise RateLimitAbort("дедлайн на enrichment-цикле")
 
-            # Score + Stats для прошедших матчей
-            if not is_prematch:
-                score = _extract_score(ev)
-                if score:
-                    if patch_match(cid, "score", score, source="bzzoiro"):
-                        score_enriched += 1
-                    else:
-                        enrichment_errors += 1
+                status = ev.get("status", "")
+                is_prematch = status in PREMATCH_STATUSES
 
-            # ─── Odds (всегда) ───
-            odds_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/odds"
-            odds_data = _fetch_bzzoiro(odds_url, headers, max_retries=MAX_RETRIES)
+                # Score + Stats для прошедших матчей
+                if not is_prematch:
+                    score = _extract_score(ev)
+                    if score:
+                        if patch_match(cid, "score", score, source="bzzoiro"):
+                            score_enriched += 1
+                        else:
+                            enrichment_errors += 1
 
-            if odds_data is _NOT_FOUND:
-                not_found += 1
-            elif odds_data and isinstance(odds_data, dict):
-                best_odds = _extract_best_odds(odds_data)
-                if best_odds:
-                    if patch_match(cid, "odds", best_odds, source="bzzoiro"):
+                # ─── Odds: bulk сначала, per-event — только fallback (§1.33) ───
+                flat_odds = bulk_odds.get(str(bzzoiro_id))
+                if flat_odds is None:
+                    odds_data = _fetch_bzzoiro(f"{BZZOIRO_BASE}/events/{bzzoiro_id}/odds", headers)
+                    if odds_data is _NOT_FOUND:
+                        not_found += 1
+                    elif isinstance(odds_data, dict):
+                        flat_odds = _extract_best_odds(odds_data)
+                if flat_odds:
+                    if patch_match(cid, "odds", flat_odds, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
                     else:
                         enrichment_errors += 1
-                else:
+                elif not bulk_odds:
                     not_found += 1
-            else:
-                enrichment_errors += 1
 
-            if idx < DEBUG_EVENT_COUNT:
-                print(f"[BZZOIRO DEBUG] Odds #{idx}: {json.dumps(odds_data, ensure_ascii=False)[:500] if odds_data is not _NOT_FOUND else '404'}")
+                time.sleep(ENRICH_DELAY)
 
-            time.sleep(ENRICH_DELAY)
-
-            # ─── Predictions (только для pre-match!) ───
-            if is_prematch:
-                pred_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/predictions"
-                pred_data = _fetch_bzzoiro(pred_url, headers, max_retries=MAX_RETRIES)
-
-                if pred_data is _NOT_FOUND:
+                # ─── H2H (per-event; bulk-маршрута нет, §1.34; legacy-fallback удален) ───
+                h2h_data = _fetch_bzzoiro(f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h", headers)
+                if h2h_data is _NOT_FOUND:
                     not_found += 1
-                elif pred_data and isinstance(pred_data, dict):
-                    inner_pred = pred_data.get("prediction", pred_data)
-                    if isinstance(inner_pred, dict) and inner_pred:
-                        if patch_match(cid, "predictions", inner_pred, source="bzzoiro"):
-                            pred_enriched += 1
+                elif h2h_data and isinstance(h2h_data, dict):
+                    inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
+                    if isinstance(inner_h2h, dict) and inner_h2h:
+                        if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
+                            h2h_enriched += 1
                         else:
                             enrichment_errors += 1
                     else:
@@ -455,82 +586,47 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 else:
                     enrichment_errors += 1
 
-                if idx < DEBUG_EVENT_COUNT:
-                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: {json.dumps(pred_data, ensure_ascii=False)[:500] if pred_data is not _NOT_FOUND else '404'}")
-
                 time.sleep(ENRICH_DELAY)
-            else:
-                if idx < DEBUG_EVENT_COUNT:
-                    print(f"[BZZOIRO DEBUG] Prediction #{idx}: skipped (not pre-match)")
 
-            # ─── H2H (всегда) ───
-            h2h_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h"
-            h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
-
-            if h2h_data is _NOT_FOUND:
-                h2h_url_legacy = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/head_to_head"
-                h2h_data = _fetch_bzzoiro(h2h_url_legacy, headers, max_retries=MAX_RETRIES)
-
-            if h2h_data is _NOT_FOUND:
-                not_found += 1
-            elif h2h_data and isinstance(h2h_data, dict):
-                inner_h2h = h2h_data.get("head_to_head", h2h_data.get("h2h", h2h_data))
-                if isinstance(inner_h2h, dict) and inner_h2h:
-                    if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
-                        h2h_enriched += 1
-                    else:
-                        enrichment_errors += 1
-                else:
-                    not_found += 1
-            else:
-                enrichment_errors += 1
-
-            if idx < DEBUG_EVENT_COUNT:
-                print(f"[BZZOIRO DEBUG] H2H #{idx}: {json.dumps(h2h_data, ensure_ascii=False)[:500] if h2h_data is not _NOT_FOUND else '404'}")
-
-            time.sleep(ENRICH_DELAY)
-
-            # ─── Stats (только для прошедших) ───
-            if not is_prematch:
-                stats_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/stats"
-                stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
-
-                if stats_data is _NOT_FOUND:
-                    not_found += 1
-                elif stats_data and isinstance(stats_data, dict):
-                    inner_stats = stats_data.get("stats", stats_data)
-                    if isinstance(inner_stats, dict) and inner_stats:
-                        flat_stats = _flatten_stats(inner_stats)
-                        for k, v in stats_data.items():
-                            if k != "stats" and not isinstance(v, dict):
-                                flat_stats[k] = v
-                        if any(v is not None for v in flat_stats.values()):
-                            if patch_match(cid, "stats", flat_stats, source="bzzoiro"):
-                                stats_enriched += 1
+                # ─── Stats (только для прошедших) ───
+                if not is_prematch:
+                    stats_data = _fetch_bzzoiro(f"{BZZOIRO_BASE}/events/{bzzoiro_id}/stats", headers)
+                    if stats_data is _NOT_FOUND:
+                        not_found += 1
+                    elif stats_data and isinstance(stats_data, dict):
+                        inner_stats = stats_data.get("stats", stats_data)
+                        if isinstance(inner_stats, dict) and inner_stats:
+                            flat_stats = _flatten_stats(inner_stats)
+                            for k, v in stats_data.items():
+                                if k != "stats" and not isinstance(v, dict):
+                                    flat_stats[k] = v
+                            if any(v is not None for v in flat_stats.values()):
+                                if patch_match(cid, "stats", flat_stats, source="bzzoiro"):
+                                    stats_enriched += 1
+                                else:
+                                    enrichment_errors += 1
                             else:
-                                enrichment_errors += 1
+                                not_found += 1
                         else:
                             not_found += 1
                     else:
-                        not_found += 1
-                else:
-                    enrichment_errors += 1
+                        enrichment_errors += 1
 
-                if idx < DEBUG_EVENT_COUNT:
-                    print(f"[BZZOIRO DEBUG] Stats #{idx}: {json.dumps(stats_data, ensure_ascii=False)[:500] if stats_data is not _NOT_FOUND else '404'}")
+                    time.sleep(ENRICH_DELAY)
 
-                time.sleep(ENRICH_DELAY)
-            else:
-                if idx < DEBUG_EVENT_COUNT:
-                    print(f"[BZZOIRO DEBUG] Stats #{idx}: skipped (pre-match)")
+                if (idx + 1) % 50 == 0:
+                    print(f"[BZZOIRO] Обогащение: {idx + 1}/{len(stored_matches)} "
+                          f"(odds={odds_enriched}, h2h={h2h_enriched}, stats={stats_enriched}, score={score_enriched})")
+        except RateLimitAbort as e:
+            rate_limited = True
+            logging.warning(f"[BZZOIRO] Внешний контур прерван ({e}) — переход на кэш (§1.8)")
 
-            if (idx + 1) % 50 == 0:
-                print(f"[BZZOIRO] Обогащение: {idx + 1}/{len(stored_matches)} (odds={odds_enriched}, pred={pred_enriched}, stats={stats_enriched}, h2h={h2h_enriched}, score={score_enriched})")
+    h2h_count = h2h_enriched
 
-    # ─── Шаг 4: Итоги ───
+    # ─── Шаг 4: Итоги (Safe Logging §1.22: только атомарные метаданные) ───
     print(f"[BZZOIRO] Готово: матчей {len(stored_matches)} (создано {created}, обновлено {updated})")
-    print(f"[BZZOIRO]   Odds: {odds_enriched}, Predictions: {pred_enriched}, Stats: {stats_enriched}, H2H: {h2h_enriched}, Score: {score_enriched}")
-    print(f"[BZZOIRO]   Ошибки: {enrichment_errors}, Not Found: {not_found}")
+    print(f"[BZZOIRO]   Odds: {odds_enriched}, H2H: {h2h_enriched}, Stats: {stats_enriched}, Score: {score_enriched}")
+    print(f"[BZZOIRO]   Ошибки: {enrichment_errors}, Not Found: {not_found}, Aborted (429): {rate_limited}")
 
     result = {
         "last_run": now_msk(),
@@ -539,25 +635,20 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
         "created": created,
         "updated": updated,
         "error_count": enrichment_errors,
+        "h2h_count": h2h_count,
+        "odds_enriched": odds_enriched,
+        "stats_enriched": stats_enriched,
+        "score_enriched": score_enriched,
         "pages_fetched": pages_fetched,
-        "enrichment": {
-            "odds": odds_enriched,
-            "predictions": pred_enriched,
-            "stats": stats_enriched,
-            "h2h": h2h_enriched,
-            "score": score_enriched,
-            "errors": enrichment_errors,
-            "not_found": not_found,
-        },
+        "aborted_by_rate_limit": rate_limited,
         "events_only": events_only,
         "skipped_past": skipped_past,
         "skipped_finished": skipped_finished,
         "deduped": deduped,
         "no_date": no_date_count,
     }
-    print(f"[BZZOIRO] Result: {json.dumps(result, ensure_ascii=False)}")
 
-    # ─── Шаг 5: Сохранение мета ───
+    # ─── Шаг 5: Сохранение мета (§1.26: без enrichment, с h2h_count) ───
     save_meta("bzzoiro",
               total_events=len(all_events),
               stored_matches=len(stored_matches),
@@ -567,7 +658,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
               deduped=deduped,
               pages_fetched=pages_fetched,
               error_count=enrichment_errors,
-              enrichment=result.get("enrichment"))
+              h2h_count=h2h_count)
 
     return result
 

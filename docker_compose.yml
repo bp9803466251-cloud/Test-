@@ -1,4 +1,12 @@
-version: "3.8"
+# ==============================================================================
+# Gatekeeper-AI Ecosystem
+# Deployment Manifest: docker_compose.yml
+# Version: 9.6.8-patched
+# Changes: [REMOVED] TCP-redis mock (incompatible with Upstash REST architecture)
+#          [ADDED] Secrets passthrough from host environment (no hardcoding)
+#          [REMOVED] obsolete "version: 3.8" key (Compose V2)
+#          [FIXED] config/fixtures mounts are read-only (:ro)
+# ==============================================================================
 
 networks:
   docker_compose_secure_net:
@@ -14,10 +22,21 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - GATEKEEPER_ENV=production
+      # Redis/Upstash: приоритеты имён — §1.10 redis_config (env > config > none)
+      - SHARED_UPSTASH_REDIS_REST_URL=${SHARED_UPSTASH_REDIS_REST_URL:-}
+      - SHARED_UPSTASH_REDIS_REST_TOKEN=${SHARED_UPSTASH_REDIS_REST_TOKEN:-}
+      - SHARED_REDIS_REST_URL=${SHARED_REDIS_REST_URL:-}
+      - SHARED_REDIS_REST_TOKEN=${SHARED_REDIS_REST_TOKEN:-}
+      - UPSTASH_REDIS_REST_URL=${UPSTASH_REDIS_REST_URL:-}
+      - UPSTASH_REDIS_REST_TOKEN=${UPSTASH_REDIS_REST_TOKEN:-}
+      # Telegram-транспорт: имя бота и чат дашборда
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     volumes:
-      # Проброс конфига и фикстур для горячей отладки без пересборки образа
-      - ./gatekeeper_config.yaml:/app/gatekeeper_config.yaml
-      - ./fail_safe_fixtures.json:/app/fail_safe_fixtures.json
+      # Проброс конфига и фикстур для горячей отладки без пересборки образа.
+      # Read-only: сбой в ядре не должен уметь перезаписывать конфигурацию хоста.
+      - ./gatekeeper_config.yaml:/app/gatekeeper_config.yaml:ro
+      - ./fail_safe_fixtures.json:/app/fail_safe_fixtures.json:ro
     networks:
       - docker_compose_secure_net
     deploy:
@@ -27,18 +46,8 @@ services:
           memory: 4G
     restart: on-failure  # Строго через дефис под требования Docker Engine
 
-  # Мок-сервер Upstash Redis для обеспечения полигона хаос-тестирования
-  upstash_redis_mock:
-    image: redis:7-alpine
-    container_name: docker_compose_redis_mock
-    command: redis-server --appendonly yes --port 6379
-    expose:
-      - "6379"
-    networks:
-      - docker_compose_secure_net
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
-          
+  # [REMOVED v9.6.8] Сервис upstash_redis_mock (redis:7-alpine, TCP 6379) удалён.
+  # Причина: весь пакет общается с Upstash через REST API (urllib + Bearer),
+  # TCP-протокол Upstash не обслуживает; ни один модуль, включая леджер,
+  # TCP-клиентом не пользуется. Мок был мёртвым грузом (0.5 CPU / 512M).
+

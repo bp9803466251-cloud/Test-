@@ -3,7 +3,7 @@ country_code_map.py — Маппинг кодов стран и лиг.
 Используется коллекторами для нормализации country и competition.
 """
 
-__version__ = "9.3-audited"
+__version__ = "9.6.8-patched"
 
 __all__ = [
     "COUNTRY_CODE_MAP", "LEAGUE_NAME_MAP",
@@ -123,7 +123,7 @@ COUNTRY_CODE_MAP = {
     # ── football-data.co.uk однобуквенные коды ─────────
     "E": "England",    # E0, E1, E2, E3, EC
     "S": "Scotland",   # S0, S1, S2, SC
-    "G": "Germany",     # D1, D2 (football-data использует D, не G)
+    "G": "Greece",      # football-data: G-коды относятся к Греции (G1 = Super League Greece). Германия живёт в D1/D2
     "D": "Germany",
     "I": "Italy",       # I1, I2
     "SP": "Spain",      # SP1, SP2
@@ -132,7 +132,6 @@ COUNTRY_CODE_MAP = {
     "B": "Belgium",     # B1
     "P": "Portugal",    # P1
     "T": "Turkey",      # T1
-    "G2": "Germany",    # Bundesliga 2 в некоторых источниках
 }
 
 # Маппинг названий лиг (slug → читаемое название)
@@ -193,7 +192,7 @@ LEAGUE_NAME_MAP = {
     "B1": "Jupiler Pro League",
     "P1": "Primeira Liga",
     "T1": "S\u00fcper Lig",
-    "G1": "Bundesliga",
+    "G1": "Super League Greece",
     # ── Scottish league codes ──────────────────────────
     "SC0": "Scottish Premiership",
     "SC1": "Scottish Championship",

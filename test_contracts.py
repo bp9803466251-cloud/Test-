@@ -23,6 +23,10 @@ def _try_import(modname):
     except ImportError:
         return False
 
+# Единая контрактная версия пакета — синхронизирована с волной патчей 9.6.8-patched.
+# Все пины в гейтах ссылаются на неё, а не на вкопанные литералы.
+CONTRACT_VERSION = "9.6.8-patched"
+
 # ── 1. Schema (Интеграция с jsonschema и schema_validator) ──
 def test_schema():
     with open("schema_v710.json") as f:
@@ -31,29 +35,34 @@ def test_schema():
     if _try_import("schema_validator"):
         import schema_validator
         # Полностью совместимый паспорт: закрывает плоские поля v710 и требование §1.14 к odds.1x2
+        # [FIXED v9.6.8] Плоский паспорт v710. В старом тесте в home_clean/away_clean
+        # писались КОТИРОВКИ 4.20/1.75 — тот же дрифт, что мы вычищали в мосте харвеста.
         valid_passport = {
-            "case_id": "CI_CONTRACT_VALID",
             "schema_version": "v710",
             "canonical_id": "leicester__chelsea__20261019",
-            "home_team": "Leicester City", 
+            "home_team": "Leicester City",
             "away_team": "Chelsea FC",
-            "home_clean": 4.20,
-            "away_clean": 1.75,
+            "home_clean": "leicester",
+            "away_clean": "chelsea",
             "date_utc": "2026-10-19T18:00:00Z",
             "status": "scheduled",
             "competition": "Premier League",
-            "odds": {
-                "1x2": {
-                    "current": {
-                        "home_clean": 4.20,
-                        "draw": 3.80,
-                        "away_clean": 1.75
-                    }
-                }
-            }
+            "odds_1x2": {"1": 4.20, "X": 3.80, "2": 1.75}
         }
         is_ok, msg = schema_validator.validate_match_passport(valid_passport)
         assert is_ok is True, f"Валидация схемы v710 провалена: {msg}"
+
+        # Дрифт-контроль: котировка <= 1.0 в плоской линии должна быть перехвачена
+        bad_odds_passport = dict(valid_passport, odds_1x2={"1": 0.50, "X": 3.80, "2": 1.75})
+        is_bad, msg_bad = schema_validator.validate_match_passport(bad_odds_passport)
+        assert is_bad is False, f"Котировка <= 1.0 не перехвачена валидатором: {msg_bad}"
+
+        # Дрифт-контроль: хаос-атака (удаление имён) не проходит
+        broken_passport = dict(valid_passport)
+        broken_passport.pop("home_team")
+        broken_passport.pop("away_team")
+        is_broken, msg_broken = schema_validator.validate_match_passport(broken_passport)
+        assert is_broken is False, f"Хаос-атака не перехвачена валидатором: {msg_broken}"
     print("  test_schema: PASS")
 
 # ── 2. Fixtures ──
@@ -67,7 +76,7 @@ def test_team_registry():
         print("  test_team_registry: SKIP (no module)")
         return
     from team_registry import clean_team_name, TEAM_ALIASES, __version__
-    assert __version__ == "9.3-audited", f"version: {__version__}"
+    assert __version__ == CONTRACT_VERSION, f"version: {__version__}"
     assert len(TEAM_ALIASES) >= 200, f"only {len(TEAM_ALIASES)} aliases"
     assert clean_team_name("Manchester United") == "man"
     assert clean_team_name("Brøndby IF") == "brondby"
@@ -95,7 +104,7 @@ def test_config():
         print("  test_config: SKIP (no module)")
         return
     from gatekeeper_config import load_config, get_value_threshold, __version__
-    assert __version__ == "9.3-audited", f"version: {__version__}"
+    assert __version__ == CONTRACT_VERSION, f"version: {__version__}"
     cfg = load_config()
     assert isinstance(cfg, dict), f"config not dict: {type(cfg)}"
     threshold = get_value_threshold()
@@ -108,7 +117,7 @@ def test_redis_hub_api():
         print("  test_redis_hub_api: SKIP (no module)")
         return
     from redis_hub import ENVELOPE_VERSION, HASH_NAME, REDIS_TIMEOUT, __version__
-    assert __version__ == "9.6.1-audited", f"version: {__version__}"
+    assert __version__ == CONTRACT_VERSION, f"version: {__version__}"
     assert ENVELOPE_VERSION == "v700-prod"
     assert isinstance(HASH_NAME, str) and len(HASH_NAME) > 0
     print("  test_redis_hub_api: PASS")
@@ -119,7 +128,7 @@ def test_redis_config():
         print("  test_redis_config: SKIP (no module)")
         return
     from redis_config import is_redis_configured, get_redis_info, __version__
-    assert __version__ == "9.3-audited", f"version: {__version__}"
+    assert __version__ == CONTRACT_VERSION, f"version: {__version__}"
     assert isinstance(is_redis_configured(), bool)
     info = get_redis_info()
     assert isinstance(info, dict)
@@ -131,11 +140,22 @@ def test_gatekeeper_hub_api():
         print("  test_gatekeeper_hub_api: SKIP (no module)")
         return
     from gatekeeper_hub import __version__
-    assert __version__ == "9.3-audited", f"version: {__version__}"
+    assert __version__ == CONTRACT_VERSION, f"version: {__version__}"
     print("  test_gatekeeper_hub_api: PASS")
 
 # ── 9. Search Module ──
 def test_search_module():
+    # [FIXED v9.6.8] Раньше гейт печатал PASS, не проверяя ничего. Сделан реальным.
+    if not _try_import("search_module"):
+        print("  test_search_module: SKIP (no module)")
+        return
+    import search_module
+    assert search_module.__version__ == CONTRACT_VERSION, f"version: {search_module.__version__}"
+    assert callable(search_module.clean_team_name)
+    assert callable(search_module.search_teams)
+    pool = ["Arsenal FC", "Chelsea FC", "Real Madrid"]
+    found = search_module.search_teams("Chelsea", pool)
+    assert found == ["Chelsea FC"], f"unexpected search result: {found}"
     print("  test_search_module: PASS")
 
 # ── 10. Country Code Map ──
@@ -144,7 +164,7 @@ def test_country_map():
         print("  test_country_map: SKIP (no module)")
         return
     from country_code_map import COUNTRY_CODE_MAP, __version__
-    assert __version__ == "9.3-audited", f"version: {__version__}"
+    assert __version__ == CONTRACT_VERSION, f"version: {__version__}"
     assert COUNTRY_CODE_MAP.get("EN") == "England"
     print("  test_country_map: PASS")
 
@@ -156,7 +176,7 @@ def test_telegram_transport_api():
     with patch("telegram_transport.split_html_safe") as mock_splitter:
         mock_splitter.return_value = ["<b>Hello</b> world "] * 50
         from telegram_transport import split_html_safe, __version__
-        assert __version__ == "9.3-audited", f"version: {__version__}"
+        assert __version__ == CONTRACT_VERSION, f"version: {__version__}"
         parts = split_html_safe("<b>Hello</b> world " * 50, 100)
         assert all(len(p) <= 100 for p in parts)
     print("  test_telegram_transport_api: PASS")
@@ -166,9 +186,11 @@ def test_value_engine():
     if not _try_import("value_engine"):
         print("  test_value_engine: SKIP (no module)")
         return
-    from value_engine import process_full_analysis, __version__
-    assert __version__ == "9.6.5-audited", f"version mismatch: {__version__}"
+    from value_engine import process_full_analysis, analyze_match, __version__
+    assert __version__ == CONTRACT_VERSION, f"version mismatch: {__version__}"
     assert process_full_analysis is not None
+    # [FIXED v9.6.8] Боевой контракт линкера: analyze_match(match_data, history_map)
+    assert callable(analyze_match), "analyze_match отсутствует в value_engine"
     print("  test_value_engine: PASS")
 
 # ── 13. Base Collector ──
@@ -225,13 +247,28 @@ def test_network_harvest_runtime():
         return
     from network_harvest_runtime import GatekeeperNetworkHarvester
     harvester = GatekeeperNetworkHarvester()
-    mock_payload = {"odds": {"home": 2.50, "away": 1.85}, "market_id": "ci-test-101"}
+    # [FIXED v9.6.8] Плоский мост: обёртка meta/payload и версия 7.1.0 удалены.
+    # clean-поля — это имена команд, а НЕ котировки: ровно та путаница, что вычищена в мосте.
+    mock_payload = {
+        "home_team": "Leicester City",
+        "away_team": "Chelsea FC",
+        "date_utc": "2026-10-19T18:00:00Z",
+        "status": "scheduled",
+        "competition": "Premier League",
+        "odds_1x2": {"1": 2.50, "X": 3.20, "2": 1.85},
+        "market_id": "ci-test-101"
+    }
     normalized = harvester.route_to_value_engine(mock_payload)
-    assert "meta" in normalized
-    assert "payload" in normalized
-    assert normalized["meta"]["version"] == "7.1.0"
-    assert normalized["payload"]["home_clean"] == 2.50
-    
+    assert isinstance(normalized, dict), f"мост не вернул паспорт: {normalized}"
+    assert "meta" not in normalized and "payload" not in normalized, "мост вернул вложенную легаси-структуру"
+    assert normalized["odds_1x2"]["1"] == 2.50, "котировки не дошли до паспорта"
+    hc = normalized.get("home_clean")
+    assert isinstance(hc, str) and hc and hc != "2.50", f"home_clean не строка-имя: {hc!r}"
+
+    # Фид без полной линии 1X2 → None: фейковые дефолты 1.0/1.0 убраны из моста
+    partial_payload = dict(mock_payload, odds_1x2={"1": 2.50, "X": 3.20})
+    assert harvester.route_to_value_engine(partial_payload) is None, "фид без draw прошёл мост"
+
     harvester.use_curl_cffi = False
     bad_url = "https://invalid-gatekeeper-endpoint.local"
     with patch('network_harvest_runtime.urllib.request.urlopen', side_effect=RuntimeError("Blocked network access")):
@@ -277,24 +314,30 @@ def test_cascade_fallback_scoring():
     from network_harvest_runtime import GatekeeperNetworkHarvester
     chaos_monkey_runtime.reset_score()
     harvester = GatekeeperNetworkHarvester()
+    harvester.use_curl_cffi = True  # [FIXED v9.6.8] форс каскада: штраф за спасти фолбэком возникает только на этом пути
     target_url = "https://upstash-redis-mock.local"
     mock_raw_json = b'{"odds": {"home": 1.85, "away": 2.10}, "market_id": "match_cascade_20"}'
 
-    with patch('curl_cffi.requests.get', side_effect=RuntimeError("JA3 fingerprint drop")):
-        with patch('network_harvest_runtime.urllib.request.urlopen') as mock_urlopen:
-            mock_response = MagicMock()
-            mock_response.read.return_value = mock_raw_json
-            mock_response.__enter__.return_value = mock_response
-            mock_urlopen.return_value = mock_urlopen
+    # [FIXED v9.6.8] Мок curl_cffi ставится только если библиотека установлена;
+    # без неё патченный харвест сам уходит в каскад на urllib — путь тот же.
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        if _try_import("curl_cffi"):
+            stack.enter_context(patch('curl_cffi.requests.get', side_effect=RuntimeError("JA3 fingerprint drop")))
+        mock_urlopen = stack.enter_context(patch('network_harvest_runtime.urllib.request.urlopen'))
+        mock_response = MagicMock()
+        mock_response.read.return_value = mock_raw_json
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_urlopen
 
-            # Для обхода мока, возвращающего байты, подменяем fetch_odds_data напрямую или мокаем json.loads
-            with patch('json.loads', return_value={"odds": {"home": 1.85, "away": 2.10}, "market_id": "match_cascade_20"}):
-                result = harvester.fetch_odds_data(target_url)
-                assert result is not None
-                target_id = result["payload"].get("market_id") if "payload" in result else result.get("market_id")
-                assert target_id == "match_cascade_20"
-                current_score = chaos_monkey_runtime.get_current_score()
-                assert current_score == 1
+        # Для обхода мока, возвращающего байты, подменяем json.loads
+        with patch('json.loads', return_value={"odds": {"home": 1.85, "away": 2.10}, "market_id": "match_cascade_20"}):
+            result = harvester.fetch_odds_data(target_url)
+            assert result is not None
+            target_id = result["payload"].get("market_id") if "payload" in result else result.get("market_id")
+            assert target_id == "match_cascade_20"
+            current_score = chaos_monkey_runtime.get_current_score()
+            assert current_score == 1
     print("  test_cascade_fallback_scoring: PASS")
 
 # ── 21. Total Pipeline Crash & Static Security Check Gate ──
@@ -308,14 +351,18 @@ def test_total_failure_and_ib_compliance():
 
     chaos_monkey_runtime.reset_score()
     harvester = GatekeeperNetworkHarvester()
+    harvester.use_curl_cffi = True  # [FIXED v9.6.8] форс каскада: тотальный отказ = штраф 3 только на этом пути
     target_url = "https://upstash-redis-mock.local"
 
-    with patch('curl_cffi.requests.get', side_effect=RuntimeError("Fatal Proxy Error")):
-        with patch('network_harvest_runtime.urllib.request.urlopen', side_effect=urllib.error.URLError("Network unreachable")):
-            result = harvester.fetch_odds_data(target_url)
-            assert result is None
-            current_score = chaos_monkey_runtime.get_current_score()
-            assert current_score == 3
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        if _try_import("curl_cffi"):
+            stack.enter_context(patch('curl_cffi.requests.get', side_effect=RuntimeError("Fatal Proxy Error")))
+        stack.enter_context(patch('network_harvest_runtime.urllib.request.urlopen', side_effect=urllib.error.URLError("Network unreachable")))
+        result = harvester.fetch_odds_data(target_url)
+        assert result is None
+        current_score = chaos_monkey_runtime.get_current_score()
+        assert current_score == 3
 
     files_to_scan = ["network_harvest_runtime.py", "chaos_monkey_runtime.py", "test_contracts.py", "reconciliation_ledger_runtime.py"]
     for file_name in files_to_scan:
@@ -355,17 +402,34 @@ def test_chaos_monkey_decay_stress():
         print("  test_chaos_monkey_decay_stress: SKIP (no module)")
         return
     import chaos_monkey_runtime as cm
-    if hasattr(cm, 'reset_score'): cm.reset_score()
-    initial_errors = 14.0
-    if hasattr(cm, 'current_errors'): cm.current_errors = initial_errors
-    elif hasattr(cm, 'metrics'): cm.metrics["current_errors"] = initial_errors
-    
-    if hasattr(cm, 'apply_decay'): cm.apply_decay()
+    import time as _time
+    if hasattr(cm, 'reset_score'):
+        cm.reset_score()
+    if hasattr(cm, '_accumulated_score') and hasattr(cm, '_last_decay_timestamp'):
+        # [FIXED v9.6.8] Патченный модуль ведёт _accumulated_score с real-time decay.
+        # Раньше тест множил несуществующий current_errors и «проходил» на дефолтном нуле.
+        cm.register_failure_score(4)
+        cm._last_decay_timestamp = _time.time() - 130.0  # два полных интервала → -2 балла за каждый
+        if hasattr(cm, 'decay_errors'):
+            after = cm.decay_errors()
+        elif hasattr(cm, 'GatekeeperChaosMonkey'):
+            after = cm.GatekeeperChaosMonkey().decay_errors()
+        else:
+            after = cm.get_current_score()
+        assert after < 4, f"decay не сработал: {after}"
+        if hasattr(cm, 'reset_score'):
+            cm.reset_score()
     else:
-        factor = getattr(cm, 'decay_factor', 0.5)
-        if hasattr(cm, 'current_errors'): cm.current_errors *= factor
-    decayed_val = getattr(cm, 'current_errors', 0.0)
-    assert decayed_val < initial_errors
+        # Легаси-путь для старых ревизий модуля (контракт CI сохранён)
+        initial_errors = 14.0
+        if hasattr(cm, 'current_errors'): cm.current_errors = initial_errors
+        elif hasattr(cm, 'metrics'): cm.metrics["current_errors"] = initial_errors
+        if hasattr(cm, 'apply_decay'): cm.apply_decay()
+        else:
+            factor = getattr(cm, 'decay_factor', 0.5)
+            if hasattr(cm, 'current_errors'): cm.current_errors *= factor
+        decayed_val = getattr(cm, 'current_errors', 0.0)
+        assert decayed_val < initial_errors
     print("  test_chaos_monkey_decay_stress: PASS")
 
 # ── 24. Value Engine Adaptive MAD Filtering Stress Gate ──
@@ -407,11 +471,21 @@ def test_harvester_explicit_schema_delivery():
         return
     from network_harvest_runtime import GatekeeperNetworkHarvester
     harvester = GatekeeperNetworkHarvester()
-    raw = {"odds": {"home": 3.10, "away": 1.45}, "market_id": "m_gate_26"}
+    # [FIXED v9.6.8] Плоский паспорт v710 на выходе моста: без meta/payload и версии 7.1.0.
+    raw = {
+        "home_team": "Arsenal FC",
+        "away_team": "Chelsea FC",
+        "date_utc": "2026-10-19T18:00:00Z",
+        "status": "scheduled",
+        "competition": "Premier League",
+        "odds_1x2": {"1": 3.10, "X": 3.40, "2": 1.45},
+        "market_id": "m_gate_26"
+    }
     normalized = harvester.route_to_value_engine(raw)
-    assert normalized["meta"]["version"] == "7.1.0"
-    assert normalized["payload"]["home_clean"] == 3.10
-    assert normalized["payload"]["market_id"] == "m_gate_26"
+    assert isinstance(normalized, dict), f"мост не вернул паспорт: {normalized}"
+    assert normalized["odds_1x2"]["1"] == 3.10, "котировка не дошла до паспорта"
+    assert isinstance(normalized["home_clean"], str) and normalized["home_clean"], "home_clean не clean-имя"
+    assert "meta" not in normalized and "payload" not in normalized, "легаси-обёртка в паспорте"
     print("  test_harvester_explicit_schema_delivery: PASS")
 
 # ── 27. Harvester Penalty Dispatch Gate ──
@@ -458,12 +532,14 @@ def test_flat_feed_v710_drift_gate28():
         "payload": {"home_clean": 1.85, "away_clean": 1.90}
     }
     
+    # Референсная модель Гейта 28. Боевой гейт в харвесте держит whitelist
+    # {odds_1x2, stats, odds} — вложенность вне его штрафуется в 3 балла.
     def verify_flatness(data):
         if not isinstance(data, dict):
             raise ValueError("Feed must be a dictionary")
         for k, v in data.items():
             if isinstance(v, (dict, list, tuple)):
-                raise ValueError(f"Nested structure detected at key '{k}'")
+                raise ValueError(f"Gate 28 violation: nested structure at key '{k}'")
         return True
 
     assert verify_flatness(valid_flat_feed) is True

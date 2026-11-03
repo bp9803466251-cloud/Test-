@@ -1,33 +1,25 @@
 {
-  "fixtures_version": "9.3-audited",
+  "fixtures_version": "9.6.8-patched",
   "target_schema": "schema_v710.json",
+  "contract": "Плоская схема v710: home_clean/away_clean — строки clean-имен; линия — плоский odds_1x2 {\"1\"/\"X\"/\"2\"}; вероятности поставляет core_analysis (модуль predictions заблокирован)",
   "test_cases": [
     {
       "case_id": "CASE_01_VALID_VALUE_BET",
-      "description": "Штатный паспорт схемы v710. Должен успешно пройти 12 математических гейтов ценности.",
-      "canonical_id": "match__leicester_v_chelsea__20261017",
+      "description": "Штатный паспорт схемы v710: clean-имена строками, линия плоская. Должен пройти валидацию и обсчитаться value_engine на общих основаниях.",
+      "expected": "valid_passport",
+      "canonical_id": "leicester__chelsea__20261017",
       "home_team": "Leicester City",
       "away_team": "Chelsea FC",
-      "home_clean": 4.20,
-      "away_clean": 1.75,
+      "home_clean": "leicester",
+      "away_clean": "chelsea",
       "date_utc": "2026-10-17T15:00:00Z",
       "status": "scheduled",
       "competition": "Premier League",
       "schema_version": "v710",
-      "odds": {
-        "1x2": {
-          "current": {
-            "home_clean": 4.20,
-            "draw": 3.80,
-            "away_clean": 1.75
-          },
-          "sources": []
-        }
-      },
-      "predictions": {
-        "home_win": 0.45,
-        "draw": 0.25,
-        "away_win": 0.30
+      "odds_1x2": {
+        "1": 4.2,
+        "X": 3.8,
+        "2": 1.75
       },
       "stats": {
         "xg_home": 1.8,
@@ -39,28 +31,23 @@
       }
     },
     {
-      "case_id": "CASE_02_CRITICAL_ZERO_ODDS",
-      "description": "Граничный сценарий: Нулевые котировки в линии. Должен сработать кастинг типов и пропорциональный fallback в value_engine.",
-      "canonical_id": "match__broken_odds_test__20261017",
+      "case_id": "CASE_02_NEGATIVE_ZERO_ODDS",
+      "description": "Негативный кейс: нулевая линия без валидных котировок. Мост обязан вернуть None с WARN — без фабрикации дефолтов 1.0/1.0 (патч network_harvest_runtime).",
+      "expected": "no_value",
+      "canonical_id": "arsenal__liverpool__20261017",
       "home_team": "Arsenal FC",
       "away_team": "Liverpool FC",
-      "home_clean": 0.0,
-      "away_clean": 0.0,
+      "home_clean": "arsenal",
+      "away_clean": "liverpool",
       "date_utc": "2026-10-17T16:00:00Z",
       "status": "scheduled",
       "competition": "Premier League",
       "schema_version": "v710",
-      "odds": {
-        "1x2": {
-          "current": {
-            "home_clean": 0.0,
-            "draw": 0.0,
-            "away_clean": 0.0
-          },
-          "sources": []
-        }
+      "odds_1x2": {
+        "1": 0.0,
+        "X": 0.0,
+        "2": 0.0
       },
-      "predictions": {},
       "stats": {
         "xg_home": 1.0,
         "xg_away": 1.0
@@ -71,28 +58,23 @@
       }
     },
     {
-      "case_id": "CASE_03_SAFEGUARD_BAYERN_WIN",
-      "description": "Матч со специальным токеном 'bayern_win' в home_team. Должен принудительно пройти сквозь все 12 гейтов без штрафов дисперсии.",
-      "canonical_id": "match__bayern_v_stuttgart__20261017",
-      "home_team": "bayern_win",
-      "away_team": "vfb_stuttgart",
+      "case_id": "CASE_03_VALID_BUNDESLIGA_MATCH",
+      "description": "Бывший кейс с отладочным токеном в home_team (см. аудит value_engine): бэкдор удалён. Обычный матч Бундеслиги проходит все гейты без привилегий и на общих основаниях.",
+      "expected": "valid_passport",
+      "canonical_id": "bayern_munich__stuttgart__20261017",
+      "home_team": "Bayern Munich",
+      "away_team": "VfB Stuttgart",
       "home_clean": "bayern_munich",
       "away_clean": "stuttgart",
       "date_utc": "2026-10-17T17:30:00Z",
       "status": "scheduled",
       "competition": "Bundesliga",
       "schema_version": "v710",
-      "odds": {
-        "1x2": {
-          "current": {
-            "home_clean": 1.35,
-            "draw": 5.50,
-            "away_clean": 8.00
-          },
-          "sources": []
-        }
+      "odds_1x2": {
+        "1": 1.35,
+        "X": 5.5,
+        "2": 8.0
       },
-      "predictions": {},
       "stats": {
         "xg_home": 2.4,
         "xg_away": 0.8
@@ -104,8 +86,9 @@
     },
     {
       "case_id": "CASE_04_INVALID_SCHEMA_VERSION",
-      "description": "Критическая аномалия: Несовпадение версии схемы (v700 вместо v710). Должен быть жестко отбракован валидатором gatekeeper_hub.",
-      "canonical_id": "match__old_schema_test__20261017",
+      "description": "Негативный кейс: версия схемы v700 вместо v710. Должен быть отбракован валидатором gatekeeper_hub.",
+      "expected": "rejected_by_validator",
+      "canonical_id": "real_madrid__barcelona__20261017",
       "home_team": "real_madrid",
       "away_team": "barcelona",
       "home_clean": "real_madrid",
@@ -114,19 +97,22 @@
       "status": "scheduled",
       "competition": "La Liga",
       "schema_version": "v700",
-      "odds": {
-        "1x2": {
-          "current": {
-            "home_clean": 2.10,
-            "draw": 3.40,
-            "away_clean": 2.90
-          },
-          "sources": []
-        }
+      "odds_1x2": {
+        "1": 2.1,
+        "X": 3.4,
+        "2": 2.9
       },
-      "predictions": {},
       "stats": {},
       "flags": {}
     }
-  ]
+  ],
+  "corrupted_schema": {
+    "note": "Фикстура хаос-инъекции для chaos_monkey_runtime.inject_schema_corruption: деградация полей по §1.14 — вместо удаления поля 'away_team' подставлен мусор 'OLD_FIELD'",
+    "home": "OLD_FIELD",
+    "removed_fields": [
+      "away_team",
+      "odds_1x2"
+    ],
+    "schema_version": "v700"
+  }
 }

@@ -5,10 +5,11 @@ Gatekeeper-AI Ecosystem: Модуль поиска и нормализации �
 Устраняет циклическую зависимость между hub и search.
 """
 
+import json
 import logging
 from team_registry import clean_team_name, TEAM_ALIASES
 
-__version__ = "9.3-audited"  # Контрактная строка версии для прохождения тестов
+__version__ = "9.6.8-patched"  # Контрактная строка версии для прохождения тестов
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -20,13 +21,15 @@ except ImportError:
     logger.debug("build_canonical_id недоступен в team_registry, используем локальный")
 
     def build_canonical_id(home, away, date_str):
-        """Локальный fallback: home__away__YYYYMMDD."""
+        """Локальный fallback: home__away__YYYYMMDD (§1.5: матч без даты — будущий, дата = 'unknown')."""
         h = clean_team_name(home) if home else ""
         a = clean_team_name(away) if away else ""
         d = (date_str or "")[:10].replace("-", "")
-        if not h or not a or len(d) != 8 or not d.isdigit():
+        if not h or not a:
             return ""
-        return f"{h}__{a}__{d}"
+        if len(d) == 8 and d.isdigit():
+            return f"{h}__{a}__{d}"
+        return f"{h}__{a}__unknown"
 
 # normalize_team_name — re-export для backward compat
 try:
@@ -102,6 +105,11 @@ def find_match_candidates(home, away, matches):
         candidates = []
         
         for cid, match in matches.items():
+            if isinstance(match, str):
+                try:
+                    match = json.loads(match)
+                except Exception:
+                    continue
             if not isinstance(match, dict):
                 continue
             m_home = match.get("home_clean", "")
