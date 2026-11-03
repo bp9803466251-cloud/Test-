@@ -417,7 +417,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 continue
 
             # ─── Odds ───
-            odds_data = ev_detail.get("odds", ev_detail)
+            odds_data = ev_detail.get("odds") or ev_detail
             if is_first_ten:
                 logger.debug(f"DEBUG MATCH #{idx+1} ODDS DATA TYPE: {type(odds_data)}")
 
@@ -430,12 +430,11 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                         odds_enriched += 1
                     else:
                         enrichment_errors += 1
+                else:
+                    enrichment_errors += 1
                 
                 for m_key, m_val in extended_markets.items():
                     patch_match(cid, m_key, m_val, source="bzzoiro")
-
-                if not flat_1x2 and not extended_markets:
-                    not_found += 1
 
             # ─── H2H ───
             h2h_data = ev_detail.get("h2h") or ev_detail.get("head_to_head") or ev_detail.get("headToHead")
@@ -519,4 +518,4 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 if __name__ == "__main__":
     events_only = "--events-only" in sys.argv
     collect_bzzoiro(events_only=events_only)
-    
+                    
