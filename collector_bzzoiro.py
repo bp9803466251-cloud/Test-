@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 collector_bzzoiro.py — PRIMARY Ingestion Collector для Bzzoiro (v9.6.8-patched).
-Сбор сетки матчей, коэффициентов, статистики и H2H с детальным дебагом для первых 10 матчей.
+Сбор сетки матчей, коэффициентов, статистики и H2H напрямую через /events/{id}/ без таймаутов.
 """
 
 import os
@@ -12,11 +12,11 @@ import datetime as dt
 from typing import Any
 import logging
 
-# Использование curl_cffi с impersonate="chrome" для обхода WAF/Cloudflare внешних API (§1.3, §1.23)[span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span)
+# Использование curl_cffi с impersonate="chrome" для обхода WAF/Cloudflare внешних API (§1.3, §1.23)[span_1](start_span)[span_1](end_span)[span_2](start_span)[span_2](end_span)
 try:
     from curl_cffi import requests
 except ImportError:
-    import requests  # fallback, но рекомендуется curl_cffi[span_2](start_span)[span_2](end_span)
+    import requests  # fallback, но рекомендуется curl_cffi[span_3](start_span)[span_3](end_span)
 
 # ─── Logging setup (DEBUG enabled) ───
 logging.basicConfig(
@@ -73,7 +73,6 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
     for attempt in range(max_retries + 1):
         try:
             try:
-                # Уменьшаем таймаут до 15 секунд для предотвращения долгих зависаний
                 resp = requests.get(url, headers=headers, timeout=15, impersonate="chrome")
             except TypeError:
                 resp = requests.get(url, headers=headers, timeout=15)
@@ -253,7 +252,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     }
 
     logger.info("=" * 60)
-    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (DEBUG FIRST 10 MATCHES) started.")
+    logger.info("[BZZOIRO] Collector Bzzoiro v9.6.8-patched (STABLE /events/{id}/) started.")
     logger.info("=" * 60)
 
     # ─── Шаг 0: Инициализация Redis ───
@@ -392,7 +391,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     if events_only:
         logger.info("Режим events-only — enrichment пропущен")
     elif stored_matches:
-        logger.info(f"Шаг 3: Обогащение {len(stored_matches)} матчей...")
+        logger.info(f"Шаг 3: Обогащение {len(stored_matches)} матчей через /events/{{id}}/...[span_4](start_span)[span_4](end_span)")
 
         for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
             is_first_ten = idx < 10
@@ -408,22 +407,21 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     if patch_match(cid, "score", score, source="bzzoiro"):
                         score_enriched += 1
 
+            # Единый стабильный запрос детекта всей информации по матчу через /events/{id}/[span_5](start_span)[span_5](end_span)
+            event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
+            ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
+
+            if ev_detail is _NOT_FOUND or not isinstance(ev_detail, dict):
+                not_found += 1
+                time.sleep(ENRICH_DELAY)
+                continue
+
             # ─── Odds ───
-            odds_url = f"{BZZOIRO_BASE}/odds/?event_id={bzzoiro_id}"
-            odds_data = _fetch_bzzoiro(odds_url, headers, max_retries=MAX_RETRIES)
-
-            if odds_data is _NOT_FOUND or not odds_data:
-                detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
-                detail_data = _fetch_bzzoiro(detail_url, headers, max_retries=MAX_RETRIES)
-                if isinstance(detail_data, dict):
-                    odds_data = detail_data.get("odds", detail_data)
-                    if is_first_ten:
-                        logger.debug(f"DEBUG MATCH #{idx+1} EVENT DETAIL KEYS: {list(detail_data.keys())}")
-
+            odds_data = ev_detail.get("odds", ev_detail)
             if is_first_ten:
-                logger.debug(f"DEBUG MATCH #{idx+1} ODDS DATA TYPE: {type(odds_data)} | CONTENT: {str(odds_data)[:500]}")
+                logger.debug(f"DEBUG MATCH #{idx+1} ODDS DATA TYPE: {type(odds_data)}")
 
-            if odds_data is _NOT_FOUND or not odds_data:
+            if not odds_data:
                 not_found += 1
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
@@ -439,26 +437,12 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 if not flat_1x2 and not extended_markets:
                     not_found += 1
 
-            time.sleep(ENRICH_DELAY)
-
             # ─── H2H ───
-            event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
-            ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
-            
-            h2h_data = None
-            if isinstance(ev_detail, dict):
-                h2h_data = ev_detail.get("h2h") or ev_detail.get("head_to_head") or ev_detail.get("headToHead")
-
-            if not h2h_data or h2h_data is _NOT_FOUND:
-                h2h_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/h2h"
-                h2h_data = _fetch_bzzoiro(h2h_url, headers, max_retries=MAX_RETRIES)
-
+            h2h_data = ev_detail.get("h2h") or ev_detail.get("head_to_head") or ev_detail.get("headToHead")
             if is_first_ten:
                 logger.debug(f"DEBUG MATCH #{idx+1} H2H DATA: {str(h2h_data)[:400]}")
 
-            if h2h_data is _NOT_FOUND or not h2h_data:
-                not_found += 1
-            else:
+            if h2h_data and h2h_data is not _NOT_FOUND:
                 inner_h2h = {}
                 if isinstance(h2h_data, dict):
                     inner_h2h = (
@@ -477,27 +461,14 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                         h2h_enriched += 1
                     else:
                         enrichment_errors += 1
-                else:
-                    not_found += 1
-
-            time.sleep(ENRICH_DELAY)
 
             # ─── Stats ───
             if not is_prematch:
-                stats_data = None
-                if isinstance(ev_detail, dict):
-                    stats_data = ev_detail.get("stats")
-
-                if not stats_data or stats_data is _NOT_FOUND:
-                    stats_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/stats"
-                    stats_data = _fetch_bzzoiro(stats_url, headers, max_retries=MAX_RETRIES)
-
+                stats_data = ev_detail.get("stats")
                 if is_first_ten:
                     logger.debug(f"DEBUG MATCH #{idx+1} STATS DATA: {str(stats_data)[:400]}")
 
-                if stats_data is _NOT_FOUND or not stats_data:
-                    not_found += 1
-                elif isinstance(stats_data, dict):
+                if stats_data and stats_data is not _NOT_FOUND and isinstance(stats_data, dict):
                     inner_stats = stats_data.get("stats", stats_data)
                     if isinstance(inner_stats, dict) and inner_stats:
                         flat_stats = _flatten_stats(inner_stats)
@@ -505,10 +476,8 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                             stats_enriched += 1
                         else:
                             enrichment_errors += 1
-                    else:
-                        not_found += 1
 
-                time.sleep(ENRICH_DELAY)
+            time.sleep(ENRICH_DELAY)
 
             if (idx + 1) % 50 == 0:
                 logger.info(f"Обогащение: {idx + 1}/{len(stored_matches)}")
