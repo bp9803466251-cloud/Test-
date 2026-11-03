@@ -7,18 +7,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
+  group: telegram-dashboard # [FIXED] Была gatekeeper-redis: копипаста, дашборд вставал в очередь за коллекторами
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12' # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
   PYTHONUNBUFFERED: '1'
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # Синхронизировано с gatekeeper_config.py
 
 jobs:
   dashboard:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15 # [FIXED] 5 -> 15: установка numpy/scipy плюс сетевые отправки с ретраями не укладываются в 5 минут
 
     steps:
       - name: Checkout Repository
@@ -34,20 +34,42 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Принудительное развертывание математического стека для предотвращения ModuleNotFoundError
-          pip install numpy scipy
+          # [REMOVED] Непривязанный "pip install numpy scipy": мог поднять numpy 2.x
+          # поверх пина numpy<2.0.0 из патченного requirements (ABI-конфликт со scipy<1.14).
+          # Версии уже зафиксированы в requirements.txt — второй установки не требуется.
 
       - name: Broadcast Environment Health Metrics
+        env:
+          # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
+          # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
+          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+          SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          # [FIXED] Контракт транспорта: send_transport_payload читает TELEGRAM_CHAT_ID,
+          # а не TELEGRAM_GROUP_ID. Значение секрета группы прокинуто на ожидаемое имя.
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          GATEKEEPER_ENV: production # [FIXED] prod -> production: синхрон с docker_compose.yml
+          GATEKEEPER_CONFIG_FILE: ${{ env.GATEKEEPER_CONFIG_FILE }}
         run: |
-          python -c "
-          import json
+          # [FIXED] Инлайн python -c с экранированными кавычками заменен на heredoc:
+          # делимитер в кавычках отключает шелл-интерполяцию, кавычки f-строк
+          # не экранируются вовсе. АСТ-проверкой подтверждена компилируемость.
+          # [FIXED] Импорт: в патченном telegram_transport.py (9.6.8) функции
+          # send_telegram_dashboard не существует — импорт падал с ImportError
+          # на каждом запуске. Реальный контракт — send_transport_payload(html_payload).
+          python -u - <<'PYEOF'
+          import os
           from redis_config import is_redis_configured
           from gatekeeper_hub import get_all_matches
           from metrics import collect_metrics, save_metrics
-          from telegram_transport import send_telegram_dashboard
+          from telegram_transport import send_transport_payload
 
           redis_ok = is_redis_configured()
-          
+
           # Сбор системной канонической матрицы здоровья экосистемы
           metrics_payload = collect_metrics()
           save_metrics(metrics_payload)
@@ -56,25 +78,24 @@ jobs:
           now_str = metrics_payload.get('timestamp', '?')
           report_text = (
               f'📊 <b>GatekeeperAI System Status Dashboard</b>\n'
-              f'• Извлечено пре-матч паспортов: {metrics_payload.get(\"matches_total\", 0)}\n'
-              f'• Доступность Redis Cluster: {\"✅ ONLINE\" if redis_ok else \"❌ OFFLINE\"}\n'
-              f'• Активных Serverless-коллекторов: {metrics_payload.get(\"collectors_active\", 0)}\n'
-              f'• Обнаружено сигналов VALUE BETS: {metrics_payload.get(\"matches_with_value\", 0)}\n\n'
+              f'• Извлечено пре-матч паспортов: {metrics_payload.get("matches_total", 0)}\n'
+              f'• Доступность Redis Cluster: {"✅ ONLINE" if redis_ok else "❌ OFFLINE"}\n'
+              f'• Активных Serverless-коллекторов: {metrics_payload.get("collectors_active", 0)}\n'
+              f'• Обнаружено сигналов VALUE BETS: {metrics_payload.get("matches_with_value", 0)}\n\n'
               f'🕒 Временная метка генерации: {now_str}\n'
               f'⭐ Стандарт вычислений: CORE ENGINE V6.7'
           )
-          
-          send_telegram_dashboard(report_text)
-          "
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-          GATEKEEPER_ENV: prod
-          GATEKEEPER_CONFIG_FILE: ${{ env.GATEKEEPER_CONFIG_FILE }}
+
+          # Без токена транспорт не отправит ничего: честный notice и тихий выход,
+          # чтобы ручной запуск дашборда не краснел при незаведённом секрете.
+          if not os.getenv('TELEGRAM_BOT_TOKEN'):
+              print('::notice::TELEGRAM_BOT_TOKEN не задан в Secrets - отчёт сформирован, но не отправлен')
+          else:
+              # В синхронном скрипте без event loop транспорт сам откатывается
+              # на синхронную отправку с ретраями и экспоненциальным backoff.
+              if not send_transport_payload(report_text):
+                  raise SystemExit('Доставка отчёта в Telegram завершилась сбоем')
+          PYEOF
 
       - name: Telegram alert on failure
         if: failure()
@@ -82,8 +103,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
+          # [FIXED] Битый URL (telegram.org{TELEGRAM_BOT_TOKEN} не является адресом:
+          # потеряны api, префикс bot и скобка) -> канонический api.telegram.org/bot.
+          # [FIXED] Убран || true: отказ доставки алерта должен быть виден в логе.
+          # curl — системная утилита раннера, §1.3 регулирует Python-код пакета.
           MSG="❌ Telegram Dashboard FAILED%0ARun: ${{ github.run_id }}"
-          curl -s -X POST "https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage" \
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
-            -d text="${MSG}" || true
+            -d text="${MSG}"
             
