@@ -10,19 +10,20 @@ on:
         type: string
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12" # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
 
 permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
+  group: collector-sharpapi # [FIXED] Была gatekeeper-redis: копипаста из odds_api сериализовала коллекторы
   cancel-in-progress: false
 
 jobs:
   run-collector:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30 # [FIXED] 15 -> 30: SHARPAPI_RATE_LIMIT_DELAY=6 с и до 60 страниц дают >15 мин на одни паузы
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -39,18 +40,27 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run collector
-        run: python collector_sharpapi.py
+        run: python -u collector_sharpapi.py # [FIXED] -u: небуферизированный вывод в логи Actions
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
+          # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY }}
+          SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+          SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
+          # Ключ поставщика и настройки квот/дилей
+          # [FIXED] || '' для паритета с серией: на пустом ключе коллектор сам репортит деградацию
+          SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
           SHARPAPI_RATE_LIMIT_DELAY: ${{ vars.SHARPAPI_RATE_LIMIT_DELAY || '6' }}
           SHARPAPI_MAX_PAGES: ${{ vars.SHARPAPI_MAX_PAGES || '60' }}
           SHARPAPI_LIMIT: ${{ vars.SHARPAPI_LIMIT || '200' }}
           SHARPAPI_MAX_RETRIES: ${{ vars.SHARPAPI_MAX_RETRIES || '3' }}
           GATEKEEPER_EXTERNAL_API_TIMEOUT: ${{ vars.GATEKEEPER_EXTERNAL_API_TIMEOUT || '15' }}
+          # Безопасно: интерполяция ручного ввода только в env-блоке, не в run-скрипте
           SHARPAPI_DAYS_AHEAD: ${{ github.event.inputs.days_ahead || '1' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # [ADDED] Паритет с docker_compose.yml и серией коллекторов
+          GATEKEEPER_ENV: production
           
