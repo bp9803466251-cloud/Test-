@@ -1,10 +1,16 @@
 name: Engine Stress Test
 
+# §1.2: workflow_dispatch only, no cron
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# §16.4: каноническая группа диагностического слоя
+concurrency:
+  group: gatekeeper-diagnostics
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: '3.11'
@@ -36,7 +42,6 @@ jobs:
         run: python stress_test_runtime.py
         env:
           GATEKEEPER_ENV: stress_testing
-          CI: "true"
 
       - name: Print Pipeline Execution Status
         if: always()
