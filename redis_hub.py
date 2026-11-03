@@ -422,18 +422,23 @@ def save_to_cache(field_id, value, sender_repo="unknown"):
 
 
 def get_from_cache(field_id):
-    """Чтение одного поля (с мягкой распаковкой конверта и поддержкой сырых словарей)."""
+    """Чтение одного поля с автоматической поддержкой префикса match:."""
     raw = _execute_upstash_cmd(["HGET", HASH_NAME, field_id])
+    if raw is None and not field_id.startswith("match:"):
+        raw = _execute_upstash_cmd(["HGET", HASH_NAME, f"match:{field_id}"])
+
     if raw is None:
         return None
+
     payload = _unwrap_envelope(raw)
     if isinstance(payload, dict):
         return payload
-    # Fallback: если пришел десериализованный объект или строка, пробуем десериализовать в словарь
+
     if isinstance(raw, str):
         obj = _deserialize(raw)
         if isinstance(obj, dict):
             return obj
+
     return None
 
 
@@ -589,4 +594,5 @@ __all__ = [
     "PipelineBatch",
     "_execute_upstash_cmd",
     "_execute_pipeline",
-  ]
+      ]
+      
