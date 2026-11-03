@@ -172,11 +172,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # Защита от зависания бесконечных циклов в CI окружении GitHub Actions
-    if "CI" in os.environ or "true" in os.environ.get("CI", "").lower():
-        logger.info("CI-раннер обнаружен. Предварительная компиляция стресс-теста успешна.")
-        sys.exit(0)
-        
     success = main()
     sys.exit(0 if success else 1)
-    
+
