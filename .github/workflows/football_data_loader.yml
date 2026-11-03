@@ -39,13 +39,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
+  group: gatekeeper-pipeline
   cancel-in-progress: false
 
 jobs:
   load:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 60
 
     env:
       SEASONS_INPUT: ${{ github.event.inputs.seasons || '' }}
@@ -58,9 +58,9 @@ jobs:
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
+      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || '' }}
+      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY || '' }}
 
     steps:
       - name: Checkout
@@ -135,7 +135,7 @@ jobs:
 
       - name: Verify Redis data
         if: always()
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
           python -c "
           import os, json, urllib.request, sys
@@ -193,4 +193,5 @@ jobs:
           MSG="❌ Football Data Loader FAILED%0A%0ARun: ${{ github.run_id }}%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
-            -d text="${MSG}" || true
+            -d text="${MSG}"
+            
