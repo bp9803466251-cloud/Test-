@@ -1,20 +1,32 @@
 name: Match Dump
 
+# §1.2: workflow_dispatch only, no cron
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# §16.4: каноническая группа диагностического слоя
+concurrency:
+  group: gatekeeper-diagnostics
+  cancel-in-progress: false
+
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
-  GK_CONFIG_FILE: gatekeeper_config.yaml
+  GK_CONFIG_FILE: 'gatekeeper_config.yaml'
 
 jobs:
   dump:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
+    env:
+      SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+      SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -31,15 +43,10 @@ jobs:
 
       - name: Run match dump
         run: python diagnostic_matches.py
-        env:
-          SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
-          SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-          GK_CONFIG_FILE: ${{ env.GK_CONFIG_FILE }}
 
       - name: Summary
         if: always()
         run: |
           echo "=== Match Dump Summary ==="
           echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
