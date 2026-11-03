@@ -264,3 +264,5 @@ if WARN > 0:
 if FAIL == 0:
     print(f"\n✅ All tests passed — ready to deploy")
     sys.exit(0)
+print(f"\n❌ Tests failed — deployment blocked ({FAIL} failures)")
+sys.exit(1)
