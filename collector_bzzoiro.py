@@ -12,11 +12,11 @@ import datetime as dt
 from typing import Any
 import logging
 
-# Использование curl_cffi с impersonate="chrome" для обхода WAF/Cloudflare внешних API (§1.3, §1.23)[span_1](start_span)[span_1](end_span)[span_2](start_span)[span_2](end_span)
+# Использование curl_cffi с impersonate="chrome" для обхода WAF/Cloudflare внешних API (§1.3, §1.23)
 try:
     from curl_cffi import requests
 except ImportError:
-    import requests  # fallback, но рекомендуется curl_cffi[span_3](start_span)[span_3](end_span)
+    import requests  # fallback, но рекомендуется curl_cffi
 
 # ─── Logging setup (DEBUG enabled) ───
 logging.basicConfig(
@@ -391,7 +391,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
     if events_only:
         logger.info("Режим events-only — enrichment пропущен")
     elif stored_matches:
-        logger.info(f"Шаг 3: Обогащение {len(stored_matches)} матчей через /events/{{id}}/...[span_4](start_span)[span_4](end_span)")
+        logger.info(f"Шаг 3: Обогащение {len(stored_matches)} матчей через /events/{{id}}/...[span_0](start_span)[span_0](end_span)")
 
         for idx, (cid, bzzoiro_id, ev) in enumerate(stored_matches):
             is_first_ten = idx < 10
@@ -407,7 +407,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     if patch_match(cid, "score", score, source="bzzoiro"):
                         score_enriched += 1
 
-            # Единый стабильный запрос детекта всей информации по матчу через /events/{id}/[span_5](start_span)[span_5](end_span)
+            # Единый стабильный запрос детекта всей информации по матчу через /events/{id}/[span_1](start_span)[span_1](end_span)
             event_detail_url = f"{BZZOIRO_BASE}/events/{bzzoiro_id}/"
             ev_detail = _fetch_bzzoiro(event_detail_url, headers, max_retries=MAX_RETRIES)
 
@@ -426,7 +426,30 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
                 if flat_1x2:
-                    if patch_match(cid, "odds", flat_1x2, source="bzzoiro", upstream="opta"):
+                    # Корректная обертка 1x2 под схему v710 с обязательным current и sources
+                    odds_wrapped = {
+                        "1x2": {
+                            "current": {
+                                "home": str(flat_1x2.get("1", flat_1x2.get("home", "-"))),
+                                "draw": str(flat_1x2.get("X", flat_1x2.get("draw", "-"))),
+                                "away": str(flat_1x2.get("2", flat_1x2.get("away", "-")))
+                            },
+                            "sources": [
+                                {
+                                    "source": "bzzoiro",
+                                    "upstream": "opta",
+                                    "price": {
+                                        "home": str(flat_1x2.get("1", flat_1x2.get("home", "-"))),
+                                        "draw": str(flat_1x2.get("X", flat_1x2.get("draw", "-"))),
+                                        "away": str(flat_1x2.get("2", flat_1x2.get("away", "-")))
+                                    },
+                                    "timestamp": now_msk(),
+                                    "type": "live"
+                                }
+                            ]
+                        }
+                    }
+                    if patch_match(cid, "odds", odds_wrapped, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
                     else:
                         enrichment_errors += 1
@@ -518,4 +541,4 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 if __name__ == "__main__":
     events_only = "--events-only" in sys.argv
     collect_bzzoiro(events_only=events_only)
-                    
+    
