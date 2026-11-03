@@ -415,7 +415,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                 time.sleep(ENRICH_DELAY)
                 continue
 
-            # ─── Odds (Strict-Flat Схема v710 / Гейт 28) ───
+            # ─── Odds (v710 формат с current/sources) ───
             odds_data = ev_detail.get("odds") or ev_detail
             if is_first_ten:
                 logger.debug(f"DEBUG MATCH #{idx+1} ODDS DATA TYPE: {type(odds_data)}")
@@ -425,13 +425,27 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
                 if flat_1x2:
-                    flat_odds_v710 = {
-                        "1": float(flat_1x2.get("1", flat_1x2.get("home", 0.0))),
-                        "X": float(flat_1x2.get("X", flat_1x2.get("draw", 0.0))),
-                        "2": float(flat_1x2.get("2", flat_1x2.get("away", 0.0)))
+                    odds_v710 = {
+                        "current": {
+                            "home": str(flat_1x2.get("1", flat_1x2.get("home", "-"))),
+                            "draw": str(flat_1x2.get("X", flat_1x2.get("draw", "-"))),
+                            "away": str(flat_1x2.get("2", flat_1x2.get("away", "-")))
+                        },
+                        "sources": [
+                            {
+                                "source": "bzzoiro",
+                                "upstream": "opta",
+                                "price": {
+                                    "home": str(flat_1x2.get("1", flat_1x2.get("home", "-"))),
+                                    "draw": str(flat_1x2.get("X", flat_1x2.get("draw", "-"))),
+                                    "away": str(flat_1x2.get("2", flat_1x2.get("away", "-")))
+                                },
+                                "timestamp": now_msk(),
+                                "type": "live"
+                            }
+                        ]
                     }
-                    # Исправлено: имя секции строго "odds_1x2" согласно Схеме v710 (§1.21)
-                    if patch_match(cid, "odds_1x2", flat_odds_v710, source="bzzoiro", upstream="opta"):
+                    if patch_match(cid, "odds", odds_v710, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
                     else:
                         enrichment_errors += 1
@@ -523,3 +537,4 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 if __name__ == "__main__":
     events_only = "--events-only" in sys.argv
     collect_bzzoiro(events_only=events_only)
+
