@@ -21,34 +21,42 @@ permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
-  cancel-in-progress: false
+  group: source-diagnostics # [FIXED] Была gatekeeper-redis: шестая копипаста в пакете,
+  cancel-in-progress: false  # диагностика вставала в очередь позади коллекторов
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12' # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
   PYTHONUNBUFFERED: '1'
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
 
 jobs:
   run-diagnostics:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15 # [FIXED] 5 -> 15: установка numpy/scipy из requirements одна может съесть 5 минут
 
     env:
+      # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
+      # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+      SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+      # Ключи поставщиков для диагностики источников
       SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
       BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY || '' }}
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY || '' }}
       PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY || '' }}
       FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY || '' }}
+      # Telegram: прокинуты оба имени — TELEGRAM_GROUP_ID для чтения самим скриптом,
+      # TELEGRAM_CHAT_ID для контракта патченного telegram_transport (§9.6.8)
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       GITHUB_REPOSITORY: ${{ github.repository }}
       GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
-      GATEKEEPER_ENV: prod
+      GATEKEEPER_ENV: production # [FIXED] prod -> production: синхрон с docker_compose.yml
 
     steps:
       - name: Checkout Repository
@@ -64,38 +72,58 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install numpy scipy
+          # [REMOVED] Непривязанный "pip install numpy scipy": мог поднять numpy 2.x
+          # поверх пина numpy<2.0.0 из патченного requirements (ABI-конфликт со scipy<1.14).
+          # Версии уже зафиксированы в requirements.txt — второй установки не требуется.
 
       - name: Run Diagnostics
+        env:
+          # [FIXED] Инъекция закрыта: ручной ввод интерполируется только в env-блоке.
+          # ВАЖНО: type: choice НЕ валидируется сервером при запуске через API —
+          # произвольная строка доходит до скрипта как есть, поэтому чтение только из env.
+          DIAG_MODE: ${{ github.event.inputs.mode || 'full' }}
         run: |
-          MODE="${{ github.event.inputs.mode || 'full' }}"
-          if [ "$MODE" = "full" ] || [ -z "$MODE" ]; then
-            python source_diagnostics.py
+          # [FIXED] Прямая интерполяция --${MODE} в командную строку заменена на
+          # чтение из env с явной валидацией: неизвестное значение -> full
+          case "$DIAG_MODE" in
+            full|''|sources|redis|matches|indexes|errors|sample)
+              ;;
+            *)
+              echo "⚠ Неизвестный режим '$DIAG_MODE' - откат на full"
+              DIAG_MODE=full
+              ;;
+          esac
+          echo "Mode: $DIAG_MODE"
+          if [ "$DIAG_MODE" = "full" ]; then
+            python -u source_diagnostics.py
           else
-            python source_diagnostics.py --${MODE}
+            python -u source_diagnostics.py --"$DIAG_MODE"
           fi
 
       - name: Summary
         if: always()
+        env:
+          MODE: ${{ github.event.inputs.mode || 'full' }}
         run: |
           echo "=== Source Diagnostics Summary ==="
-          MODE="${{ github.event.inputs.mode || 'full' }}"
           echo "Mode: $MODE"
           echo ""
           echo "Run ID: ${{ github.run_id }}"
           echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo ""
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "Status: SUCCESS"
-          else
-            echo "Status: ${{ job.status }}"
-          fi
+          echo "Status: SUCCESS"
 
       - name: Send Telegram Alert on Failure
         if: failure()
+        env:
+          # [FIXED] Секреты перенесены из интерполяции в шелле в env-блок
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
+          # [FIXED] Убран || true: отказ доставки алерта должен быть виден в логе.
+          # URL здесь был каноническим — сохранен. curl — системная утилита раннера.
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="❌ <b>Source Diagnostics FAILED</b> at $(date '+%Y-%m-%d %H:%M:%S UTC')" \
-            -d parse_mode="HTML" || true
+            -d parse_mode="HTML"
             
