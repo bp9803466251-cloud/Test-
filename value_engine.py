@@ -460,9 +460,6 @@ def process_full_analysis(passport: Dict[str, Any]) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    if "CI" in os.environ:
-        logger.info("CI среда обнаружена. Векторизованный прогон value_engine завершен успешно.")
-        sys.exit(0)
 
     # Тест 1: плоский матч v710 (боевой контракт match_linker)
     flat_match = {
