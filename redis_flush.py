@@ -6,6 +6,13 @@ Gatekeeper-AI Ecosystem: Очистка и балансировка операт
 Версия 9.6.6-patched — Прямой SCAN конвейер без внешней зависимости от scan_keys.
 Topology: Zero-Folder Architecture (Root Execution)
 Compliance: §1.3: No requests — только встроенная urllib.request через redis_hub.py API.
+
+[9.6.6 FIX #1] _scan_redis: имена полей хэша (history:match:*) больше не добавляются
+               в standalone_keys — это поля хэша, DEL по ним не удаляет ничего.
+[9.6.6 FIX #2] _build_plan (history-only): хэш-история уходит в HDEL, а не в no-op DEL.
+               Прежняя версия молча не работала для половины истории, репортуя успех.
+[9.6.6 FIX #3] _execute_delete: DEL=0 означает «ключа не было» — не удаляемый объект.
+               Прежняя версия засчитывала каждый no-op как удаление (n if n > 0 else 1).
 """
 
 import os
@@ -69,17 +76,17 @@ VALID_MODES = ("history-only", "soft", "hard", "purge", "reset-breaker")
 def _scan_redis():
     """Сканирует Redis напрямую через SCAN и возвращает классифицированные ключи."""
     result = {
-        "hash_fields": {},      # field_name -> value (из HKEYS+HMGET)
+        "hash_fields": {},       # field_name -> value (из HKEYS+HMGET)
         "standalone_keys": [],   # history:*, system:* и др.
     }
     try:
         all_fields = get_all_fields()
         if isinstance(all_fields, dict):
             result["hash_fields"] = all_fields
-            # Дополнительно проверяем, не попали ли ключи истории внутрь хэша
-            for k in all_fields.keys():
-                if k.startswith("history:match:") and k not in result["standalone_keys"]:
-                    result["standalone_keys"].append(k)
+            # [9.6.6 FIX #1] Имена полей хэша (в т.ч. history:match:*) НЕ добавляются
+            # в standalone_keys: это поля хэша, DEL по ним — no-op, который прежняя
+            # версия засчитывала как успешное удаление. Хэш-поля обрабатываются
+            # через HDEL в _build_plan/_execute_delete.
     except Exception as e:
         logger.warning("get_all_fields() error: %s", e)
 
@@ -92,25 +99,25 @@ def _scan_redis():
                 raw_res = _execute_upstash_cmd(["SCAN", cursor, "MATCH", pattern, "COUNT", "250"])
                 if not raw_res or not isinstance(raw_res, list) or len(raw_res) < 2:
                     break
-                
+
                 next_cursor, keys = raw_res[0], raw_res[1]
-                
+
                 # Обработка строкового или байтового курсора
                 if isinstance(next_cursor, bytes):
                     next_cursor = next_cursor.decode('utf-8')
                 cursor = str(next_cursor)
-                
+
                 if keys and isinstance(keys, list):
                     for k in keys:
                         k_str = k.decode('utf-8') if isinstance(k, bytes) else str(k)
                         if k_str not in result["standalone_keys"]:
                             result["standalone_keys"].append(k_str)
-                            
+
                 if cursor == "0" or cursor == 0:
                     break
         except Exception as e:
             logger.warning("Прямой SCAN(%s) конвейера завершился с ошибкой: %s", pattern, e)
-            
+
     return result
 
 def _classify_hash_fields(fields):
@@ -134,7 +141,7 @@ def _classify_hash_fields(fields):
                     has_odds = True
             if not has_odds:
                 cats["match_no_odds"].append(fname)
-                
+
         elif fname.endswith(":meta"):
             cats["meta"].append(fname)
             if isinstance(fval, dict):
@@ -187,8 +194,15 @@ def _build_plan(mode, scan_result):
     to_del_hash, to_del_standalone, desc_parts = [], [], []
 
     if mode == "history-only":
+        # [9.6.6 FIX #2] История бывает и в полях хэша: HDEL по ним обязателен.
+        # Прежняя версия пускала имена полей хэша в DEL (no-op) и засчитывала их
+        # как удалённые — режим молча не работал для половины истории.
+        hist_hash = [f for f in fields if f.startswith("history:match:")]
+        to_del_hash.extend(hist_hash)
         to_del_standalone.extend(scats["history"])
-        desc_parts.append(f"history:match:* — {len(scats['history'])} ключей")
+        desc_parts.append(
+            f"history:match:* — {len(hist_hash)} полей хэша, {len(scats['history'])} обособленных ключей"
+        )
     elif mode == "soft":
         to_del_hash.extend(hcats["match_no_odds"])
         to_del_hash.extend(hcats["meta_stale"])
@@ -250,8 +264,11 @@ def _execute_delete(to_del_hash, to_del_standalone, batch_size=50):
         result = _execute_upstash_cmd(["DEL", key])
         if result is not None:
             try:
+                # [9.6.6 FIX #3] DEL=0 означает «ключа не было» — не удаляемый объект
+                # и не ошибка. Прежняя версия засчитывала каждый no-op как удаление
+                # (n if n > 0 else 1), завышая отчёт об успешности.
                 n = int(result)
-                deleted_standalone += n if n > 0 else 1
+                deleted_standalone += max(n, 0)
             except (ValueError, TypeError): deleted_standalone += 1
         else: errors += 1
     return deleted_hash, deleted_standalone, errors
@@ -287,14 +304,14 @@ def main():
     # Сканирование актуального состояния базы
     print(" -> Сканирование хранилища данных Redis (Нативный SCAN конвейер)...")
     scan_res = _scan_redis()
-    
+
     # Расчет плана удаления
     to_h, to_s, desc = _build_plan(args.mode, scan_res)
-    
+
     print("\n📋 ПЛАН ОЧИСТКИ:")
     for d in desc:
         print(f"   - {d}")
-        
+
     total_targets = len(to_h) + len(to_s)
     print(f"\n   Итого к удалению: {len(to_h)} полей хэша, {len(to_s)} обособленных ключей.")
 
@@ -313,7 +330,7 @@ def main():
     # Выполнение транзакции удаления
     print("\n🚀 Запуск транзакции очистки оперативной памяти...")
     del_h, del_s, errs = _execute_delete(to_h, to_s)
-    
+
     print("=" * 60)
     print("🏁 РЕЗУЛЬТАТЫ ВЫПОЛНЕНИЯ ОЧИСТКИ:")
     print(f"   Удалено полей хэша (HDEL): {del_h}")
@@ -323,4 +340,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+                    
