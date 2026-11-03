@@ -4,7 +4,7 @@ Gatekeeper-AI Ecosystem: TEAM REGISTRY & NORMALIZATION LAYER.
 Версия 9.6.1-audited — Исправлено cross-source склеивание топ-клубов (CI #9, §17).
 """
 
-__version__ = "9.3-audited"
+__version__ = "9.6.1-audited"
 
 
 import unicodedata
@@ -1784,10 +1784,10 @@ TEAM_ALIASES = {
     "club cienciano": "cienciano",
     "associazione sportiva cittadella s.r.l.": "cittadella",
     "cittadella": "cittadella",
-    "man city": "city",
-    "man_city": "city",
-    "manchester city": "city",
-    "manchester city football club": "city",
+    "man city": "man_city",
+    "man_city": "man_city",
+    "manchester city": "man_city",
+    "manchester city football club": "man_city",
     "ciudad bolivar": "ciudad_de_bolivar",
     "ciudad bolívar": "ciudad_de_bolivar",
     "ciudad de bolivar": "ciudad_de_bolivar",
@@ -2666,7 +2666,7 @@ TEAM_ALIASES = {
     "everton cd": "everton",
     "everton de vina del mar": "everton",
     "everton de viña del mar": "everton",
-    "everton fc county cup": "everton",
+    "everton fc county cup": "everton", от
     "everton football club": "everton",
     "everton de vina": "everton_vina",
     "everton vina": "everton_vina",
@@ -8214,6 +8214,6 @@ if __name__ == "__main__":
     print(f"[TEST] Сгенерированный ID: '{test_cid}'")
     
     if res == "brondby" and test_cid == "brondby__kashiwa_reysol__20261017":
-        print("Status: 32/32 PASSED")
+        print("Status: 2/2 PASSED")
     else:
         print("Status: FAILED")
