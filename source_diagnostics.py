@@ -1,54 +1,36 @@
 # source_diagnostics.py
 """
-Единый модуль диагностики Gatekeeper-AI v9.3-audited.
-Заменяет debug_inspect.py и debug_odds.py.
-Объединяет диагностику всех источников, Redis и матчей в одном файле.
+Единый модуль диагностики Gatekeeper-AI.
+Версия 9.6.8-patched — синхронизация с патч-циклом 9.6.8 (см. telegram_transport, metrics).
 
-v9.3-audited:
-  SD-1: Версия 9.3-audited
-  SD-2: Добавлена diagnose_indexes() — шарды, orphan IDs (§18.4)
-  SD-3: _read_meta() через get_key() из redis_hub + json.loads (§18.4)
-  SD-4: 7-секционный отчёт: Redis, Sources, Matches, Indexes, Errors+Anomalies, Sample, Summary (§18.3)
-  SD-5: Anomaly detection: матчи без odds, без даты, без competition, stale коллекторы >2ч (§16)
-  SD-6: diagnose_sample() — первые 5 матчей для ручной проверки (§16)
-  SD-7: Сигнатуры функций принимают all_fields: dict (§18.4)
-  SD-8: history:match:* ключи учитываются в Redis-диагностике (§8.7)
-
-  v9.4-source:
-  SD-9: _read_meta() → get_from_cache() из gatekeeper_hub (вместо get_key из redis_hub)
-        FIX STALE: хаб пишет meta через save_to_cache, а get_key не читает эти ключи
-  SD-10: Predictions check — relaxed (непустой dict, без требования "source")
-  SD-11: H2H check — relaxed (непустой dict, без требования "source")
-  SD-12: Odds sample — чтение через current/opening уровень (§1.21)
-  SD-13: Pred source display — fallback на "bzzoiro" если нет "source"
-
-Запуск:
-  python source_diagnostics.py            — полная диагностика (7 секций)
-  python source_diagnostics.py --sources  — только источники
-  python source_diagnostics.py --redis    — только Redis
-  python source_diagnostics.py --matches  — только матчи
-  python source_diagnostics.py --indexes  — только индексы
-  python source_diagnostics.py --errors   — только ошибки + аномалии
+[9.6.8 FIX] main(): добавлен argparse. Прежняя версия не разбирала аргументы вовсе —
+            режимы из workflow (--sources/--redis/--matches/--indexes/--errors/--sample)
+            молча игнорировались, скрипт всегда гонял все 7 секций.
+[9.6.8 FIX] _check_stale: нечитаемая дата трактуется как STALE (безопасная сторона для
+            мониторинга) с предупреждением в лог. Прежний except -> False считал
+            битую дату живым коллектором.
+[9.6.8 FIX] diagnose_matches: детекция котировок по контракту v710 — плоский odds_1x2
+            и model_inputs.odds_dict, а не только вложенный odds; value-сигналы по
+            границам определений (HOT*/VALUE_BET) через classification/verdict —
+            синхронно с metrics.py и telegram_transport (9.6.8).
+[9.6.8 FIX] diagnose_errors: прежде — заглушка с пустым списком (секция «Ошибки»
+            никогда ничего не находила). Теперь реально детектирует нечитаемые JSON-
+            записи в all_fields и паспорта без match_id.
+[9.6.8 FIX] run_initialization в main(): молчаливый except: pass заменен на логирование.
 """
 import os
 import sys
 import json
 import logging
+import argparse
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 
-__version__ = "9.4-source"
+__version__ = "9.6.8-patched"  # Контрактная строка версии — сверьте пин в test_contracts.py
 
 __all__ = [
-    "diagnose_sources",
-    "diagnose_redis",
-    "diagnose_matches",
-    "diagnose_indexes",
-    "diagnose_errors",
-    "diagnose_sample",
-    "print_summary",
-    "main",
-    "__version__",
+    "diagnose_sources", "diagnose_redis", "diagnose_matches", "diagnose_indexes",
+    "diagnose_errors", "diagnose_sample", "print_summary", "main", "__version__",
 ]
 
 logger = logging.getLogger(__name__)
@@ -77,8 +59,6 @@ def _now_msk() -> str:
 def _read_meta(key: str) -> Optional[dict]:
     """Читает meta-ключ через get_from_cache() из gatekeeper_hub (§18.4).
     FIX-9.4: get_key() из redis_hub не читает ключи, записанные через save_to_cache().
-    Хаб пишет meta через rh.save_to_cache(), а get_module_status() читает через
-    rh.get_from_cache() — используем тот же метод.
     Fallback: если get_from_cache недоступен, пробуем get_key из redis_hub.
     """
     try:
@@ -101,7 +81,11 @@ def _read_meta(key: str) -> Optional[dict]:
 
 
 def _check_stale(last_run: str, now: Optional[datetime] = None) -> bool:
-    """Проверяет, является ли коллектор stale (>2ч от last_run)."""
+    """Проверяет, является ли коллектор stale (>2ч от last_run).
+    [9.6.8 FIX] Нечитаемая дата теперь STALE (True) с предупреждением: для мониторинга
+    безопаснее считать битую метку времени проблемой, чем живым коллектором.
+    Прежний except -> False маскировал сбой под здоровье.
+    """
     if not last_run or last_run == "неизвестно":
         return True
     if now is None:
@@ -113,8 +97,40 @@ def _check_stale(last_run: str, now: Optional[datetime] = None) -> bool:
             dt = dt.replace(tzinfo=timezone.utc)
         age = (now - dt.astimezone(MSK_TIMEZONE)).total_seconds() / 3600
         return age > STALE_THRESHOLD_HOURS
-    except Exception:
-        return False
+    except Exception as e:
+        logger.warning("_check_stale(%s): нечитаемая дата трактуется как STALE: %s", last_run, e)
+        return True
+
+
+def _resolve_classification(match_data) -> str:
+    """[9.6.8] Синхронизировано с telegram_transport._resolve_classification:
+    приоритет core_analysis.classification, fallback verdict."""
+    res = match_data.get("core_analysis") or match_data
+    if not isinstance(res, dict):
+        return ""
+    return str(res.get("classification") or res.get("verdict") or "")
+
+
+def _is_value_signal(classification: str) -> bool:
+    """[9.6.8] Границы определений вместо подстрочного матча ('BET' in 'NO BET').
+    Синхронно с metrics.py 9.6.8 и telegram_transport 9.6.8."""
+    cls = classification.upper()
+    return cls.startswith("HOT") or "VALUE_BET" in cls
+
+
+def _has_odds_1x2(match: dict) -> bool:
+    """[9.6.8 FIX] Детекция котировок по контракту v710: вложенный odds, плоский
+    odds_1x2 и model_inputs.odds_dict. Прежняя версия видела только вложенный odds."""
+    odds = match.get("odds", {})
+    if isinstance(odds, dict) and odds:
+        return True
+    flat = match.get("odds_1x2")
+    if isinstance(flat, dict) and flat:
+        return True
+    inputs = match.get("model_inputs")
+    if isinstance(inputs, dict) and inputs.get("odds_dict"):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -143,16 +159,9 @@ def diagnose_sources(all_fields: dict = None) -> dict:
         stale = _check_stale(last_run, now)
         stale_mark = " ⚠️ STALE" if stale else ""
         sources["sharpapi"] = {
-            "key": sharpapi_key,
-            "last_run": last_run,
-            "total_events": total_events,
-            "stored": stored,
-            "created": created,
-            "updated": updated,
-            "deduped": deduped,
-            "errors": error_count,
-            "pages": pages,
-            "stale": stale,
+            "key": sharpapi_key, "last_run": last_run, "total_events": total_events,
+            "stored": stored, "created": created, "updated": updated, "deduped": deduped,
+            "errors": error_count, "pages": pages, "stale": stale,
         }
         print(f"   📊 SharpAPI: ключ {sharpapi_key}, событий {total_events}, "
               f"записано {stored} (создано {created}, обновлено {updated}, "
@@ -186,14 +195,8 @@ def diagnose_sources(all_fields: dict = None) -> dict:
         stale = _check_stale(last_run, now)
         stale_mark = " ⚠️ STALE" if stale else ""
         sources["bzzoiro"] = {
-            "key": bzzoiro_key,
-            "events": events,
-            "stored": stored,
-            "created": created,
-            "updated": updated,
-            "last_run": last_run,
-            "errors": error_count,
-            "stale": stale,
+            "key": bzzoiro_key, "events": events, "stored": stored, "created": created,
+            "updated": updated, "last_run": last_run, "errors": error_count, "stale": stale,
         }
         print(f"   🐝 Bzzoiro:  ключ {bzzoiro_key}, событий {events}, "
               f"записано {stored} (создано {created}, обновлено {updated}), "
@@ -223,17 +226,10 @@ def diagnose_sources(all_fields: dict = None) -> dict:
         stale = _check_stale(last_run, now)
         stale_mark = " ⚠️ STALE" if stale else ""
         sources["odds_api"] = {
-            "key": oddsapi_key,
-            "events": events,
-            "stored": stored,
-            "created": created,
-            "updated": updated,
-            "deduped": deduped,
-            "errors": error_count,
-            "quota_remaining": quota_remaining,
-            "quota_used": quota_used,
-            "last_run": last_run,
-            "stale": stale,
+            "key": oddsapi_key, "events": events, "stored": stored, "created": created,
+            "updated": updated, "deduped": deduped, "errors": error_count,
+            "quota_remaining": quota_remaining, "quota_used": quota_used,
+            "last_run": last_run, "stale": stale,
         }
         print(f"   🎲 OddsAPI: ключ {oddsapi_key}, событий {events}, "
               f"записано {stored} (создано {created}, обновлено {updated}, "
@@ -258,15 +254,9 @@ def diagnose_sources(all_fields: dict = None) -> dict:
         stale = _check_stale(last_run, now)
         stale_mark = " ⚠️ STALE" if stale else ""
         sources["propline"] = {
-            "key": propline_key,
-            "events": events,
-            "stored": stored,
-            "created": created,
-            "updated": updated,
-            "deduped": deduped,
-            "errors": error_count,
-            "last_run": last_run,
-            "stale": stale,
+            "key": propline_key, "events": events, "stored": stored, "created": created,
+            "updated": updated, "deduped": deduped, "errors": error_count,
+            "last_run": last_run, "stale": stale,
         }
         print(f"   🎯 Propline: ключ {propline_key}, "
               f"событий {events}, записано {stored} "
@@ -285,10 +275,8 @@ def diagnose_sources(all_fields: dict = None) -> dict:
         stale = _check_stale(last_run, now)
         stale_mark = " ⚠️ STALE" if stale else ""
         sources["football_data"] = {
-            "key": football_key,
-            "last_run": last_run,
-            "stored": football_meta.get("stored_matches", 0),
-            "stale": stale,
+            "key": football_key, "last_run": last_run,
+            "stored": football_meta.get("stored_matches", 0), "stale": stale,
         }
         print(f"   ⚽ Football-Data: ключ {football_key}, "
               f"записано {football_meta.get('stored_matches', 0)}, "
@@ -332,7 +320,7 @@ def diagnose_redis() -> dict:
     index_keys = [k for k in all_fields if k.startswith("match:index:")]
     search_keys = [k for k in all_fields if k.startswith("search:results:")]
     system_keys = [k for k in all_fields if k.startswith("system:") or k.endswith(":meta")]
-    
+
     # SD-8: §8.7 — интеграция истории через хаб
     history_matches = get_all_history_matches() or {}
     history_keys = list(history_matches.keys()) if isinstance(history_matches, dict) else []
@@ -345,7 +333,6 @@ def diagnose_redis() -> dict:
 
     est_memory_kb = round(len(match_keys) * 2 + len(search_keys) * 3 + len(history_keys) * 2 + 5, 1)
 
-    # system:health
     try:
         health = _read_meta("system:health")
     except Exception as e:
@@ -416,9 +403,10 @@ def diagnose_matches(all_fields: dict = None) -> dict:
                 matches = matches_list
             elif isinstance(matches_list, list):
                 for m in matches_list:
-                    cid = m.get("canonical_id", "")
-                    if cid:
-                        matches[cid] = m
+                    if isinstance(m, dict):
+                        cid = m.get("canonical_id", "")
+                        if cid:
+                            matches[cid] = m
     except Exception as e:
         logger.error("diagnose_matches: %s", e, exc_info=True)
         print(f"   ❌ Ошибка чтения матчей: {e}")
@@ -448,73 +436,88 @@ def diagnose_matches(all_fields: dict = None) -> dict:
         if not isinstance(match, dict):
             continue
 
-        # Odds
-        odds = match.get("odds", {})
-        if isinstance(odds, dict) and odds:
-            with_odds += 1
-        else:
-            no_odds_list.append(cid)
+        try:
+            inputs = match.get("model_inputs")
+            if not isinstance(inputs, dict):
+                inputs = {}
 
-        # Stats
-        stats = match.get("stats", {})
-        if isinstance(stats, dict) and stats and len(stats) > 0:
-            with_stats += 1
+            # [9.6.8 FIX] Odds — по контракту v710 (вложенный odds, плоский odds_1x2,
+            # model_inputs.odds_dict), а не только вложенный odds
+            if _has_odds_1x2(match):
+                with_odds += 1
+            else:
+                no_odds_list.append(cid)
 
-        # Predictions
-        has_pred = False
-        has_h2h = False
-        predictions = match.get("predictions", {})
-        if isinstance(predictions, dict) and predictions:
-            with_predictions += 1
-            has_pred = True
+            # Stats
+            stats = match.get("stats", {})
+            if isinstance(stats, dict) and stats and len(stats) > 0:
+                with_stats += 1
 
-        h2h = match.get("h2h", {})
-        if isinstance(h2h, dict) and h2h:
-            with_h2h += 1
-            has_h2h = True
+            # Predictions (SD-10: relaxed — непустой dict, без требования "source")
+            has_pred = False
+            has_h2h = False
+            predictions = match.get("predictions", {})
+            if isinstance(predictions, dict) and predictions:
+                with_predictions += 1
+                has_pred = True
 
-        if not has_pred or not has_h2h:
-            extra = match.get("extra", {})
-            if isinstance(extra, dict):
-                if not has_pred and "bzzoiro_prediction" in extra:
-                    with_predictions += 1
-                if not has_h2h and "bzzoiro_h2h" in extra:
-                    with_h2h += 1
+            h2h = match.get("h2h", {})
+            if isinstance(h2h, dict) and h2h:
+                with_h2h += 1
+                has_h2h = True
 
-        # Value bet
-        value = match.get("value_analysis", {})
-        if isinstance(value, dict) and value and value.get("best_side"):
-            with_value += 1
+            if not has_pred or not has_h2h:
+                extra = match.get("extra", {})
+                if isinstance(extra, dict):
+                    if not has_pred and "bzzoiro_prediction" in extra:
+                        with_predictions += 1
+                    if not has_h2h and "bzzoiro_h2h" in extra:
+                        with_h2h += 1
 
-        # Sources
-        sources_list = match.get("sources", [])
-        if isinstance(sources_list, list):
+            # Value: [9.6.8 FIX] classification/verdict по границам определений
+            # (HOT*/VALUE_BET) — синхронно с metrics 9.6.8; легаси
+            # value_analysis.best_side сохранен как fallback
+            value = match.get("value_analysis", {})
+            classification = _resolve_classification(match)
+            if _is_value_signal(classification) or (isinstance(value, dict) and value.get("best_side")):
+                with_value += 1
+
+            # Sources
+            sources_list = match.get("sources")
+            if not isinstance(sources_list, list):
+                sources_list = []
             for s in sources_list:
-                source_counts[s] = source_counts.get(s, 0) + 1
+                if isinstance(s, str):
+                    source_counts[s] = source_counts.get(s, 0) + 1
 
-        # Status
-        status = match.get("status", "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
+            # Status
+            status = match.get("status", "scheduled")
+            if not isinstance(status, str):
+                status = "scheduled"
+            status_counts[status] = status_counts.get(status, 0) + 1
 
-        # SD-5: Anomaly checks
-        date_utc = match.get("date_utc") or match.get("timestamp")
-        if not date_utc:
-            no_date_list.append(cid)
+            # Anomalies (SD-5): без даты, без competition
+            date = match.get("date_utc", match.get("date", match.get("timestamp")))
+            if not date:
+                no_date_list.append(cid)
+            competition = match.get("competition", match.get("league"))
+            if not competition:
+                no_competition_list.append(cid)
+        except Exception as e:
+            # [9.6.8 FIX] Сбой одного матча изолирован и не глотает секцию
+            logger.warning("diagnose_matches(%s): %s", cid, e)
+            anomalies.append(f"{cid}: ошибка разбора ({e})")
 
-        competition = match.get("competition") or match.get("league")
-        if not competition:
-            no_competition_list.append(cid)
-
-    if no_odds_list:
-        anomalies.append(f"Матчи без котировок: {len(no_odds_list)}")
-    if no_date_list:
-        anomalies.append(f"Матчи без даты: {len(no_date_list)}")
-    if no_competition_list:
-        anomalies.append(f"Матчи без лиги/турнира: {len(no_competition_list)}")
+    print(f"   Статусы: {status_counts}")
+    print(f"   Источники: {source_counts}")
 
     print(f"   Всего матчей: {total}")
     print(f"   С котировками: {with_odds}, со статистикой: {with_stats}")
     print(f"   С прогнозами: {with_predictions}, с H2H: {with_h2h}, с валуйными сигналами: {with_value}")
+
+    anomalies.extend([f"без котировок: {k}" for k in no_odds_list[:5]])
+    anomalies.extend([f"без даты: {k}" for k in no_date_list[:5]])
+    anomalies.extend([f"без competition: {k}" for k in no_competition_list[:5]])
     if anomalies:
         print(f"   ⚠️ Обнаружены аномалии: {anomalies}")
 
@@ -526,6 +529,8 @@ def diagnose_matches(all_fields: dict = None) -> dict:
         "with_h2h": with_h2h,
         "with_value": with_value,
         "anomalies": anomalies,
+        "source_counts": source_counts,
+        "status_counts": status_counts,
     }
 
 
@@ -537,41 +542,35 @@ def diagnose_indexes(all_fields: dict = None) -> dict:
     print("🔎 ДИАГНОСТИКА ИНДЕКСОВ И ШАРДОВ")
     print("=" * 60)
 
-    try:
-        if all_fields is None:
-            all_fields = get_all_fields() or {}
-    except Exception:
-        all_fields = {}
-
+    all_fields = all_fields or {}
     index_keys = [k for k in all_fields if k.startswith("match:index:")]
-    match_keys = {k for k in all_fields if k.startswith("match:") and not k.startswith("match:index:")}
 
-    orphan_count = 0
+    # [9.6.8] Orphan IDs: ID, присутствующие в индексных шардах, но не имеющие
+    # соответствующего паспорта матча в all_fields
+    match_ids = {k[len("match:"):] for k in all_fields if k.startswith("match:")}
+    indexed_ids = set()
     shards_info = {}
-
-    for ik in index_keys:
-        val = all_fields.get(ik)
-        cids = []
-        if isinstance(val, str):
-            try:
-                cids = json.loads(val)
-            except Exception:
-                cids = []
+    for k in index_keys:
+        val = all_fields.get(k)
+        ids = []
+        if isinstance(val, dict):
+            for v in val.values():
+                if isinstance(v, list):
+                    ids.extend(v)
+                elif v is not None:
+                    ids.append(v)
         elif isinstance(val, list):
-            cids = val
+            ids = val
+        indexed_ids.update(str(i) for i in ids)
+        shards_info[k] = len(ids)
 
-        valid_cids = 0
-        for cid in cids:
-            match_key = f"match:{cid}" if not cid.startswith("match:") else cid
-            if match_key in match_keys or cid in match_keys:
-                valid_cids += 1
-            else:
-                orphan_count += 1
-
-        shards_info[ik] = {"total": len(cids), "valid": valid_cids}
+    orphan_ids = sorted(i for i in indexed_ids if i not in match_ids)
+    orphan_count = len(orphan_ids)
 
     print(f"   Шардов индексов: {len(index_keys)}")
     print(f"   Сиротских ID в индексах: {orphan_count}")
+    if orphan_ids[:5]:
+        print(f"     • {orphan_ids[:5]}")
     return {"index_shards": len(index_keys), "orphan_ids": orphan_count, "shards": shards_info}
 
 
@@ -583,8 +582,23 @@ def diagnose_errors(all_fields: dict = None) -> dict:
     print("⚠️ ОШИБКИ И АНОМАЛИИ")
     print("=" * 60)
     errors = []
+    # [9.6.8 FIX] Прежняя версия была заглушкой (всегда пустой список). Теперь секция
+    # реально детектирует: нечитаемые JSON-записи в хэше и паспорта без match_id.
+    for k, v in (all_fields or {}).items():
+        if isinstance(v, str):
+            try:
+                json.loads(v)
+            except Exception as e:
+                errors.append(f"{k}: нечитаемый JSON ({e})")
+        elif isinstance(v, dict):
+            meta = v.get("match_metadata")
+            if isinstance(meta, dict) and not meta.get("match_id"):
+                errors.append(f"{k}: match_metadata без match_id")
+
     print(f"   Найдено критических ошибок: {len(errors)}")
-    return {"errors": errors}
+    for e in errors[:10]:
+        print(f"     • {e}")
+    return {"errors": errors, "error_count": len(errors)}
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +630,9 @@ def diagnose_sample(all_fields: dict = None) -> dict:
         home = match.get("home_team", match.get("home", "Home"))
         away = match.get("away_team", match.get("away", "Away"))
         date = match.get("date_utc", match.get("timestamp", "?"))
-        print(f"   {i}. [{cid}] {home} vs {away} ({date})")
+        # [9.6.8] Вердикт по контракту v710 для быстрой ручной проверки
+        cls = _resolve_classification(match) or "-"
+        print(f"   {i}. [{cid}] {home} vs {away} ({date}) | {cls}")
 
     print("=" * 60)
     return {"sample_count": len(sample_items)}
@@ -635,31 +651,65 @@ def print_summary(src_data, redis_data, matches_data) -> None:
         print("   ✅ Данные и индексы доступны.")
     else:
         print("   ⚠️ Redis недоступен или пуст.")
+    if matches_data.get("anomalies"):
+        print(f"   ⚠️ Аномалий в матчах: {len(matches_data['anomalies'])}")
     print("=" * 60)
 
 
 def main():
+    # [9.6.8 FIX] Прежняя версия не разбирала аргументы: режимы из workflow
+    # (--sources/--redis/--matches/--indexes/--errors/--sample) молча игнорировались.
+    parser = argparse.ArgumentParser(description="Gatekeeper-AI: единая диагностика источников, Redis и матчей")
+    parser.add_argument("--sources", action="store_const", const="sources", dest="mode",
+                        help="Только диагностика источников")
+    parser.add_argument("--redis", action="store_const", const="redis", dest="mode",
+                        help="Только диагностика Redis")
+    parser.add_argument("--matches", action="store_const", const="matches", dest="mode",
+                        help="Только диагностика матчей")
+    parser.add_argument("--indexes", action="store_const", const="indexes", dest="mode",
+                        help="Только диагностика индексов")
+    parser.add_argument("--errors", action="store_const", const="errors", dest="mode",
+                        help="Только ошибки и аномалии")
+    parser.add_argument("--sample", action="store_const", const="sample", dest="mode",
+                        help="Только sample матчей")
+    args = parser.parse_args()
+
     print("=" * 60)
     print(f"🔧 ДИАГНОСТИКА GATEKEEPER-AI v{__version__}")
     print("=" * 60)
     try:
         run_initialization(collector="source_diagnostics")
-    except Exception:
-        pass
+    except Exception as e:
+        # [9.6.8 FIX] Молчаливый except: pass заменен на логирование
+        logger.warning("run_initialization завершился сбоем: %s", e)
 
     all_fields = {}
     try:
         all_fields = get_all_fields() or {}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("get_all_fields завершился сбоем: %s", e)
 
-    src_data = diagnose_sources(all_fields)
-    redis_data = diagnose_redis()
-    matches_data = diagnose_matches(all_fields)
-    diagnose_indexes(all_fields)
-    diagnose_errors(all_fields)
-    diagnose_sample(all_fields)
-    print_summary(src_data, redis_data, matches_data)
+    if args.mode == "sources":
+        diagnose_sources(all_fields)
+    elif args.mode == "redis":
+        diagnose_redis()
+    elif args.mode == "matches":
+        diagnose_matches(all_fields)
+    elif args.mode == "indexes":
+        diagnose_indexes(all_fields)
+    elif args.mode == "errors":
+        diagnose_errors(all_fields)
+    elif args.mode == "sample":
+        diagnose_sample(all_fields)
+    else:
+        # Полная диагностика: 7 секций (§18.3)
+        src_data = diagnose_sources(all_fields)
+        redis_data = diagnose_redis()
+        matches_data = diagnose_matches(all_fields)
+        diagnose_indexes(all_fields)
+        diagnose_errors(all_fields)
+        diagnose_sample(all_fields)
+        print_summary(src_data, redis_data, matches_data)
 
 
 if __name__ == "__main__":
