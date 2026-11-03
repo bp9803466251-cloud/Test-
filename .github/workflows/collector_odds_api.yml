@@ -4,20 +4,20 @@ on:
   workflow_dispatch:
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12" # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
 
 permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
+  group: collector-odds-api # [FIXED] Была gatekeeper-redis: см. разбор ниже
   cancel-in-progress: false
 
 jobs:
   collect:
     name: The Odds API V4
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30 # [FIXED] 15 -> 30: квота 1.0 с/запрос и ретраи легально превышают 15 минут
     steps:
       - uses: actions/checkout@v4
 
@@ -34,16 +34,24 @@ jobs:
 
       - name: Run collector_odds_api
         env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
+          # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+          SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
+          # Ключ поставщика и настройки квот/дилей
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY || '' }}
           ODDS_API_REGIONS: ${{ vars.ODDS_API_REGIONS || 'eu,uk' }}
           ODDS_API_MARKETS: ${{ vars.ODDS_API_MARKETS || 'h2h' }}
           ODDS_API_ODDS_FORMAT: ${{ vars.ODDS_API_ODDS_FORMAT || 'decimal' }}
           ODDS_API_RATE_DELAY: ${{ vars.ODDS_API_RATE_DELAY || '1.0' }}
           ODDS_API_MAX_RETRIES: ${{ vars.ODDS_API_MAX_RETRIES || '1' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python collector_odds_api.py
+          # [ADDED] Паритет с docker_compose.yml и sports_pipeline.yml
+          GATEKEEPER_ENV: production
+        # [FIXED] -u: небуферизированный вывод в логи Actions
+        run: python -u collector_odds_api.py
         
