@@ -1,35 +1,35 @@
 name: Team Registry Tests
 
+# §1.2: workflow_dispatch only, no push/pull_request triggers
 on:
-  push:
-    paths:
-      - 'team_registry.py'
-      - 'test_gluing.py'
-  pull_request:
-    paths:
-      - 'team_registry.py'
-      - 'test_gluing.py'
+  workflow_dispatch:
 
 permissions:
   contents: read # Least privilege по правилу экосистемы §1.10
 
+# §16.4: каноническая группа диагностического слоя
+concurrency:
+  group: gatekeeper-diagnostics
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false # Гарантирует изоляцию прогона матрицы до конца при локальных сбоях версий
-      matrix:
-        python-version: ['3.10', '3.11', '3.12']
+    timeout-minutes: 5
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python Environment
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: 'pip' # Автоматическое кэширование зависимостей для ускорения тасков
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
       - name: Install Architecture & Mathematical Dependencies
         run: |
