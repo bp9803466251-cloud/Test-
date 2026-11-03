@@ -47,7 +47,7 @@ BZZOIRO_API_KEY = os.environ.get("BZZOIRO_API_KEY", "")
 RATE_DELAY = float(os.environ.get("BZZOIRO_RATE_DELAY", "0.5"))
 ENRICH_DELAY = float(os.environ.get("BZZOIRO_ENRICH_DELAY", "0.2"))
 MAX_RETRIES = int(os.environ.get("BZZOIRO_MAX_RETRIES", "1"))
-DAYS_AHEAD = 2
+DAYS_AHEAD = 1
 PAGE_LIMIT = 200
 
 FINISHED_STATUSES = {"finished", "completed", "ended", "cancelled", "awarded", "forfeited"}
