@@ -147,60 +147,13 @@ def _extract_score(ev: dict) -> Any:
 
 
 def _extract_best_odds(odds_data: Any) -> dict:
-    """Парсер коэффициентов в строгом соответствии с _merge_odds и _validate_section хаба."""
-    flat_1x2 = {}
-    items = []
-    if isinstance(odds_data, dict):
-        items = odds_data.get("results", odds_data.get("data", [odds_data]))
-    elif isinstance(odds_data, list):
-        items = odds_data
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        market = item.get("market", "1x2")
-        outcome = item.get("outcome", "")
-        price = item.get("decimal_odds", item.get("price", item.get("odd")))
-
-        if price is None:
-            for k, v in item.items():
-                if isinstance(v, (int, float, str)) and v not in ("-", ""):
-                    try:
-                        price = float(v)
-                        outcome = k
-                        break
-                    except ValueError:
-                        pass
-
-        if price is None:
-            continue
-
-        try:
-            val = float(price)
-        except (ValueError, TypeError):
-            continue
-
-        oc_upper = str(outcome).upper()
-        if market in ("1x2", "match_result", "full_time"):
-            if oc_upper in ("HOME", "1", "HOME_WIN"):
-                flat_1x2["home"] = val
-            elif oc_upper in ("DRAW", "X", "DRAW_X"):
-                flat_1x2["draw"] = val
-            elif oc_upper in ("AWAY", "2", "AWAY_WIN"):
-                flat_1x2["away"] = val
-
-    if not flat_1x2 and isinstance(odds_data, dict):
-        odds = odds_data.get("odds", odds_data)
-        if isinstance(odds, dict):
-            for k, v in odds.items():
-                if k in ("1", "home", "home_win") and v:
-                    flat_1x2["home"] = float(v)
-                elif k in ("X", "draw") and v:
-                    flat_1x2["draw"] = float(v)
-                elif k in ("2", "away", "away_win") and v:
-                    flat_1x2["away"] = float(v)
-
-    return {k: str(v) for k, v in flat_1x2.items() if v is not None}
+    """Возвращает сырой словарь котировок из ответа API (как в успешном эталонном коллекторе)."""
+    if not isinstance(odds_data, dict):
+        return {}
+    odds = odds_data.get("odds", odds_data)
+    if isinstance(odds, dict) and odds:
+        return odds
+    return {}
 
 
 def _flatten_stats(stats_data: dict, parent_key: str = "", sep: str = "_") -> dict:
@@ -407,7 +360,7 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 
             if odds_data is _NOT_FOUND:
                 not_found += 1
-            elif odds_data and odds_data is not _NOT_FOUND:
+            elif odds_data and isinstance(odds_data, dict):
                 best_odds = _extract_best_odds(odds_data)
                 if best_odds:
                     if patch_match(cid, "odds", best_odds, source="bzzoiro"):
