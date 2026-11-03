@@ -1,7 +1,7 @@
 name: Backtest
 
 # Tight-coupled-v9.3: Симуляция на history:match:* с temporal cutoff
-# §13: workflow_dispatch only, no cron (§1.2)
+# §1.2: workflow_dispatch only, no cron
 on:
   workflow_dispatch:
     inputs:
@@ -30,9 +30,9 @@ on:
 permissions:
   contents: read
 
-# §13: единая группа для предотвращения race condition
+# §16.4: каноническая группа pipeline-слоя
 concurrency:
-  group: gatekeeper-redis
+  group: gatekeeper-pipeline
   cancel-in-progress: false
 
 env:
@@ -50,7 +50,6 @@ jobs:
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-      GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # ФИКС: Прямая передача строки без вызова ${{ env }}
       GATEKEEPER_ENV: backtest
 
     steps:
@@ -99,23 +98,22 @@ jobs:
       - name: Telegram alert on failure
         if: failure()
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || '' }}
         run: |
-          MSG="🔴 <b>Backtest FAILED</b>\nRepo: ${{ github.repository }}\nRun: ${{ github.run_id }}"
-          curl -s -X POST "https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage" \
+          MSG="🔴 Backtest FAILED%0ARepo: ${{ github.repository }}%0ARun: ${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
-            -d parse_mode="HTML" \
-            -d text="$MSG" || true
+            -d text="${MSG}"
 
       - name: Telegram summary on success
         if: success()
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || '' }}
         run: |
           python -c "
-          import json, urllib.request, urllib.parse, os
+          import json, urllib.request, urllib.parse, os, sys
 
           try:
               with open('backtest_report.json') as f:
@@ -128,13 +126,13 @@ jobs:
           warm = report.get('warm_count', 0)
           brier = report.get('avg_brier', 0)
           rps = report.get('avg_rps', 0)
-          
+
           drift_obj = report.get('drift', {})
           drift = drift_obj.get('drift_flags', 0)
           calibrated = report.get('calibration_status', 'unknown')
 
           msg = (
-              '📊 <b>Backtest Complete</b>\n'
+              '📊 Backtest Complete\n'
               f'Matches: {total}\n'
               f'HOT: {hot} | WARM: {warm}\n'
               f'Brier: {brier:.4f} | RPS: {rps:.4f}\n'
@@ -144,19 +142,21 @@ jobs:
 
           token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
           chat_id = os.environ.get('TELEGRAM_GROUP_ID', '')
-          if token and chat_id:
-              data = urllib.parse.urlencode({
-                  'chat_id': chat_id,
-                  'parse_mode': 'HTML',
-                  'text': msg
-              }).encode()
-              req = urllib.request.Request(
-                  f'https://telegram.org{token}/sendMessage',
-                  data=data
-              )
-              try:
-                  urllib.request.urlopen(req, timeout=10)
-              except Exception:
-                  pass
+          if not token or not chat_id:
+              print('ERROR: Telegram credentials not configured')
+              sys.exit(1)
+          data = urllib.parse.urlencode({
+              'chat_id': chat_id,
+              'text': msg
+          }).encode()
+          req = urllib.request.Request(
+              f'https://api.telegram.org/bot{token}/sendMessage',
+              data=data
+          )
+          try:
+              urllib.request.urlopen(req, timeout=10)
+          except Exception as e:
+              print(f'ERROR: Telegram send failed: {e}')
+              sys.exit(1)
           "
           
