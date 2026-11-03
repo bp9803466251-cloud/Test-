@@ -108,7 +108,7 @@ def auto_merge_duplicates(matches_dict: Dict[str, Any]) -> Dict[str, Any]:
                 a_match = (a1c == a2c) or (len(a1c) > 3 and a1c in a2c) or (len(a2c) > 3 and a2c in a1c)
                 
                 h_rev_match = (h1c == a2c) or (len(h1c) > 3 and h1c in a2c) or (len(a2c) > 3 and a2c in h1c)
-                a_rev_match = (a1c == h2c) or (len(a1c) > 3 and a1c in h2c) or (len(a2c) > 3 and a2c in a1c)
+                a_rev_match = (a1c == h2c) or (len(a1c) > 3 and a1c in h2c) or (len(h2c) > 3 and h2c in h1c)
 
                 direct_match = h_match and a_match
                 reverse_match = h_rev_match and a_rev_match
@@ -406,4 +406,4 @@ def run_initialization(collector: Optional[str] = None) -> Dict[str, Any]:
 
     metrics["init_latency_ms"] = int((time.time() - start) * 1000)
     return metrics
-                
+        
