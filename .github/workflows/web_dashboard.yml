@@ -8,7 +8,7 @@ on:
         required: false
         default: '8080'
       duration:
-        description: "Длительность работы (минуты, 0 = бессрочно)"
+        description: "Длительность работы (минуты, 0 = бессрочно в пределах таймаута job)"
         required: false
         default: '30'
 
@@ -16,11 +16,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: gatekeeper-redis
+  group: web-dashboard # [FIXED] Была gatekeeper-redis: копипаста, дашборд вставал в очередь за коллекторами
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12' # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
   PYTHONUNBUFFERED: '1'
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
 
@@ -42,61 +42,86 @@ jobs:
       - name: Install Mathematics & Core Dependencies
         run: |
           python -m pip install --upgrade pip
+          # [REMOVED] Непривязанный "pip install numpy scipy": мог поднять numpy 2.x
+          # поверх пина numpy<2.0.0 из requirements. Версии уже зафиксированы там.
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install numpy scipy
 
+      # [FIXED] Сломанный шаг: wget -q https://equinox.io качал HTML-страницу корня
+      # сайта, а tar ждал архива ngrok-v3-stable-linux-amd64.tgz, которого не было.
+      # Теперь: официальный релизный URL ngrok v3 + ранний выход, если токен не задан.
       - name: Install ngrok Tunnel Agent
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }} # секрет только через env
         run: |
-          # [FIX] Корректный прямой URL для скачивания бинарного релиза архива ngrok v3
-          wget -q https://equinox.io
-          tar -xzf ngrok-v3-stable-linux-amd64.tgz
+          if [ -z "$NGROK_AUTH_TOKEN" ]; then
+            echo "::notice::NGROK_AUTH_TOKEN не задан в Secrets - туннель подниматься не будет"
+            exit 0
+          fi
+          # [FIXED] Прямой официальный URL бинарного релиза ngrok v3 (CDN equinox.io)
+          wget -q -O ngrok.tgz "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz"
+          tar -xzf ngrok.tgz
           chmod +x ngrok
+          ./ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
 
       - name: Start Web Dashboard & Expose Public URL
         env:
+          # Сетевой транспорт кэш-слоя Redis - полная лестница приоритетов §1.10
+          # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+          SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+          SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
           GATEKEEPER_CONFIG_FILE: ${{ env.GATEKEEPER_CONFIG_FILE }}
+          # [ADDED] Паритет с docker_compose.yml и серией коллекторов
+          GATEKEEPER_ENV: production
+          # [FIXED] Инъекция закрыта: ручной ввод и секреты интерполируются только
+          # в env-блоке, скрипт читает из переменных окружения
+          PORT: ${{ github.event.inputs.port || '8080' }}
+          DURATION: ${{ github.event.inputs.duration || '30' }}
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
-          # [FIX] Передача порта напрямую в окружение для изоляции сокетов web_dashboard.py
-          export PORT="${{ github.event.inputs.port || '8080' }}"
-          DURATION=${{ github.event.inputs.duration || '30' }}
+          # [FIXED] Валидация ручного ввода: только цифры, иначе дефолты
+          case "$PORT" in ''|*[!0-9]*) PORT=8080;; esac
+          case "$DURATION" in ''|*[!0-9]*) DURATION=30;; esac
 
-          # Запуск веб-панели в фоновом рантайме (без неконтрактных флагов --port)
-          python web_dashboard.py &
+          # Запуск веб-панели в фоновом рантайме
+          python -u web_dashboard.py &
           DASHBOARD_PID=$!
           echo "Dashboard PID: $DASHBOARD_PID"
 
           sleep 5
 
-          # Запуск ngrok-туннеля
-          if [ -n "${{ secrets.NGROK_AUTH_TOKEN }}" ]; then
-            ./ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-            ./ngrok http $PORT --log=stdout > ngrok.log 2>&1 &
+          if [ -n "$NGROK_AUTH_TOKEN" ]; then
+            # Запуск ngrok-туннеля
+            ./ngrok http "$PORT" --log=stdout > ngrok.log 2>&1 &
             NGROK_PID=$!
             echo "Ngrok PID: $NGROK_PID"
             sleep 5
 
-            # Парсинг публичного адреса
+            # Парсинг публичного адреса из локального API ngrok
             PUBLIC_URL=$(curl -s http://localhost:4040/api/tunnels | python -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null || echo "unknown")
             echo "::notice::Web Dashboard available at: $PUBLIC_URL"
 
-            # [FIX] Безопасная нормализованная транспортировка ссылки доступа на домен api.telegram.org/bot
-            if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
-              TG_CHAT="${{ secrets.TELEGRAM_GROUP_ID }}"
-              MSG="🖥 <b>GatekeeperAI Monitor</b>%0AURL: $PUBLIC_URL%0APort: $PORT%0ADuration: ${DURATION}m%0A%0A🌐 Redis ONLINE | ⭐CORE ENGINE v9.6.5"
-              curl -s -X POST "https://telegram.org{{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            # [FIXED] Исправлены битые URL уведомления (telegram.org{{...}} не является
+            # адресом): канонический api.telegram.org/bot + sendMessage.
+            # Убрана устаревшая строка "CORE ENGINE v9.6.5".
+            if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+              MSG="🖥 <b>GatekeeperAI Monitor</b>%0AURL: $PUBLIC_URL%0APort: $PORT%0ADuration: ${DURATION}m"
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d "chat_id=${TG_CHAT}" \
                 -d "text=${MSG}" \
-                -d "parse_mode=HTML" || true
+                -d "parse_mode=HTML"
             fi
           else
             echo "::notice::NGROK_AUTH_TOKEN не задан в Secrets. Сервер запущен локально на порту $PORT"
           fi
 
-          # Удержание контейнера
+          # Удержание контейнера. ВАЖНО: DURATION=0 ("бессрочно") всё равно ограничен
+          # timeout-minutes: 180 данного job - упомянуто в описании входа duration.
           if [ "$DURATION" = "0" ]; then
             wait $DASHBOARD_PID
           else
@@ -110,10 +135,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
         run: |
-          # [FIX] Синхронизация переменных окружения в bash-команде алерта сбоя
-          MSG="🔴 <b>Web Dashboard FAILED</b>%0ARepo: ${{ github.repository }}%0ARun: ${{ github.run_id }}%0A%0A👉 https://github.com{{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage" \
+          # [FIXED] Битый URL (потеряны api, префикс bot и скобка) ->
+          # канонический api.telegram.org/bot + sendMessage.
+          # [FIXED] Битая ссылка на ран: потерян слэш после github.com.
+          # [FIXED] Убран || true: отказ доставки алерта должен быть виден в логе.
+          MSG="🔴 <b>Web Dashboard FAILED</b>%0ARepo: ${{ github.repository }}%0ARun: ${{ github.run_id }}%0A%0A👉 https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_GROUP_ID}" \
             -d "text=${MSG}" \
-            -d "parse_mode=HTML" || true
+            -d "parse_mode=HTML"
             
