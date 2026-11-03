@@ -73,22 +73,23 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
     for attempt in range(max_retries + 1):
         try:
             try:
-                resp = requests.get(url, headers=headers, timeout=30, impersonate="chrome")
+                # Уменьшаем таймаут до 15 секунд для предотвращения долгих зависаний
+                resp = requests.get(url, headers=headers, timeout=15, impersonate="chrome")
             except TypeError:
-                resp = requests.get(url, headers=headers, timeout=30)
+                resp = requests.get(url, headers=headers, timeout=15)
 
             if resp.status_code == 404:
                 _cache_response(url, _NOT_FOUND)
                 return _NOT_FOUND
             if resp.status_code == 429:
-                wait = 2 ** (attempt + 2)
+                wait = 2 ** (attempt + 1)
                 logger.warning(f"Rate limit. Waiting {wait}s")
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
                 logger.error(f"HTTP {resp.status_code} [BODY]: {resp.text[:300]}")
                 if attempt < max_retries:
-                    time.sleep(RATE_DELAY * 2)
+                    time.sleep(RATE_DELAY)
                     continue
                 return None
 
@@ -100,7 +101,7 @@ def _fetch_bzzoiro(url: str, headers: dict, max_retries: int = 1) -> Any:
         except Exception as e:
             logger.error(f"Request exception on {url}: {e}")
             if attempt < max_retries:
-                time.sleep(RATE_DELAY * 2)
+                time.sleep(RATE_DELAY)
                 continue
             return None
 
@@ -427,7 +428,6 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
             else:
                 flat_1x2, extended_markets = _process_odds_payload(odds_data)
                 if flat_1x2:
-                    # Требование Гейта 28 / §1.20: обязательный upstream="opta[span_3](start_span)"[span_3](end_span)
                     if patch_match(cid, "odds", flat_1x2, source="bzzoiro", upstream="opta"):
                         odds_enriched += 1
                     else:
@@ -472,7 +472,6 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     inner_h2h = {"matches": h2h_data}
 
                 if isinstance(inner_h2h, dict) and inner_h2h:
-                    # Требование регламента §1.29a: обязательный инжекционный маркер source="bzzoiro[span_4](start_span)"[span_4](end_span)
                     inner_h2h["source"] = "bzzoiro"
                     if patch_match(cid, "h2h", inner_h2h, source="bzzoiro"):
                         h2h_enriched += 1
@@ -502,7 +501,6 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
                     inner_stats = stats_data.get("stats", stats_data)
                     if isinstance(inner_stats, dict) and inner_stats:
                         flat_stats = _flatten_stats(inner_stats)
-                        # Требование Гейта 28 / §1.20: обязательный upstream="opta[span_5](start_span)"[span_5](end_span)
                         if patch_match(cid, "stats", flat_stats, source="bzzoiro", upstream="opta"):
                             stats_enriched += 1
                         else:
@@ -552,4 +550,4 @@ def collect_bzzoiro(events_only: bool = False) -> dict:
 if __name__ == "__main__":
     events_only = "--events-only" in sys.argv
     collect_bzzoiro(events_only=events_only)
-        
+    
