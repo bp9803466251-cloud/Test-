@@ -2,7 +2,7 @@
 # backtest_runner.py
 """
 Gatekeeper-AI Ecosystem: Раннер бэктеста GatekeeperAI.
-Версия 9.3.2-chunk — синхронизировано с вероятностями CORE ENGINE V6.7 (Стандарт V5.7.12).
+Версия 9.3.3-resilient — синхронизировано с вероятностями CORE ENGINE V6.7 (Стандарт V5.7.12).
 
 Обновления (патч контракта истории v9.3.1):
   - _fetch_history_matches выровнен по контракту писатель/читатель (§1.7d).
@@ -10,23 +10,30 @@ Gatekeeper-AI Ecosystem: Раннер бэктеста GatekeeperAI.
   - Голые except: continue заменены на честные счётчики.
 
 Обновления (патч транспорта v9.3.2):
-  - Fallback-чтение легаси-хэша переписано с HGETALL (один запрос на весь хэш:
-    Backtest #5 получил 'The read operation timed out' на 9925 полях) на чанковую
-    схему: HSCAN-курсор по именам полей + HMGET пачками HMGET_CHUNK_SIZE.
-    Каждый запрос переносит малый объём — таймаут 6с и лимит Upstash 10MB не
-    задеваются даже на больших архивах.
-  - Неудачные чанки и нечитаемые записи считаются честно — без молчаливого
-    проглатывания.
+  - Легаси-хэш читается чанково: HSCAN-курсор + HMGET пачками.
+
+Обновления (патч отказоустойчивости v9.3.3):
+  - Backtest #6: одиночный таймаут HSCAN обнулял весь фолбэк без повторов.
+    Введён _bulk_call(): ретраи (GATEKEEPER_BULK_RETRIES, дефолт 2) с
+    нарастающей паузой и увеличенным таймаутом (GATEKEEPER_BULK_REDIS_TIMEOUT, дефолт 15с).
+  - Fallback-лестница перечня полей: HSCAN (пары) -> HKEYS (только имена — ответ
+    в сотни раз меньше HGETALL и заведомо ниже лимита Upstash 10MB) -> честный отказ.
+  - HSCAN разбирается как ПАРЫ "поле-значение" (реальный контракт Redis/Upstash):
+    имена полей берутся по чётным позициям.
+  - Учитывается Circuit Breaker (§1.9): при открытом breaker ретрай ждёт паузу —
+    half-open восстановление позволяет продолжить.
+  - В отчёт добавлен блок "fetch": standalone/hash/parse_errors/fetch_errors.
 """
 
 import os
 import sys
 import json
+import time
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
 
-__version__ = "9.3.2-chunk"
+__version__ = "9.3.3-resilient"
 __all__ = ["run_backtest", "main", "__version__"]
 
 logger = logging.getLogger("backtest_runner")
@@ -34,6 +41,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 
 MSK_TZ = timezone(timedelta(hours=3))
 REPORT_PATH = "backtest_report.json"
+
+BULK_REDIS_TIMEOUT = int(os.getenv("GATEKEEPER_BULK_REDIS_TIMEOUT", "15"))
+BULK_RETRIES = int(os.getenv("GATEKEEPER_BULK_RETRIES", "2"))
+BULK_RETRY_BACKOFF = float(os.getenv("GATEKEEPER_BULK_RETRY_BACKOFF_S", "2"))
 
 def _now_msk():
     return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
@@ -63,46 +74,72 @@ def _get_value_engine():
         return value_engine
     except ImportError: return None
 
-# ── [v9.3.2] Чанковое чтение легаси-хэша ──
 def _root_addr(redis_hub):
     return getattr(redis_hub, "IMMUTABLE_ROOT_ADDRESS", "GatekeeperAI")
 
+def _bulk_call(redis_hub, cmd):
+    """[v9.3.3] Ретраи с нарастающей паузой. Учитывает Circuit Breaker."""
+    for attempt in range(BULK_RETRIES + 1):
+        breaker_open = getattr(redis_hub, "_circuit_breaker_open", False)
+        if breaker_open and attempt > 0:
+            logger.warning("Circuit Breaker открыт — пауза %.1fs до полураскрытия", BULK_RETRY_BACKOFF)
+        res = redis_hub.redis_command(cmd, timeout=BULK_REDIS_TIMEOUT)
+        if res is not None:
+            return res
+        if attempt < BULK_RETRIES:
+            logger.warning("Сбой вызова %s (попытка %d/%d) — повтор через %.1fs",
+                           cmd[0], attempt + 1, BULK_RETRIES + 1, BULK_RETRY_BACKOFF)
+            time.sleep(BULK_RETRY_BACKOFF)
+    return None
+
 def _scan_hash_fields(redis_hub, pattern):
-    """HSCAN-курсор по хэшу: возвращает только имена полей, значения не переносятся."""
-    fields, cursor = [], "0"
+    """Перечень полей истории: HSCAN (пары) -> HKEYS. Поднимает RuntimeError при полном отказе."""
     root = _root_addr(redis_hub)
+
+    fields, cursor = [], "0"
+    hscan_ok = True
     while True:
-        res = redis_hub.redis_command(["HSCAN", root, cursor, "MATCH", pattern, "COUNT", "200"])
+        res = _bulk_call(redis_hub, ["HSCAN", root, cursor, "MATCH", pattern + "*", "COUNT", "200"])
         if res is None:
-            raise RuntimeError("HSCAN вернул None (сбой транспорта/breaker)")
+            hscan_ok = False
+            break
         if not isinstance(res, (list, tuple)) or len(res) < 2:
-            raise RuntimeError(f"HSCAN вернул неожиданный формат: {type(res).__name__}")
+            hscan_ok = False
+            break
         cursor, batch = res[0], res[1]
-        if isinstance(batch, list):
-            fields.extend(k for k in batch if isinstance(k, str))
+        if isinstance(batch, list) and batch:
+            if len(batch) % 2 == 0:
+                fields.extend(batch[0::2])   # пары: имена на чётных позициях
+            else:
+                fields.extend(batch)          # защитный режим: плоский список
         if cursor in ("0", 0, None):
             break
-    return fields
+    if hscan_ok and fields:
+        return fields
+    if hscan_ok and not fields:
+        return []
+
+    logger.warning("HSCAN недоступен после ретраев — фолбэк на HKEYS (только имена полей)")
+    res = _bulk_call(redis_hub, ["HKEYS", root])
+    if res is None or not isinstance(res, list):
+        raise RuntimeError("HSCAN и HKEYS недоступны после ретраев (сбой транспорта/breaker)")
+    return [k for k in res if isinstance(k, str) and k.startswith(pattern)]
 
 def _unwrap_envelope(raw):
-    """Распаковка конверта v700-prod: payload в приоритете, плоский объект как фолбэк."""
     obj = json.loads(raw) if isinstance(raw, str) else raw
     if isinstance(obj, dict) and isinstance(obj.get("payload"), dict):
         return obj["payload"]
     return obj
 
 def _fetch_hash_chunked(redis_hub, stats):
-    """
-    Читает легаси-историю из хэша пачками HMGET. Возвращает True, если путь применён
-    (даже при частичных ошибках), None — если путь недоступен (нет redis_command).
-    """
     if not hasattr(redis_hub, "redis_command"):
         return None
     try:
-        fields = _scan_hash_fields(redis_hub, "history:match:*")
+        fields = _scan_hash_fields(redis_hub, "history:match:")
     except Exception as e:
-        logger.warning("HSCAN хэша истории провалился: %s", e)
-        return True  # путь доступен, но провалился — не маскируем get_all_fields
+        logger.warning("Перечень полей истории недоступен: %s", e)
+        stats["fetch_errors"] += 1
+        return True
 
     if not fields:
         return True
@@ -111,20 +148,15 @@ def _fetch_hash_chunked(redis_hub, stats):
     root = _root_addr(redis_hub)
     chunk_size = int(getattr(redis_hub, "HMGET_CHUNK_SIZE", 50) or 50)
     for i in range(0, len(fields), chunk_size):
-        chunk = fields[i:i + chunk_size]
-        try:
-            raws = redis_hub.redis_command(["HMGET", root] + chunk)
-        except Exception as e:
-            logger.warning("HMGET чанка [%d:%d] упал: %s", i, i + chunk_size, e)
-            stats["fetch_errors"] += len(chunk)
+        chunk = [f for f in fields[i:i + chunk_size] if str(f).startswith("history:match:")]
+        if not chunk:
             continue
+        raws = _bulk_call(redis_hub, ["HMGET", root] + chunk)
         if raws is None or not isinstance(raws, list):
-            logger.warning("HMGET чанка [%d:%d] вернул None — чанк пропущен", i, i + chunk_size)
+            logger.warning("HMGET чанка [%d:%d] недоступен после ретраев — чанк пропущен", i, i + chunk_size)
             stats["fetch_errors"] += len(chunk)
             continue
         for field, raw in zip(chunk, raws):
-            if not str(field).startswith("history:match:"):
-                continue
             if raw is None:
                 stats["parse_errors"] += 1
                 logger.warning("Поле истории '%s' вернуло nil", field)
@@ -144,17 +176,13 @@ def _fetch_hash_chunked(redis_hub, stats):
     return True
 
 def _fetch_history_matches(hub, seasons=None, leagues=None, limit=0):
-    """
-    Приоритет §1.7d: standalone-ключи history:match:* (scan_keys + get_history_match).
-    Fallback: легаси-хранение истории полями хэша GatekeeperAI — чанково (v9.3.2).
-    """
     redis_hub = _get_redis_hub()
+    stats = {"parse_errors": 0, "fetch_errors": 0, "n_standalone": 0, "n_hash": 0}
     if redis_hub is None:
-        return []
+        return [], stats
 
     matches = []
     seen_cids = set()
-    stats = {"parse_errors": 0, "fetch_errors": 0, "n_standalone": 0, "n_hash": 0}
 
     def _accept(match):
         if not isinstance(match, dict):
@@ -171,7 +199,6 @@ def _fetch_history_matches(hub, seasons=None, leagues=None, limit=0):
         return True
     stats["accept"] = _accept
 
-    # 1) Канонический путь §1.7d: Root-ключи history:match:*
     try:
         keys = redis_hub.scan_keys("history:match:*") if hasattr(redis_hub, "scan_keys") else []
     except Exception as e:
@@ -194,11 +221,9 @@ def _fetch_history_matches(hub, seasons=None, leagues=None, limit=0):
         if _accept(match):
             stats["n_standalone"] += 1
 
-    # 2) Fallback: легаси-хэш — чанково (HSCAN + HMGET), HGETALL только как последний резерв
     if stats["n_standalone"] == 0:
         chunked = _fetch_hash_chunked(redis_hub, stats)
         if chunked is None and hasattr(redis_hub, "get_all_fields"):
-            # Резерв для окружений без redis_command: только малые хэши (риск таймаута на больших)
             logger.warning("redis_command недоступен — резервный HGETALL (риск таймаута на больших хэшах)")
             try:
                 all_fields = redis_hub.get_all_fields()
@@ -222,7 +247,7 @@ def _fetch_history_matches(hub, seasons=None, leagues=None, limit=0):
                 stats["n_standalone"], stats["n_hash"], len(matches), stats["parse_errors"], stats["fetch_errors"])
 
     matches.sort(key=lambda m: m.get("date_utc", ""))
-    return matches[:limit] if limit > 0 else matches
+    return (matches[:limit] if limit > 0 else matches), stats
 
 def _build_history_map(matches, current_idx, lookback=200):
     current = matches[current_idx]
@@ -285,13 +310,15 @@ def run_backtest(seasons=None, leagues=None, window_size=50, limit=0, dry_run=Fa
         _write_report(report)
         return report
 
-    matches = _fetch_history_matches(hub, seasons, leagues, limit)
+    matches, fetch_stats = _fetch_history_matches(hub, seasons, leagues, limit)
+    fetch_block = {k: fetch_stats.get(k) for k in ("n_standalone", "n_hash", "parse_errors", "fetch_errors")}
+
     if not matches:
         report = {"version": __version__, "timestamp": _now_msk(), "error": "no_history_matches",
                   "total_matches": 0, "analyzed_matches": 0, "hot_count": 0, "warm_count": 0,
                   "avg_brier": None, "avg_rps": None, "metrics_note": "not computed (no history matches)",
                   "calibration_status": "unknown", "drift": {"drift_detected": False, "drift_flags": 0},
-                  "dry_run": dry_run}
+                  "fetch": fetch_block, "dry_run": dry_run}
         _write_report(report)
         return report
 
@@ -346,7 +373,8 @@ def run_backtest(seasons=None, leagues=None, window_size=50, limit=0, dry_run=Fa
         "avg_brier": round(avg_brier, 4) if avg_brier is not None else None,
         "avg_rps": round(avg_rps, 4) if avg_rps is not None else None,
         "metrics_note": "not computed" if avg_brier is None else "computed",
-        "calibration_status": calibration_status, "drift": drift, "dry_run": dry_run
+        "calibration_status": calibration_status, "drift": drift,
+        "fetch": fetch_block, "dry_run": dry_run
     }
 
     if not dry_run:
@@ -370,4 +398,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
+                   
