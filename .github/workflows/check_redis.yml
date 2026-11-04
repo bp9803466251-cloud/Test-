@@ -4,20 +4,25 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read # [ADDED] Least privilege по правилу §1.10 - отсутствовал в исходнике
+  contents: read # Least privilege по правилу §1.10
 
+# [AUDIT 2026-11-04] group check-redis -> gatekeeper-diagnostics: канонические группы §16.4
+# (collector-*, gatekeeper-pipeline, gatekeeper-diagnostics); произвольные имена вне реестра.
 concurrency:
-  group: check-redis # [ADDED] В исходнике группы не было вовсе - повторный запуск мог наложиться на идущий
+  group: gatekeeper-diagnostics
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.12' # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
+  # [AUDIT 2026-11-04] 3.12 -> 3.11: §1.10 требует единый интерпретатор по репозиторию
+  # (матрица 3.10/3.12 удалена именно по этому правилу; backtest.yml стоит на 3.11).
+  PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
 
 jobs:
   diagnostic:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # [ADDED] Защита от зависаний: в исходнике таймаута не было
+    # [AUDIT 2026-11-04] 15 -> 5: §1.10 «утилиты и диагностика — 5 минут».
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -32,15 +37,12 @@ jobs:
       - name: Run diagnostic script
         env:
           # Сетевой транспорт кэш-слоя Redis - полная лестница приоритетов §1.10
-          # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
           SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
           SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
           SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
           SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-        # [FIXED] -u: небуферизированный вывод в логи Actions.
         # pip install не требуется: скрипт на чистом stdlib (+ опциональный импорт HASH_NAME
         # из redis_hub с fallback - установка зависимостей не нужна).
         run: python -u check_redis.py
-        
