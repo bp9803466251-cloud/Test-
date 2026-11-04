@@ -958,8 +958,6 @@ def cleanup_expired(all_data: Optional[Dict[str, Any]] = None,
                 save_to_cache(shard, idx)
 
         now_local = datetime.now(MSK_TIMEZONE)
-        for search_field in scan_keys("search:results:*") if callable(getattr(globals().get("scan_keys"), "__call__", None)) and False else []:
-            pass  # placeholder — реальный вызов ниже
         try:
             for search_field in scan_keys("search:results:*"):
                 if search_field != "search:results:latest":
@@ -967,7 +965,7 @@ def cleanup_expired(all_data: Optional[Dict[str, Any]] = None,
         except Exception:
             pass
 
-        _update_health_metric({
+        _update_health_metric("last_cleanup", {
             "last_cleanup_count": deleted_live,
             "last_cleanup_at": now_local.isoformat(),
             "last_cleanup_finished": deleted_completed,
