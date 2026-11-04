@@ -1039,7 +1039,7 @@ def collect_and_process(seasons: str = "", leagues: str = "",
         league_list = list(LEAGUES.keys())
 
     # Инициализация хаба
-    init_metrics = run_initialization(collector=SOURCE_NAME)
+    init_metrics = run_initialization()
     run_id = init_metrics.get("run_id", "manual")
 
     if not dry_run:
@@ -1109,7 +1109,7 @@ def main():
     logger.info(f"  Registry: {'available' if _REGISTRY_AVAILABLE else 'fallback (local TEAM_ALIASES)'}")
 
     # Инициализация хаба
-    init_metrics = run_initialization(collector=SOURCE_NAME)
+    init_metrics = run_initialization()
     run_id = init_metrics.get("run_id", "manual")
 
     if not init_metrics.get("redis_available", False) and not args.dry_run:
