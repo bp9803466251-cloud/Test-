@@ -1,30 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 Диагностический скрипт check_redis.py для проверки Propline, включая spreads и totals (до 15 матчей).
-Версия 9.6.8-patched (аудит 2026-11-04).
+Версия 9.6.8-patched (v1.1-audit).
 
-[9.6.8 FIX] Лестница §1.10 дополнена средним звеном SHARED_REDIS_REST_*.
-[9.6.8 FIX] Явная проверка конфигурации Redis: без URL/токена - понятное сообщение
-            и осознанный exit 1 вместо TypeError в глубине urllib.
-[9.6.8 FIX] Хардкод 'GatekeeperAI' заменен на HASH_NAME из redis_hub (с fallback на
-            прежнее значение, если hub недоступен в контуре диагностики).
-[9.6.8 FIX] Контракт v710: записи могут храниться и оберткой с payload, и плоским
-            объектом (поля в корне). Прежняя версия на плоском хранении находила
-            0 записей Propline - молчаливый ложный диагноз "чистой базы".
-[9.6.8 FIX] urlopen с таймаутом 10с; молчаливые except: continue заменены на подсчет
-            нечитаемых записей с предупреждениями (стандарт 9.6.8).
-
-[АУДИТ 2026-11-04] Сетевой сбой на HKEYS/HGET: понятное сообщение и осознанный
-                   exit 1 вместо необработанного traceback.
-[АУДИТ 2026-11-04] Отчет об использованном звене лестницы §1.10 (токен не выводится).
-[АУДИТ 2026-11-04] В итоговую сводку добавлено общее число просмотренных полей хэша.
+[9.6.8] Лестница §1.10 с средним звеном SHARED_REDIS_REST_*; явная проверка конфигурации
+        Redis (без URL/токена - понятное сообщение и exit 1); HASH_NAME из redis_hub
+        с fallback; контракт v710 (обертка с payload ИЛИ плоский объект); подсчет
+        нечитаемых записей вместо молчаливых except: continue.
+[v1.1]  Блок «АУДИТ КОНТРАКТА ИСТОРИИ»: подсчет полей history:* внутри хэша и
+        standalone-ключей history:match:* через SCAN с курсором; образец записи
+        истории (обрезан до 1200 символов); автоматический вердикт о соответствии
+        контрактов писатель/читатель (разрыв / совпадение / двойное хранение / пусто).
+[v1.1]  Сетевой сбой на HKEYS/HGET/SCAN/GET - понятное сообщение и осознанный exit 1
+        без traceback (прежде - необработанный RuntimeError из urllib).
+[v1.1]  Явный sys.exit(0) и итоговая сводка с числом просмотренных полей.
 """
 import os
 import sys
 import json
 import logging
 import urllib.request
-import urllib.error
 
 logger = logging.getLogger("check_redis")
 logging.basicConfig(level=logging.INFO, format="[CHECK REDIS] %(message)s")
@@ -62,52 +57,42 @@ def call(cmd, timeout=10):
         return json.loads(resp.read()).get('result')
 
 
-def _masked_endpoint(raw_url: str) -> str:
-    """Схема + хост без пути и токена - безопасно для логов CI."""
-    try:
-        if "//" in raw_url:
-            return raw_url.split("//")[0] + "//" + raw_url.split("//", 1)[1].split("/", 1)[0]
-        return raw_url.split("/", 1)[0]
-    except Exception:
-        return "<unparseable>"
-
-
-def _ladder_rung(raw_url: str) -> str:
-    """Какое звено лестницы §1.10 сработало - по совпадению с env-источником."""
-    for name in ('SHARED_UPSTASH_REDIS_REST_URL', 'SHARED_REDIS_REST_URL', 'UPSTASH_REDIS_REST_URL'):
-        if raw_url and os.environ.get(name) == raw_url:
-            return name
-    return "unknown"
-
-
-print("=== ДИАГНОСТИКА ДАННЫХ PROPLINE В REDIS (ODDS, SPREADS, TOTALS) ===")
-print(f"🔗 Транспорт: {_masked_endpoint(url)} (звено: {_ladder_rung(url)}), токен скрыт")
-
-try:
-    fields = call(['HKEYS', HASH_NAME])
-except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
-    print(f"❌ Redis недоступен на этапе HKEYS: {e}")
+def _fail_network(stage, exc):
+    """[v1.1] Понятное сообщение о сетевом сбое и осознанный exit 1 без traceback."""
+    print(f"❌ Redis недоступен на этапе {stage}: {exc}")
     sys.exit(1)
 
-if not fields:
-    fields = []
-total_fields = len(fields)
-print(f"📦 Хэш '{HASH_NAME}': всего полей {total_fields}")
 
-found = 0
-parse_errors = 0
-limit_output = 15
+def _truncate(text, limit=1200):
+    if len(text) > limit:
+        return text[:limit] + "\n... (обрезано для лога)"
+    return text
 
-if fields:
+
+def main():
+    print("=== ДИАГНОСТИКА ДАННЫХ PROPLINE В REDIS (ODDS, SPREADS, TOTALS) ===")
+
+    try:
+        fields = call(['HKEYS', HASH_NAME]) or []
+    except Exception as e:
+        _fail_network("HKEYS", e)
+
+    print(f"📦 Хэш '{HASH_NAME}': всего полей {len(fields)}")
+
+    found = 0
+    parse_errors = 0
+    skipped = 0
+    limit_output = 15
+
     for key in fields:
         if "history" in key.lower() or ":meta" in key:
+            skipped += 1
             continue
 
         try:
             raw_val = call(['HGET', HASH_NAME, key])
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
-            print(f"❌ Redis недоступен на этапе HGET (ключ {key}): {e}")
-            sys.exit(1)
+        except Exception as e:
+            _fail_network(f"HGET {key}", e)
         if not raw_val:
             continue
 
@@ -118,7 +103,7 @@ if fields:
                 logger.warning("Запись %s: %s вместо dict - пропущена", key, type(wrapper).__name__)
                 continue
 
-            # Контракт v710: поддержаны обе формы хранения -
+            # [9.6.8] Контракт v710: поддержаны обе формы хранения -
             # обертка с payload и плоский объект (поля в корне)
             payload = wrapper.get("payload")
             if not isinstance(payload, dict):
@@ -128,7 +113,7 @@ if fields:
             sources = payload.get("sources", [])
             source_ids = payload.get("source_ids", {})
             if not isinstance(source_ids, dict):
-                # source_ids: null раньше ронял .values() на AttributeError,
+                # [9.6.8] source_ids: null раньше ронял .values() на AttributeError,
                 # и запись молча пропускалась через except: continue
                 source_ids = {}
 
@@ -167,8 +152,85 @@ if fields:
             parse_errors += 1
             logger.warning("Ошибка разбора записи %s: %s", key, e)
 
-print(f"\nВсего найдено и проверено записей Propline: {found}")
-if parse_errors:
-    print(f"⚠ Нечитаемых/ошибочных записей пропущено: {parse_errors}")
-print(f"📊 Итог аудита: просмотрено {total_fields} полей, Propline-совпадений {found}")
-sys.exit(0)  # Диагностика завершена; нечитаемые записи - предупреждения, а не отказ (стандарт 9.6.8)
+    print(f"\nВсего найдено и проверено записей Propline: {found}")
+    if parse_errors:
+        print(f"⚠ Нечитаемых/ошибочных записей пропущено: {parse_errors}")
+    if skipped:
+        print(f"ℹ Полей пропущено по фильтру (history/meta): {skipped}")
+
+    # ── [v1.1] АУДИТ КОНТРАКТА ИСТОРИИ ──────────────────────────────────────
+    print("\n=== АУДИТ КОНТРАКТА ИСТОРИИ (v1.1) ===")
+
+    hash_history_fields = [k for k in fields if k.lower().startswith("history")]
+    print(f"Полей history:* в хэше '{HASH_NAME}': {len(hash_history_fields)}")
+
+    standalone_keys = []
+    cursor = "0"
+    while True:
+        try:
+            scan_result = call(['SCAN', cursor, 'MATCH', 'history:match:*', 'COUNT', 1000])
+        except Exception as e:
+            _fail_network("SCAN history:match:*", e)
+        if not isinstance(scan_result, (list, tuple)) or len(scan_result) != 2:
+            parse_errors += 1
+            logger.warning("SCAN вернул неожиданный формат: %r", scan_result)
+            break
+        cursor, keys = scan_result
+        standalone_keys.extend(keys or [])
+        if cursor in ("0", 0, None):
+            break
+    print(f"Standalone-ключей history:match:* (SCAN): {len(standalone_keys)}")
+
+    # Образец записи истории: сначала из хэша, иначе из standalone
+    sample_printed = False
+    if hash_history_fields:
+        sample_key = hash_history_fields[0]
+        try:
+            raw_sample = call(['HGET', HASH_NAME, sample_key])
+        except Exception as e:
+            _fail_network(f"HGET {sample_key}", e)
+        if raw_sample:
+            try:
+                sample = json.loads(raw_sample) if isinstance(raw_sample, str) else raw_sample
+                print(f"\nОбразец записи истории (поле хэша '{sample_key}'):")
+                print(_truncate(json.dumps(sample, indent=2, ensure_ascii=False)))
+                sample_printed = True
+            except Exception as e:
+                logger.warning("Образец записи %s нечитаем: %s", sample_key, e)
+    if not sample_printed and standalone_keys:
+        sample_key = standalone_keys[0]
+        if isinstance(sample_key, bytes):
+            sample_key = sample_key.decode("utf-8", errors="replace")
+        try:
+            raw_sample = call(['GET', sample_key])
+        except Exception as e:
+            _fail_network(f"GET {sample_key}", e)
+        if raw_sample:
+            try:
+                sample = json.loads(raw_sample) if isinstance(raw_sample, str) else raw_sample
+                print(f"\nОбразец записи истории (standalone-ключ '{sample_key}'):")
+                print(_truncate(json.dumps(sample, indent=2, ensure_ascii=False)))
+                sample_printed = True
+            except Exception as e:
+                logger.warning("Образец записи %s нечитаем: %s", sample_key, e)
+
+    # Вердикт о соответствии контрактов писатель/читатель
+    if hash_history_fields and standalone_keys:
+        print("\n⚠ ВЕРДИКТ: ДВОЙНОЕ ХРАНЕНИЕ - история лежит и в хэше, и standalone-ключами.")
+        print("   Риск дублей в бэктесте: нужен выбор одного контракта.")
+    elif hash_history_fields:
+        print("\n❌ ВЕРДИКТ: КОНТРАКТНЫЙ РАЗРЫВ - история лежит ПОЛЯМИ ХЭША, а читатели")
+        print("   (backtest_runner через scan_keys('history:match:*')) ищут ОТДЕЛЬНЫЕ ключи.")
+        print("   Это объясняет 'no_history_matches' при непустой базе. Читателя нужно выровнять.")
+    elif standalone_keys:
+        print("\n✅ ВЕРДИКТ: контракты совпадают - история лежит standalone-ключами, как ожидают читатели.")
+    else:
+        print("\nℹ ВЕРДИКТ: история отсутствует (пустой контур после DATA STOP).")
+
+    print(f"\n📊 Итог аудита: просмотрено {len(fields)} полей, Propline-совпадений {found}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+                    
