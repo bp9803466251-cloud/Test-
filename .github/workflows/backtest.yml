@@ -66,7 +66,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install numpy scipy
+          pip install numpy scipy pyyaml
 
       - name: Run backtest
         run: |
@@ -109,54 +109,43 @@ jobs:
       - name: Telegram summary on success
         if: success()
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
-          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || 'MOCK_TOKEN' }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID || 'MOCK_CHAT_ID' }}
         run: |
           python -c "
-          import json, urllib.request, urllib.parse, os, sys
+          import json
+          import html as _html
+          from telegram_transport import send_transport_payload
 
           try:
-              with open('backtest_report.json') as f:
+              with open('backtest_report.json', encoding='utf-8') as f:
                   report = json.load(f)
           except Exception:
               report = {}
 
-          total = report.get('total_matches', 0)
-          hot = report.get('hot_count', 0)
-          warm = report.get('warm_count', 0)
-          brier = report.get('avg_brier', 0)
-          rps = report.get('avg_rps', 0)
+          error = report.get('error')
+          if error:
+              msg = ('⚠️ Backtest: отчёт с ошибкой\n'
+                     f'Причина: {_html.escape(str(error))}\n'
+                     'Brier/RPS не вычислялись — исторических данных в Redis нет')
+          elif report.get('total_matches', 0) == 0:
+              msg = '⚠️ Backtest: обработано 0 матчей — метрики не вычислялись'
+          else:
+              total = report.get('total_matches', 0)
+              hot = report.get('hot_count', 0)
+              warm = report.get('warm_count', 0)
+              brier = report.get('avg_brier')
+              rps = report.get('avg_rps')
+              drift = (report.get('drift') or {}).get('drift_flags', 0)
+              calibrated = report.get('calibration_status', 'unknown')
+              metrics = ('нет данных' if brier is None else f'Brier: {brier:.4f} | RPS: {rps:.4f}')
+              msg = ('📊 Backtest Complete\n'
+                     f'Matches: {total}\n'
+                     f'HOT: {hot} | WARM: {warm}\n'
+                     f'{metrics}\n'
+                     f'Drift flags: {drift}\n'
+                     f'Calibration: {calibrated}')
 
-          drift_obj = report.get('drift', {})
-          drift = drift_obj.get('drift_flags', 0)
-          calibrated = report.get('calibration_status', 'unknown')
-
-          msg = (
-              '📊 Backtest Complete\n'
-              f'Matches: {total}\n'
-              f'HOT: {hot} | WARM: {warm}\n'
-              f'Brier: {brier:.4f} | RPS: {rps:.4f}\n'
-              f'Drift flags: {drift}\n'
-              f'Calibration: {calibrated}'
-          )
-
-          token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-          chat_id = os.environ.get('TELEGRAM_GROUP_ID', '')
-          if not token or not chat_id:
-              print('ERROR: Telegram credentials not configured')
-              sys.exit(1)
-          data = urllib.parse.urlencode({
-              'chat_id': chat_id,
-              'text': msg
-          }).encode()
-          req = urllib.request.Request(
-              f'https://api.telegram.org/bot{token}/sendMessage',
-              data=data
-          )
-          try:
-              urllib.request.urlopen(req, timeout=10)
-          except Exception as e:
-              print(f'ERROR: Telegram send failed: {e}')
-              sys.exit(1)
+          if not send_transport_payload(msg):
+              raise SystemExit(1)
           "
-          
