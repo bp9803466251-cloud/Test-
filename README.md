@@ -3,7 +3,7 @@
 Распределённая экосистема для сбора, нормализации, склейки, анализа и стресс-тестирования футбольных данных в режиме реального времени.
 
 ### 📊 CI/CD Status: Patch Cycle 9.6.8 — AUDIT COMPLETE (2026-11-03)
-![CI/CD](https://img.shields.io/badge/Workflows-18%2F18%20Dispatch--Only-blue?style=flat-square)
+![CI/CD](https://img.shields.io/badge/CI%2FCD-STRESS%20TEST%20GREEN-brightgreen?style=flat-square)
 ![Audit](https://img.shields.io/badge/Patch%20Cycle%209.6.8-6%2F6%20Workflows%20Audited-orange?style=flat-square)
 ![Architecture](https://img.shields.io/badge/Pattern-Zero--Folder%20Architecture-blue?style=flat-square)
 ![Security](https://img.shields.io/badge/Security-%C2%A71.3%20Compliant-red?style=flat-square)
@@ -15,7 +15,7 @@
 > `match_linker.py`, глушение алертов `|| true` и битый Telegram-URL в `backtest.yml`).
 > Текущий бейдж отражает **состояние исходников**, а не результат прогона. Реальный
 > статус — зелёный только после первого честного прогона всей партии.
-
+> Первый валидированный зелёный прогон: stress test #3 (2026-11-04), processed 550, safeguards 37, value_bets 14, throughput 114.4/сек ≥ порога 50
 ---
 
 ## 🩹 Патч-цикл 9.6.8 (аудит 2026-11-03): закрыто 6/6 воркфлоу + 3 скрипта
