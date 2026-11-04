@@ -15,7 +15,7 @@ concurrency:
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
-  GK_CONFIG_FILE: 'gatekeeper_config.yaml'
+    GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
 
 jobs:
   dump:
