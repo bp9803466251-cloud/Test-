@@ -77,7 +77,7 @@ def main():
     print("📋 ПОЛНЫЙ ДАМП МАТЧЕЙ ИЗ REDIS")
     print("=" * 80)
 
-    init = run_initialization(collector="diagnostic")
+    init = run_initialization()
     if not init.get("redis_available", False):
         print("❌ Redis недоступен")
         sys.exit(1)
