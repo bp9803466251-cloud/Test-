@@ -1,13 +1,13 @@
 name: Match Dump
 
-# §1.2: workflow_dispatch only, no cron
+# Manual trigger only, no cron (p1.2)
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# §16.4: каноническая группа диагностического слоя
+# Canonical diagnostics concurrency group (p16.4)
 concurrency:
   group: gatekeeper-diagnostics
   cancel-in-progress: false
@@ -15,7 +15,7 @@ concurrency:
 env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
-    GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
+  GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
 
 jobs:
   dump:
