@@ -4,6 +4,11 @@
 Gatekeeper-AI Ecosystem: Раннер бэктеста GatekeeperAI.
 Версия 9.3-audited — Синхронизировано с вероятностями CORE ENGINE V6.7 (Стандарт V5.7.12).
 Симуляция на history:match:* с temporal cutoff и скользящим окном дрифта PAVA.
+
+Обновления (патч отчётности):
+  - backtest_report.json пишется на ВСЕХ путях выполнения, включая пустой контур
+  - На пустом контуре avg_brier/avg_rps = None: отсутствие данных не маскируется под 0.0000
+  - calibration_status: unknown (нет оценок) / LIMITED (<100) / OK (>=100) — по факту
 """
 
 import os
@@ -23,9 +28,18 @@ logging.basicConfig(
 )
 
 MSK_TZ = timezone(timedelta(hours=3))
+REPORT_PATH = "backtest_report.json"
 
 def _now_msk():
     return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+
+def _write_report(report):
+    """Отчёт пишется всегда, включая пустой контур — 'нет данных' тоже отчёт."""
+    try:
+        with open(REPORT_PATH, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Не удалось записать %s: %s", REPORT_PATH, e)
 
 def _get_hub():
     try:
@@ -127,10 +141,30 @@ def _drift_detection(brier_history, window_size=50):
 
 def run_backtest(seasons=None, leagues=None, window_size=50, limit=0, dry_run=False):
     hub = _get_hub(); ve = _get_value_engine(); redis_hub = _get_redis_hub()
-    if not hub or not ve or not redis_hub: return {"error": "Компоненты ядра недоступны"}
+    if not hub or not ve or not redis_hub:
+        report = {
+            "version": __version__, "timestamp": _now_msk(),
+            "error": "components_missing",
+            "metrics_note": "not computed (components unavailable)",
+        }
+        _write_report(report)
+        return report
 
     matches = _fetch_history_matches(hub, seasons, leagues, limit)
-    if not matches: return {"error": "no_history_matches"}
+    if not matches:
+        report = {
+            "version": __version__, "timestamp": _now_msk(),
+            "error": "no_history_matches",
+            "total_matches": 0, "analyzed_matches": 0,
+            "hot_count": 0, "warm_count": 0,
+            "avg_brier": None, "avg_rps": None,
+            "metrics_note": "not computed (no history matches)",
+            "calibration_status": "unknown",
+            "drift": {"drift_detected": False, "drift_flags": 0},
+            "dry_run": dry_run,
+        }
+        _write_report(report)
+        return report
 
     brier_history, rps_history = [], []
     hot_count, warm_count, analyzed_count = 0, 0, 0
@@ -149,13 +183,13 @@ def run_backtest(seasons=None, leagues=None, window_size=50, limit=0, dry_run=Fa
         analyzed_count += 1
         math_3way = result.get("math_3way", {})
         markets = math_3way.get("markets", {})
-        
+
         # Надежное извлечение вероятностей из fair_probabilities канонического паспорта
         fair_probs = result.get("fair_probabilities", {})
         p_h = fair_probs.get("home", 33.3) / 100.0
         p_d = fair_probs.get("draw", 33.4) / 100.0
         p_a = fair_probs.get("away", 33.3) / 100.0
-        
+
         predicted_probs = {"home": p_h, "draw": p_d, "away": p_a}
         brier_history.append(_brier_score(predicted_probs, actual))
         rps_history.append(_rps_score(predicted_probs, actual))
@@ -164,18 +198,27 @@ def run_backtest(seasons=None, leagues=None, window_size=50, limit=0, dry_run=Fa
         if "MAIN BET" in verdict: hot_count += 1
         elif "VALIDATED VALUE" in verdict: warm_count += 1
 
-    avg_brier = sum(brier_history) / len(brier_history) if brier_history else 0
-    avg_rps = sum(rps_history) / len(rps_history) if rps_history else 0
+    avg_brier = sum(brier_history) / len(brier_history) if brier_history else None
+    avg_rps = sum(rps_history) / len(rps_history) if rps_history else None
     drift = _drift_detection(brier_history, window_size)
+
+    if not brier_history:
+        calibration_status = "unknown"
+    else:
+        calibration_status = "OK" if len(brier_history) >= 100 else "LIMITED"
 
     report = {
         "version": __version__, "timestamp": _now_msk(), "total_matches": len(matches),
         "analyzed_matches": analyzed_count, "hot_count": hot_count, "warm_count": warm_count,
-        "avg_brier": round(avg_brier, 4), "avg_rps": round(avg_rps, 4), "calibration_status": "OK" if len(brier_history) >= 100 else "LIMITED",
+        "avg_brier": round(avg_brier, 4) if avg_brier is not None else None,
+        "avg_rps": round(avg_rps, 4) if avg_rps is not None else None,
+        "metrics_note": "not computed" if avg_brier is None else "computed",
+        "calibration_status": calibration_status,
         "drift": drift, "dry_run": dry_run
     }
 
     if not dry_run: redis_hub.set_key("analysis:backtest:latest", json.dumps(report))
+    _write_report(report)
     return report
 
 def main():
@@ -195,4 +238,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                      
