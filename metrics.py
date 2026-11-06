@@ -1,7 +1,7 @@
 # metrics.py
 """
 Gatekeeper-AI Ecosystem: Сбор и агрегация системных метрик.
-Версия 9.6.8-patched.
+Версия 10.0.0-merged (MERGE: контракт сигналов — signal_contract; meta-скан dual-pattern).
 
 [9.6.8 FIX] Подстрочный матч "BET" in "NO BET" исключен: value-сигналы определяются
             по границам определений (HOT*, VALUE_BET) - синхронно с
@@ -18,7 +18,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-__version__ = "9.6.8-patched"
+__version__ = "10.0.0-merged"
 __all__ = ["collect_metrics", "save_metrics", "__version__"]
 
 logger = logging.getLogger("metrics")
@@ -26,30 +26,17 @@ logger.addHandler(logging.NullHandler())
 
 MSK_TZ = timezone(timedelta(hours=3))
 
+from signal_contract import (
+    resolve_classification as _resolve_classification,
+    is_value_signal as _is_value_signal,
+)  # [MERGE] единый контракт сигналов (было: две локальные копии с расхождением дефолта)
+
 # Коллекторы, чья активность проверяется по мета-маркерам в кэше
 _COLLECTORS = ["sharpapi", "odds_api", "bzzoiro", "propline", "football_data", "main"]
 
 
 def now_msk():
     return datetime.now(MSK_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
-
-
-def _resolve_classification(match_data) -> str:
-    """[9.6.8] Синхронизировано с telegram_transport._resolve_classification:
-    приоритет core_analysis.classification, fallback verdict, безопасный возврат."""
-    res = match_data.get("core_analysis") or match_data
-    if not isinstance(res, dict):
-        return ""
-    return str(res.get("classification") or res.get("verdict") or "")
-
-
-def _is_value_signal(classification: str) -> bool:
-    """[9.6.8 FIX] Границы определений вместо подстрочного матча.
-    Прежняя проверка 'BET' in verdict считала value-сигналом каждый отбракованный
-    матч 'NO BET'. WARM (слабый сигнал, но не верифицированный value) не считается -
-    в соответствии с различением заголовков в транспорте 9.6.8."""
-    cls = classification.upper()
-    return cls.startswith("HOT") or "VALUE_BET" in cls
 
 
 def collect_metrics(hub=None):
@@ -134,7 +121,7 @@ def collect_metrics(hub=None):
     for c in _COLLECTORS:
         meta = None
         try:
-            meta = hub.get_from_cache(f"{c}:meta")
+            meta = hub.get_from_cache(f"system:meta:{c}") or hub.get_from_cache(f"{c}:meta")  # [MERGE] main пишет в system:meta:*
         except Exception as e:
             # [9.6.8 FIX] Прежнее молчаливое except: pass заменено на логирование
             logger.warning("get_from_cache(%s:meta) завершился сбоем: %s", c, e)

@@ -1,15 +1,52 @@
 #!/usr/bin/env python3
 """
 match_linker.py — Модуль связывания реальных/актуальных матчей с историей из Redis
-и отправки сводного дашборда в Telegram (Gatekeeper-AI v9.6.8-patched).
+и отправки сводного дашборда в Telegram (Gatekeeper-AI, слияние 10.0.0).
+
+[10.0.0 FIX] fetch_all_history_pool: Устранён dead-code Root-скана. Прежняя версия
+             ждала redis_hub.scan_keys + redis_hub.get_history_match — функций,
+             НЕ СУЩЕСТВУЮЩИХ в хабе v710 (сборка Шага 13). getattr возвращал None,
+             Уровень 1 молча пропускался, и после миграции Шага 13 пул истории
+             всегда собирался из легаси-полей хэша (fake empty конвейера).
+             Теперь: SCAN через redis_command (контракт v710) + GET по каждому
+             ключу с пакетированием COUNT=250.
+[10.0.0 FIX] Транспорт приведён к реальному контракту v710: send_transport_payload.
+             Прежняя версия в главной ветке проверяла hasattr(send_dashboard) —
+             функции, которой в telegram_transport нет и не было (мёртвая ветка),
+             а в fallback искала send_message / send_telegram_message, которых
+             в транспорте тоже нет. Теперь: прямой вызов без getattr на
+             критичном пути (README-правило 9); сборка текста — локальная.
+[10.0.0 FIX] Классификация — через signal_contract (единая семантика квадруплета,
+             устранённого слиянием): is_value_signal -> HOT-маркер 🔥,
+             is_warm_signal -> WARM-маркер ⚠️ (прежде терялся), иначе ℹ️ NO BET.
+             Error-пакет value_engine ({"error": ...}) больше не попадает в
+             счётчик NO BET — пропускается с warning (паритет с main.py).
+[10.0.0 DECISION] Дашборд — за пайплайном (core engine), который его шлёт сам.
+             Standalone-прогон (match_linker.yml) стартует с --no-dashboard.
+             Дефолт кода сохранён (send_dashboard=True): ручные запуски без
+             флага ведут себя как раньше; main.py не затронут — он вызывает
+             только link_match_with_history.
+[10.0.0]     Легаси-Уровень 2 (hash-поля) сохранён как детектор незавершённой
+             миграции: его срабатывание после Шага 13 = сигнал в warning.
+[10.0.0]     Примечание §1.11: в source_diagnostics есть зеркальный читатель
+             fetch_history_pool (для аудита). Унификация в один метод хаба —
+             кандидат на следующий цикл; сейчас читатели семантически совпадают
+             (Root-first, дедуп по canonical_id), расхождение контролируется
+             режимом keys/history-contracts ядра.
+[9.6.8 FIX]  Сохранены: изоляция сбоев цикла, честный exit-код (0/1), статус-фильтр.
 """
 
 import os
+import sys
 import json
 import logging
+import argparse
 from datetime import datetime, timezone
 
-__version__ = "9.6.8-patched"
+# Строгий импорт: контракт сигналов обязателен (README-правило 7), сбой — честный ImportError
+from signal_contract import is_value_signal, is_warm_signal
+
+__version__ = "10.0.0-merged"
 __all__ = ["link_match_with_history", "process_upcoming_matches", "__version__"]
 
 logger = logging.getLogger("match_linker")
@@ -37,28 +74,55 @@ def _get_value_engine():
         return None
 
 
+def _scan_history_keys(redis_hub):
+    """[10.0.0] SCAN history:match:* через redis_command с итерацией по курсору."""
+    keys, cursor = [], "0"
+    while True:
+        raw = redis_hub.redis_command(["SCAN", cursor, "MATCH", "history:match:*", "COUNT", "250"])
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            raise RuntimeError(f"SCAN вернул неожиданный формат: {type(raw).__name__}")
+        cursor, found = raw[0], raw[1]
+        if isinstance(cursor, bytes):
+            cursor = cursor.decode("utf-8")
+        cursor = str(cursor)
+        if found and isinstance(found, list):
+            keys.extend(k.decode("utf-8") if isinstance(k, bytes) else str(k) for k in found)
+        if cursor == "0":
+            break
+    return keys
+
+
 def fetch_all_history_pool():
-    """История: Root-ключи history:match:* (v9.6.8 §1.7d) + hash-фолбэк (легаси)."""
+    """История: Root-ключи history:match:* (SCAN+GET, контракт v710) + hash-фолбэк.
+
+    Возвращает отсортированный по date_utc список без дубликатов canonical_id.
+    Пустой пул при живой базе = симптом: проверить source_diagnostics --mode keys.
+    """
     redis_hub = _get_redis_hub()
     if not redis_hub:
         return []
 
     matches = []
 
-    # Уровень 1: Root-ключи (новая топология v9.6.8)
-    scan_keys = getattr(redis_hub, "scan_keys", None)
-    get_history_match = getattr(redis_hub, "get_history_match", None)
-    if scan_keys and get_history_match:
-        try:
-            for key in scan_keys("history:match:*"):
-                cid = key.replace("history:match:", "") if isinstance(key, str) else key
-                m = get_history_match(cid)
-                if isinstance(m, dict):
-                    matches.append(m)
-        except Exception as e:
-            logger.warning(f"Root-скан истории недоступен: {e}")
+    # Уровень 1: Root-ключи (новая топология Шага 13) — теперь реальный, а не dead-code
+    root_hit = 0
+    try:
+        for key in _scan_history_keys(redis_hub):
+            cid = key.replace("history:match:", "") if isinstance(key, str) else key
+            raw = redis_hub.redis_command(["GET", key])
+            if raw is None:
+                continue
+            m = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(m, dict):
+                m.setdefault("canonical_id", cid)
+                matches.append(m)
+                root_hit += 1
+    except Exception as e:
+        logger.warning(f"Root-скан истории недоступен: {e}")
 
-    # Уровень 2: hash-фолбэк (легаси-записи до миграции)
+    # Уровень 2: hash-фолбэк (легаси-записи до миграции Шага 13).
+    # После миграции любое срабатывание — признак незавершённой миграции.
+    legacy = 0
     try:
         all_fields = redis_hub.get_all_fields()
         for key, raw in (all_fields or {}).items():
@@ -68,10 +132,17 @@ def fetch_all_history_pool():
                 match = json.loads(raw) if isinstance(raw, str) else raw
                 if isinstance(match, dict):
                     matches.append(match)
+                    legacy += 1
             except Exception:
                 continue
     except Exception as e:
         logger.error(f"Ошибка получения истории из Redis: {e}")
+
+    if legacy and root_hit:
+        logger.warning(
+            f"Незавершённая миграция Шага 13: {legacy} легаси-полей хэша при "
+            f"{root_hit} Root-ключах — выполните source_diagnostics --mode keys"
+        )
 
     # Дедупликация по canonical_id: Root-ключи приоритетнее легаси
     dedup = {}
@@ -153,11 +224,37 @@ def _load_live_matches():
     return {}
 
 
-def process_upcoming_matches():
+def _build_dashboard_text(results, stats):
+    """[10.0.0] Сборка текстовой сводки. Маркеры по signal_contract:
+    🔥 HOT (value-сигнал), ⚠️ WARM, ℹ️ NO BET. Warm-маркер в прежней
+    fallback-версии терялся (всё, кроме HOT, печаталось как ℹ️)."""
+    lines = [
+        "📊 MATCH LINKER DASHBOARD",
+        f"Analyzed: {stats.get('analyzed', 0)} | "
+        f"HOT: {stats.get('hot', 0)} | WARM: {stats.get('warm', 0)}",
+        "",
+    ]
+    for r in results[:20]:
+        m = r.get("_match", {})
+        cls = str(r.get("classification", "NO BET"))
+        if is_value_signal(cls):
+            mark = "🔥"
+        elif is_warm_signal(cls):
+            mark = "⚠️"
+        else:
+            mark = "ℹ️"
+        lines.append(f"{mark} {cls}: {m.get('home_team', '?')} vs "
+                     f"{m.get('away_team', '?')} ({m.get('date_utc', '?')})")
+    return "\n".join(lines)
+
+
+def process_upcoming_matches(send_dashboard=True):
     """Находит актуальные матчи, связывает с историей, анализирует и отправляет дашборд.
 
     Возвращает True при успешном прогоне (включая пустой контур),
     False при ошибке окружения или отправки.
+    send_dashboard=False — standalone-режим без дашборда [DECISION 10.0.0]:
+    сводку шлёт пайплайн, standalone-прогон оставляет только линковку/анализ.
     """
     redis_hub = _get_redis_hub()
     if not redis_hub:
@@ -197,16 +294,22 @@ def process_upcoming_matches():
             if not result:
                 continue
 
+            # [10.0.0 FIX] Error-пакет value_engine — не сигнал, не NO BET.
+            # Прежде {"error": ...} попадал в счётчик NO BET и тишины в дашборде.
+            if isinstance(result, dict) and result.get("error"):
+                logger.warning(f"Ошибка анализа матча {cid}: {result.get('error')}")
+                continue
+
             analyzed_count += 1
-            classification = result.get("classification", "NO BET")
+            classification = str(result.get("classification", "NO BET"))
 
             # Сохраняем исходные данные матча внутри результата для дашборда
             result["_match"] = match_data
 
-            if classification == "HOT":
+            if is_value_signal(classification):
                 hot_count += 1
                 analyzed_results.append(result)
-            elif classification == "WARM":
+            elif is_warm_signal(classification):
                 warm_count += 1
                 analyzed_results.append(result)
             else:
@@ -231,18 +334,24 @@ def process_upcoming_matches():
         "warm": warm_count
     }
 
+    if not send_dashboard:
+        logger.info("Дашборд отключен (--no-dashboard): сводку шлёт пайплайн. Прогон завершён.")
+        return True
+
+    logger.info("Отправка сводного дашборда в Telegram...")
     try:
         import telegram_transport
     except ImportError as e:
         logger.error(f"telegram_transport недоступен: {e}")
         return False
 
-    logger.info("Отправка сводного дашборда в Telegram...")
     try:
-        if hasattr(telegram_transport, "send_dashboard"):
-            telegram_transport.send_dashboard(analyzed_results, stats)
-        else:
-            _send_custom_dashboard(analyzed_results, stats)
+        # [10.0.0 FIX] Прямой вызов реального контракта транспорта (README-правило 9).
+        # Прежние hasattr(send_dashboard) и поиск send_message/send_telegram_message
+        # были мёртвыми именами: главная ветка не срабатывала никогда, fallback
+        # заканчивался NameError, глотавшимся except'ом.
+        payload = _build_dashboard_text(analyzed_results, stats)
+        telegram_transport.send_transport_payload(payload)
     except Exception as e:
         logger.error(f"Не удалось отправить дашборд в Telegram: {e}")
         return False
@@ -251,6 +360,10 @@ def process_upcoming_matches():
 
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(0 if process_upcoming_matches() else 1)
-
+    parser = argparse.ArgumentParser(description="Match Linker & Analyzer")
+    parser.add_argument(
+        "--no-dashboard", action="store_true",
+        help="Не отправлять сводный дашборд (standalone-прогон; дашборд шлёт пайплайн)",
+    )
+    args = parser.parse_args()
+    sys.exit(0 if process_upcoming_matches(send_dashboard=not args.no_dashboard) else 1)

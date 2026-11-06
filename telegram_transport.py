@@ -4,7 +4,7 @@
 """
 Gatekeeper-AI Ecosystem
 Module: telegram_transport.py
-Version: 9.6.8-patched
+Version: 10.0.0-merged (MERGE: классификация сигналов из signal_contract)
 Topology: Zero-Folder Architecture (Root Execution)
 Compliance: §1.3 (Strict urllib.request architecture - NO requests library)
 Description: Асинхронно-буферизированный транспорт (Часть 1 из 2).
@@ -25,8 +25,9 @@ import urllib.error
 import re
 import asyncio
 from typing import List, Dict, Any, Optional
+from signal_contract import resolve_classification as _resolve_classification  # [MERGE] единый контракт сигналов
 
-__version__ = "9.6.8-patched"
+__version__ = "10.0.0-merged"
 
 logging.basicConfig(level=logging.INFO, format="[TG TRANSPORT] %(message)s")
 logger = logging.getLogger("telegram_transport")
@@ -78,15 +79,6 @@ def _extract_1x2_display(match_data: Dict[str, Any]):
                     cur.get("away_clean", cur.get("away", match_data.get("oa", "?"))),
                 )
     return match_data.get("oh", "?"), match_data.get("od", "?"), match_data.get("oa", "?")
-
-
-def _resolve_classification(match_data: Dict[str, Any]) -> str:
-    """Читает вердикт из нового контракта (classification) с легаси-fallback (verdict)."""
-    res = match_data.get("core_analysis") or match_data
-    if not isinstance(res, dict):
-        return "NO BET"
-    cls = res.get("classification") or res.get("verdict") or "NO BET"
-    return str(cls)
 
 
 def format_value_signal_html(match_data: Dict[str, Any]) -> str:

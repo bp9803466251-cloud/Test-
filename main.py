@@ -15,23 +15,18 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # Попытка импорта обязательных компонентов автономной экосистемы
-try:
-    from gatekeeper_hub import (
-        run_initialization,
-        get_all_matches,
-        get_from_cache,
-        now_msk,
-        is_shutdown_requested,
-        patch_match,
-    )
-except ImportError:
-    # Изолированный fallback для бесперебойного прохождения тестов py_compile в CI
-    def run_initialization(collector): return {"redis_available": True}
-    def get_all_matches(): return {}
-    def get_from_cache(key): return {}
-    def now_msk(): return ""
-    def is_shutdown_requested(): return False
-    def patch_match(cid, section, data, source="", upstream=""): return True
+# [MERGE 13-G1] Строгий импорт хаба. Заглушки-фолбэки удалены: при отсутствии
+# модуля они возвращали {"redis_available": True} (fake green), и конвейер
+# отправлял фальшивый алерт "DATA STOP" вместо честной ошибки. Обоснование
+# заглушек (py_compile в CI) ошибочно: py_compile не исполняет импорты.
+from gatekeeper_hub import (
+    run_initialization,
+    get_all_matches,
+    get_from_cache,
+    now_msk,
+    is_shutdown_requested,
+    patch_match,
+)
 
 # Безопасные импорты: отсутствие модуля не должно ронять конвейер на NameError
 try:
@@ -49,6 +44,16 @@ try:
 except ImportError:
     telegram_transport = None
 
+# [MERGE] Единый контракт классификации сигналов (signal_contract — без зависимостей)
+from signal_contract import resolve_classification as _resolve_classification
+
+# [MERGE] Телеметрия system:health (§9.1): metrics.py ранее не вызывался никем
+# (не было ни шага в sports_pipeline.yml, ни вызова из main) — ключ не обновлялся.
+try:
+    import metrics as metrics_module
+except ImportError:
+    metrics_module = None
+
 logger = logging.getLogger("main")
 if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -58,7 +63,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # Жесткая фиксация контрактных версий ворот деплоя (синхронизировано с docstring)
-__version__ = "9.6.8-patched"
+__version__ = "10.0.0-merged"
 __all__ = ["main", "__version__"]
 
 MSK_TZ = timezone(timedelta(hours=3))
@@ -71,21 +76,6 @@ TERMINAL_STATUSES = {"completed", "postponed", "cancelled",
 
 def _is_terminal(status: str) -> bool:
     return (status or "").lower() in TERMINAL_STATUSES
-
-
-def _resolve_classification(res: dict) -> str:
-    """Единая точка чтения класса сигнала: новый контракт + легаси-верdict."""
-    if not isinstance(res, dict):
-        return "NO BET"
-    classification = res.get("classification")
-    if classification:
-        return str(classification).upper()
-    verdict = res.get("verdict", "")
-    if "VALUE_BET" in str(verdict):
-        return "HOT"
-    if "WARM" in str(verdict).upper():
-        return "WARM"
-    return "NO BET"
 
 
 def _build_strict_dashboard(analyzed_packages: list) -> str:
@@ -352,7 +342,21 @@ def main():
     else:
         logger.warning("Все матчи отфильтрованы или не проанализированы — дашборд не формируется.")
 
-    # === ШАГ 6: Метаданные здоровья ===
+    # === ШАГ 6: Телеметрия system:health (metrics.py) ===
+    # [MERGE] Сиротский модуль подключен: ядро диагностики читает system:health
+    # через _read_meta — теперь ключ обновляется каждым прогоном конвейера.
+    if metrics_module is not None:
+        try:
+            collected = metrics_module.collect_metrics()
+            if not metrics_module.save_metrics(collected):
+                current_errors += 1
+        except Exception as e:
+            logger.error(f"Ошибка телеметрии system:health: {e}")
+            current_errors += 1
+    else:
+        logger.warning("metrics недоступен — system:health не обновляется (честная деградация)")
+
+    # === ШАГ 7: Метаданные здоровья ===
     now_str = now_msk() if callable(now_msk) else datetime.now(MSK_TZ).isoformat()
     save_meta(
         collector_name="main",
