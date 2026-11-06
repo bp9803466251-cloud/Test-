@@ -1,103 +1,106 @@
 name: Source Diagnostics
+# [MERGE 10.0.0] Единый диагностический воркфлоу: поглощает check_redis.yml,
+# redis_diagnostics.yml, diagnostic_matches.yml (match_dump), redis_flush read-режимы.
+# Режимы ядра: full|redis|sources|matches|indexes|errors|sample|propline|keys|history-contracts|memory
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Режим диагностики"
+        description: 'Режим диагностики ядра'
         required: false
         type: choice
         options:
           - full
-          - sources
           - redis
+          - sources
           - matches
           - indexes
           - errors
           - sample
+          - propline
+          - keys
+          - history-contracts
+          - memory
         default: full
+      min_free_mb:
+        description: 'Минимум свободной памяти для memory-режима (§13.4)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
-  contents: read
+  contents: read # Least privilege по правилу §1.10
 
+# [MERGE 10.0.0] Каноническая группа §16.4 — одна очередь для всей read-only диагностики
+# (ранее: gatekeeper-diagnostics / redis-diagnostics / source-diagnostics / match_dump)
 concurrency:
-  group: source-diagnostics # [FIXED] Была gatekeeper-redis: шестая копипаста в пакете,
-  cancel-in-progress: false  # диагностика вставала в очередь позади коллекторов
+  group: gatekeeper-diagnostics
+  cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.12' # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
+  # [MERGE 10.0.0] 3.11: канон §1.10 (аннотации "3.12: синхрон с 9.6.8" не подтверждались
+  # содержанием цикла — матрица с 3.12 им как раз удалялась; honest green получен на 3.11)
+  PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
 
 jobs:
-  run-diagnostics:
+  diagnostic:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # [FIXED] 5 -> 15: установка numpy/scipy из requirements одна может съесть 5 минут
+    # [MERGE 10.0.0] 5 минут по §1.10: ядро на stdlib, pip install убран
+    # (аргумент "numpy/scipy съедает 5 минут" относился к старым YML с requirements)
+    timeout-minutes: 5
 
     env:
       # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
-      # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
       SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
       SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-      # Ключи поставщиков для диагностики источников
-      SHARP_API_KEY: ${{ secrets.SHARP_API_KEY || '' }}
-      BZZOIRO_API_KEY: ${{ secrets.BZZOIRO_API_KEY || '' }}
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY || '' }}
-      PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY || '' }}
-      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY || '' }}
-      # Telegram: прокинуты оба имени — TELEGRAM_GROUP_ID для чтения самим скриптом,
-      # TELEGRAM_CHAT_ID для контракта патченного telegram_transport (§9.6.8)
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
-      GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
-      GATEKEEPER_ENV: production # [FIXED] prod -> production: синхрон с docker_compose.yml
+      GATEKEEPER_ENV: production
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python Runtime
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
+          # [MERGE 10.0.0] cache: pip убран — pip-установок в воркфлоу нет
 
-      - name: Install Mathematics & Core Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # [REMOVED] Непривязанный "pip install numpy scipy": мог поднять numpy 2.x
-          # поверх пина numpy<2.0.0 из патченного requirements (ABI-конфликт со scipy<1.14).
-          # Версии уже зафиксированы в requirements.txt — второй установки не требуется.
-
-      - name: Run Diagnostics
+      - name: Validate mode
         env:
-          # [FIXED] Инъекция закрыта: ручной ввод интерполируется только в env-блоке.
-          # ВАЖНО: type: choice НЕ валидируется сервером при запуске через API —
-          # произвольная строка доходит до скрипта как есть, поэтому чтение только из env.
+          # [9.6.8 FIX, перенесено] type: choice НЕ валидируется сервером при запуске
+          # через API — произвольная строка доходит до скрипта как есть; чтение из env
           DIAG_MODE: ${{ github.event.inputs.mode || 'full' }}
+          DIAG_MIN_FREE_MB: ${{ github.event.inputs.min_free_mb || '' }}
         run: |
-          # [FIXED] Прямая интерполяция --${MODE} в командную строку заменена на
-          # чтение из env с явной валидацией: неизвестное значение -> full
           case "$DIAG_MODE" in
-            full|''|sources|redis|matches|indexes|errors|sample)
+            full|redis|sources|matches|indexes|errors|sample|propline|keys|history-contracts|memory)
               ;;
             *)
-              echo "⚠ Неизвестный режим '$DIAG_MODE' - откат на full"
+              echo "⚠ Неизвестный режим '$DIAG_MODE' — откат на full"
               DIAG_MODE=full
               ;;
           esac
+          echo "FLUSH_MODE_NOT_USED=true" > /dev/null  # no-op: явный маркер read-only прогона
+          echo "DIAG_MODE=$DIAG_MODE" >> "$GITHUB_ENV"
+          echo "DIAG_MIN_FREE_MB=$DIAG_MIN_FREE_MB" >> "$GITHUB_ENV"
           echo "Mode: $DIAG_MODE"
-          if [ "$DIAG_MODE" = "full" ]; then
+
+      - name: Run diagnostics (stdlib only, no pip install)
+        run: |
+          # [MERGE 10.0.0] Строгий импорт 13-G1: отсутствие хабов — осознанный exit 1
+          if [ -n "$DIAG_MIN_FREE_MB" ] && [ "$DIAG_MODE" = "memory" ]; then
+            python -u source_diagnostics.py --mode memory --min-free-mb "$DIAG_MIN_FREE_MB"
+          elif [ "$DIAG_MODE" = "full" ]; then
             python -u source_diagnostics.py
           else
-            python -u source_diagnostics.py --"$DIAG_MODE"
+            python -u source_diagnostics.py --mode "$DIAG_MODE"
           fi
 
       - name: Summary
@@ -105,25 +108,22 @@ jobs:
         env:
           MODE: ${{ github.event.inputs.mode || 'full' }}
         run: |
-          echo "=== Source Diagnostics Summary ==="
+          echo "=== Source Diagnostics Summary (merged v10.0.0) ==="
           echo "Mode: $MODE"
-          echo ""
           echo "Run ID: ${{ github.run_id }}"
           echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo ""
-          echo "Status: SUCCESS"
 
-      - name: Send Telegram Alert on Failure
+      - name: Telegram alert on failure
         if: failure()
         env:
-          # [FIXED] Секреты перенесены из интерполяции в шелле в env-блок
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          DIAG_MODE: ${{ env.DIAG_MODE }}
         run: |
-          # [FIXED] Убран || true: отказ доставки алерта должен быть виден в логе.
-          # URL здесь был каноническим — сохранен. curl — системная утилита раннера.
+          # [9.6.8 FIX, перенесено] Убран || true: отказ доставки алерта виден в логе.
+          # curl — системная утилита раннера, §1.3 регулирует Python-код пакета.
+          MSG="❌ <b>Source Diagnostics FAILED</b>%0AMode: ${DIAG_MODE}%0ARun: ${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
-            -d text="❌ <b>Source Diagnostics FAILED</b> at $(date '+%Y-%m-%d %H:%M:%S UTC')" \
+            -d text="${MSG}" \
             -d parse_mode="HTML"
-            
