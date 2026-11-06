@@ -12,6 +12,10 @@
   - Совместимость со старым API сохранена: save_to_cache / get_from_cache /
     get_all_fields / batch_get_from_cache без изменения сигнатур
 
+
+Обновления 10.0.0-compat (2026-11-06):
+  - HASH_NAME = алиас IMMUTABLE_ROOT_ADDRESS: падеж прогона Source Diagnostics #73
+    (cannot import name 'HASH_NAME') закрыт на стороне хаба — consumers не правятся
 Обновления v9.6.9-history (Шаг 13-A):
   - PipelineBatch (§13.4/§27.3): буфер команд, flush пачками по 50 одним
     REST-запросом, счётчик commands_used для football_data:meta
@@ -37,6 +41,10 @@ EXTERNAL_API_TIMEOUT = int(os.getenv("GATEKEEPER_EXTERNAL_API_TIMEOUT", "15"))
 HMGET_CHUNK_SIZE = int(os.getenv("GATEKEEPER_HMGET_CHUNK_SIZE", "50"))
 
 IMMUTABLE_ROOT_ADDRESS = "GatekeeperAI"
+# [10.0.0 COMPAT] Алиас обратной совместимости: до-13 патчей consumers
+# (source_diagnostics, redis_flush 9.6.6) импортируют HASH_NAME как имя
+# главного хэша. Семантически это тот же неизменяемый Root-адрес.
+HASH_NAME = IMMUTABLE_ROOT_ADDRESS
 HISTORY_PREFIX = "history:match:"
 MSK_TIMEZONE = timezone(timedelta(hours=3))
 ENVELOPE_VERSION = "v700-prod"

@@ -82,7 +82,7 @@ INDEX_PATTERNS = ("idx:*", "index:*", "search:results:*")
 # ---------------------------------------------------------------------------
 try:
     import redis_hub
-    from redis_hub import (HASH_NAME, get_all_fields, is_redis_available,
+    from redis_hub import (IMMUTABLE_ROOT_ADDRESS, get_all_fields, is_redis_available,
                            redis_command, get_circuit_breaker_status)
 except ImportError as e:
     print(f"❌ source_diagnostics: критический сбой импорта redis_hub: {e}")
@@ -446,7 +446,7 @@ def cmd_redis(ctx):
     print(f"   Redis сконфигурирован: {'✅' if info['redis_configured'] else '❌'}")
     print(f"   Доступен (run_initialization): {'✅' if info['redis_available'] else '❌'}")
     print(f"   Circuit Breaker: {info['circuit_breaker']} (failures: {info['cb_failures']})")
-    print(f"   Хэш '{HASH_NAME}': {info['hash_fields_total']} полей "
+    print(f"   Хэш '{IMMUTABLE_ROOT_ADDRESS}': {info['hash_fields_total']} полей "
           f"(match:*: {info['match_keys']}, канонических без префикса: {info['canonical_keys']})")
     if info["raw_canonical_no_prefix"]:
         print("   ⚠️ Коллектор пишет ключи сырым canonical_id без префикса 'match:'")
@@ -715,7 +715,7 @@ def cmd_keys(ctx, limit=DEFAULT_LIMIT):
     print("\n=== АУДИТ КОНТРАКТА ИСТОРИИ + КАРТА КЛЮЧЕЙ ===")
     fields = ctx.all_fields
     hash_history = [k for k in fields if k.lower().startswith("history")]
-    print(f"   Полей history:* в хэше '{HASH_NAME}': {len(hash_history)}")
+    print(f"   Полей history:* в хэше '{IMMUTABLE_ROOT_ADDRESS}': {len(hash_history)}")
 
     standalone = {}
     for pattern in SCAN_PATTERNS:
