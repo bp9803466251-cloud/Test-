@@ -18,10 +18,20 @@
   - cleanup_expired(auto_migrate=True): Cross-Namespace Reconciliation (§27.5)
   - Конверт поиска v700-prod; schema_version: "v710"; version >= 1
   - Импорт clean_team_name напрямую из team_registry.py (fallback search_module с WARN)
+
+Обновления v9.6.9-history (Шаг 13-H):
+  - upsert_match(force=..., batch=...): force-семантика §12.6.1 и пакетный режим 13-G2
+  - _upsert_history_entry: raw JSON без конверта (§13.1), canonical_id строится хабом,
+    predictions из extra уничтожаются (§13.2), деградация — только Root-транспорт (§1.4)
+  - Enum статусов сведён к трём значениям (12-4): scheduled/live/completed
+  - update_history_indexes: Root-индексы ZADD/SADD/RPUSH (R-5, R-7/13-G3)
+  - get_history_by_league: чтение по Root-ZSET + get_history_match
+  - Экспорт UPSTREAM_MAP и is_shutdown_requested() (13-H4); run_id в run_initialization
 """
 import os
 import json
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -40,6 +50,8 @@ from redis_hub import (
     delete_history_match,
     history_match_exists,
     scan_keys,
+    redis_command,
+    PipelineBatch,
 )
 
 # ─── Импорт реестра имён (§26): прямой импорт из team_registry ───
@@ -61,6 +73,7 @@ except ImportError:  # pragma: no cover
 
 MSK_TIMEZONE = timezone(timedelta(hours=3))
 MATCH_PREFIX = "match:"
+HISTORY_PREFIX = "history:match:"
 INDEX_FIELD = "match:index"
 MAX_CAS_RETRIES = 3
 MAX_HISTORY_ENTRIES = 20
@@ -74,7 +87,7 @@ MERGE_SECTIONS = ("odds", "stats", "extra", "h2h", "source_ids")
 BLOCKED_SECTIONS = ("predictions",)
 
 # ─── Схема v710: enum статусов + нормализация легаси ───
-SCHEMA_V710_STATUS_ENUM = {"scheduled", "live", "completed", "postponed", "cancelled"}
+SCHEMA_V710_STATUS_ENUM = {"scheduled", "live", "completed"}  # 12-4: три значения, = schema_v710.json
 _STATUS_NORMALIZE = {
     "awarded": "completed",
     "forfeited": "completed",
@@ -98,6 +111,18 @@ _UPSTREAM_MAP_FALLBACK = {
     "oddsapi": "odds_api",
     "propline": "pinnacle",
 }
+
+# 13-H4: публичный экспорт карты upstream (fallback — при отсутствии gatekeeper_config.yaml).
+# Для football_data upstream определяется каскадом колонок §12.8 (PPCH→pinnacle, MaxCH→market_max,
+# AvgCH→market_avg, B365CH→bet365); записи карты — fallback при нераспознанной колонке (§1.20).
+UPSTREAM_MAP = _UPSTREAM_MAP_FALLBACK
+
+
+def is_shutdown_requested() -> bool:
+    """Флаг graceful shutdown (§1.11). Общая точка для всех модулей экосистемы:
+    воркфлоу прерывает прогон через SIGTERM; внутри рантайма — всегда False."""
+    return False
+
 
 _provider_priority_order = ["pinnacle", "opta", "odds_api", "betradar", "bzzoiro"]
 
@@ -306,7 +331,7 @@ def _build_1x2(flat: Dict[str, float], source: str, timestamp: str) -> dict:
 
 
 def _archive_displaced_price(match_obj: dict, outcome_key: str, old_val: float, new_val: float, ts: str) -> None:
-    """Архивация вытесненной цены в изолированный блок odds.historical_context (§1.7d-стиль)."""
+    """Архивация вытесненной цены в изолированный блок odds.historical_context (§1.7.4-стиль)."""
     odds = match_obj.setdefault("odds", {})
     hist = odds.setdefault("historical_context", [])
     hist.append({
@@ -316,7 +341,7 @@ def _archive_displaced_price(match_obj: dict, outcome_key: str, old_val: float, 
         "displaced_at": ts,
     })
     if len(hist) > MAX_HISTORICAL_CONTEXT:
-        match_obj["odds"]["historical_context"] = hist[-MAX_HISTORY_ENTRIES:]
+        match_obj["odds"]["historical_context"] = hist[-MAX_HISTORICAL_CONTEXT:]
 
 
 def _merge_odds_1x2(match_obj: dict, flat: Dict[str, float], source: str) -> dict:
@@ -596,15 +621,21 @@ def _write_match(match_obj: dict) -> bool:
 # ---------------------------------------------------------------------------
 def upsert_match(home_team: str, away_team: str, date_utc: str,
                  competition: str = "", country: str = "", status: str = "scheduled",
-                 source: str = "unknown", mode: str = "live", **extra) -> Optional[dict]:
+                 source: str = "unknown", mode: str = "live",
+                 force: bool = False, batch: Optional[PipelineBatch] = None,
+                 **extra) -> Optional[dict]:
     """
     Создаёт или обновляет каркас матча. Прошедшие матчи отсекаются (§1.5).
-    mode="history" — архивный импорт в history-namespace (Root-ключ, §1.7d).
+    mode="history" — архивный импорт в history-namespace (Root-ключ, §1.7.4);
+    прошедшие матчи записываются, будущие — отклоняются (отсечка live-only, §1.5).
+    force (mode="history") — force-merge §12.6.1 при одиночной записи.
+    batch (13-G2) — PipelineBatch: запись batch.add("SET", ...) без немедленного
+    flush; merge-семантику §12.6.1 в пакетном режиме обеспечивает вызывающая сторона.
     **extra распаковывается в верхний уровень (§1.13).
     """
     if mode == "history":
         return _upsert_history_entry(home_team, away_team, date_utc, competition, country,
-                                     status, source, extra)
+                                     status, source, extra, force=force, batch=batch)
     if not _is_future_match(date_utc):
         return None
     cid = _make_canonical_id(home_team, away_team, date_utc)
@@ -694,32 +725,42 @@ def batch_upsert_matches(matches: List[dict], source: str = "unknown") -> dict:
 
 
 def _upsert_history_entry(home_team, away_team, date_utc, competition, country,
-                          status, source, extra) -> Optional[dict]:
+                          status, source, extra, force=False, batch=None) -> Optional[dict]:
+    """Архивный импорт (§23, §12.6.1, 13-G2). Raw JSON без конверта (§13.1).
+    Batch-ветка: batch.add("SET", ...) — flush делает владелец батча;
+    merge-семантику §12.6.1 в batch-режиме обеспечивает вызывающая сторона.
+    Деградация — только Root-транспорт redis_command (§1.4): live-хэш не участвует."""
     cid = _make_canonical_id(home_team, away_team, date_utc)
     normalized_status = status if status in SCHEMA_V710_STATUS_ENUM else _STATUS_NORMALIZE.get(str(status).lower(), "completed")
     entry = _init_match_object(home_team, away_team, date_utc, competition, country, normalized_status, source)
     entry["version"] = 1
     for k, v in extra.items():
-        if k == "source":
+        # canonical_id строится хабом (H-6); predictions уничтожаются (§13.2)
+        if k in ("source", "sources", "canonical_id", "predictions"):
             continue
         entry[k] = v
     ok, reason = validate_schema(entry)
     if not ok:
         print(f"[HUB HISTORY REJECT] {cid}: {reason}")
+        _increment_metric("history_rejected_total")
         return None
+    if batch is not None:
+        batch.add("SET", f"{HISTORY_PREFIX}{cid}", json.dumps(entry, ensure_ascii=False))
+        # Индексы в batch-режиме пишет загрузчик (13-G2); финальный SET в лог не идёт
+        return entry
     try:
-        ok = upsert_history_match(cid, entry)  # type: ignore[name-defined]
-    except Exception:
-        ok = save_to_cache(f"history:match:{cid}", entry)
+        ok = upsert_history_match(cid, entry, force=force)
+    except Exception as e:
+        print(f"[HUB HISTORY WARN] Root-хелпер недоступен ({e}) — деградация на Root-транспорт (не live-хэш, §1.4)")
+        _increment_metric("history_degraded_writes_total")
+        ok = bool(redis_command(["SET", f"{HISTORY_PREFIX}{cid}",
+                                 json.dumps(entry, ensure_ascii=False)]))
     if ok:
         update_history_indexes(entry)
         return entry
     return None
 
 
-# ---------------------------------------------------------------------------
-# Публичный API: patch_match (Гейт 28 + §1.20 + §1.29a)
-# ---------------------------------------------------------------------------
 def patch_match(canonical_id: str, section: str, data: Any,
                 source: str = "", upstream: str = "") -> bool:
     """
@@ -902,7 +943,7 @@ def cleanup_expired(all_data: Optional[Dict[str, Any]] = None,
     touched_shards: Dict[str, List[str]] = {}
 
     for field, value in list(all_data.items()):
-        # Уровень 2 защиты истории: явный skip (§1.7d)
+        # Уровень 2 защиты истории: явный skip (§1.7.4)
         if field.startswith("history:") or "history" in field:
             continue
         if not field.startswith(MATCH_PREFIX) or not isinstance(value, dict):
@@ -981,25 +1022,26 @@ def cleanup_expired(all_data: Optional[Dict[str, Any]] = None,
 # Инициализация рантайма (§1.7a, §1.11)
 # ---------------------------------------------------------------------------
 def run_initialization() -> dict:
+    """Инициализация рантайма (§1.7.1): reset CB, миграция, cleanup.
+    Возвращает run_id (13-H4) — трассировка прогонов в meta."""
     reset_circuit_breaker()
+    run_id = uuid.uuid4().hex[:8]
     if not is_redis_available():
         print("[HUB INIT] Redis недоступен")
-        return {"redis_available": False, "cleanup_count": 0}
+        return {"redis_available": False, "cleanup_count": 0, "run_id": run_id}
     all_data = get_all_fields()
     migrated = migrate_schema(all_data)
     cleanup_result = cleanup_expired(all_data, dry_run=False, auto_migrate=True)
     _flush_health_metrics()
-    print(f"[HUB INIT] OK — миграция: {migrated}, очистка: {cleanup_result['deleted']}")
+    print(f"[HUB INIT] OK — миграция: {migrated}, очистка: {cleanup_result['deleted']}, run_id: {run_id}")
     return {
         "redis_available": True,
         "cleanup_count": cleanup_result["deleted"],
         "migrated": migrated,
+        "run_id": run_id,
     }
 
 
-# ---------------------------------------------------------------------------
-# Чтение: get_all_matches / get_matches_by_date_range / count / odds
-# ---------------------------------------------------------------------------
 def get_all_matches() -> Dict[str, Any]:
     """Union плоского индекса и шардов (v9.6.8)."""
     result: Dict[str, Any] = {}
@@ -1083,7 +1125,7 @@ def find_match_by_source_id(provider: str, provider_id: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# History-контракт v9.6.8 (§1.7d)
+# History-контракт v9.6.8 (§1.7.4)
 # ---------------------------------------------------------------------------
 def migrate_to_history(canonical_id: str, match_obj: Optional[dict] = None) -> bool:
     if match_obj is None:
@@ -1101,41 +1143,46 @@ def migrate_to_history(canonical_id: str, match_obj: Optional[dict] = None) -> b
             return True
         ok = upsert_history_match(canonical_id, history_obj)  # type: ignore[name-defined]
     except Exception as e:
-        print(f"[HUB HISTORY WARN] Root-хелпер недоступен ({e}) — деградация в hash-поля с WARN")
-        ok = save_to_cache(f"history:match:{canonical_id}", history_obj)
+        print(f"[HUB HISTORY WARN] Root-хелпер недоступен ({e}) — деградация на Root-транспорт (не live-хэш, §1.4)")
+        _increment_metric("history_degraded_writes_total")
+        ok = bool(redis_command(["SET", f"{HISTORY_PREFIX}{canonical_id}",
+                                 json.dumps(history_obj, ensure_ascii=False)]))
     if ok:
         update_history_indexes(history_obj)
     return bool(ok)
 
 
 def update_history_indexes(match_obj: dict) -> None:
-    """Архивные индексы history:league:{code} / history:team:{name}."""
+    """Root-индексы истории (§13.1, R-5/13-G3): ZADD league, SADD team, RPUSH day-shard.
+    history:index:{YYYYMMDD} пишет хаб/загрузчик; +1 команда на матч (R-7)."""
     cid = match_obj.get("canonical_id", "")
     if not cid:
         return
-    league_code = match_obj.get("league_code") or match_obj.get("competition") or "unknown"
-    for index_key, member in (
-        (f"history:league:{league_code}", cid),
-        (f"history:team:{match_obj.get('home_clean', '')}", cid),
-        (f"history:team:{match_obj.get('away_clean', '')}", cid),
-    ):
-        idx = get_from_cache(index_key)
-        if not isinstance(idx, dict):
-            idx = {}
-        if member not in idx:
-            idx[member] = match_obj.get("date_utc", "")
-            save_to_cache(index_key, idx)
+    league_code = match_obj.get("league_code") or match_obj.get("competition") or ""
+    try:
+        dt = datetime.fromisoformat(str(match_obj.get("date_utc", "")).replace("Z", "+00:00"))
+        score = str(dt.timestamp())
+    except (ValueError, TypeError):
+        score = "0"
+    if league_code:
+        redis_command(["ZADD", f"history:league:{league_code}", score, cid])
+    for name in (match_obj.get("home_clean"), match_obj.get("away_clean")):
+        name_clean = str(name or "").replace(" ", "_")
+        if name_clean:
+            redis_command(["SADD", f"history:team:{name_clean}", cid])
+    day = str(match_obj.get("date_utc", ""))[:10].replace("-", "")
+    if day:
+        redis_command(["RPUSH", f"history:index:{day}", cid])
 
 
-def get_history_by_league(league_code: str) -> Dict[str, dict]:
-    idx = get_from_cache(f"history:league:{league_code}")
+def get_history_by_league(league_code: str, limit: int = 1000) -> Dict[str, dict]:
+    """Чтение истории лиги по Root-ZSET (R-5): ZRANGE + get_history_match."""
+    ids = redis_command(["ZRANGE", f"history:league:{league_code}", "0", str(max(limit - 1, 0))])
     result: Dict[str, dict] = {}
-    if isinstance(idx, dict):
-        keys = [f"history:match:{cid}" for cid in idx.keys()]
-        values = batch_get_from_cache(keys)
-        for k, v in values.items():
-            if isinstance(v, dict):
-                result[k.replace("history:match:", "")] = v
+    for cid in (ids if isinstance(ids, list) else []):
+        m = get_history_match(cid)
+        if isinstance(m, dict):
+            result[cid] = m
     return result
 
 

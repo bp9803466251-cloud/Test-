@@ -6,11 +6,20 @@
 Обновления v9.6.8-patched:
   - Транспортный конверт поднят до v700-prod (ENVELOPE_VERSION)
   - Circuit Breaker приведён к §1.9: 10 ошибок подряд -> 60 секунд
-  - Добавлены Root-хелперы history:match:* (уровень 1 защиты §1.7d):
+  - Добавлены Root-хелперы history:match:* (уровень 1 защиты §1.7.4):
     redis_command(), scan_keys(), upsert_history_match(),
     get_history_match(), delete_history_match() (только с HISTORY_FLUSH_CONFIRM=1)
   - Совместимость со старым API сохранена: save_to_cache / get_from_cache /
     get_all_fields / batch_get_from_cache без изменения сигнатур
+
+Обновления v9.6.9-history (Шаг 13-A):
+  - PipelineBatch (§13.4/§27.3): буфер команд, flush пачками по 50 одним
+    REST-запросом, счётчик commands_used для football_data:meta
+  - upsert_history_match(force=...): честная force-семантика §12.6.1;
+    force=False — SET NX (идемпотентно), force=True — merge с сохранением
+    live-обогащения (source_ids, h2h, created_at)
+  - History-записи — raw JSON без конверта v700-prod (§13.1);
+    get_history_match читает оба формата (легаси-конверты остаются читаемыми)
 """
 import os
 import json
@@ -149,7 +158,7 @@ def _execute_upstash_cmd(cmd_parts: List[Any], timeout: int = REDIS_TIMEOUT) -> 
 def redis_command(cmd_parts: List[Any], timeout: int = REDIS_TIMEOUT) -> Optional[Any]:
     """
     Универсальный вызов произвольной Redis-команды через защищённый транспорт.
-    Используется хабом для Root-ключей истории (§1.7d) и диагностикой.
+    Используется хабом для Root-ключей истории (§1.7.4) и диагностикой.
     Возвращает raw-результат Upstash или None при ошибке.
     """
     if not cmd_parts:
@@ -176,6 +185,96 @@ def scan_keys(pattern: str = "*", count: int = 500) -> List[str]:
         if cursor in (0, "0", None):
             break
     return keys
+
+
+# ---------------------------------------------------------------------------
+# Публичный API: PipelineBatch (§13.4, §27.3) — пакетное исполнение команд
+# ---------------------------------------------------------------------------
+
+PIPELINE_BATCH_SIZE = int(os.getenv("GATEKEEPER_PIPELINE_BATCH_SIZE", "50"))
+PIPELINE_BATCH_DELAY = float(os.getenv("GATEKEEPER_PIPELINE_BATCH_DELAY", "0.15"))
+
+
+def _execute_upstash_pipeline(cmds: List[List[Any]], timeout: int = REDIS_TIMEOUT) -> Optional[Any]:
+    """
+    Пайплайн-вызов §13.4: массив команд одним REST-запросом к Upstash.
+    Возвращает список результатов или None при ошибке транспорта.
+    """
+    if not cmds:
+        return []
+    if not _check_circuit_breaker():
+        return None
+    redis_url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("SHARED_UPSTASH_REDIS_REST_URL")
+    redis_url = (redis_url or "").rstrip("/")
+    redis_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("SHARED_UPSTASH_REDIS_REST_TOKEN")
+    if not redis_url or not redis_token:
+        print("[CRITICAL ERROR] Конфигурация Upstash Redis не найдена в окружении!")
+        _trip_breaker()
+        return None
+    url = f"{redis_url}/"
+    try:
+        payload = json.dumps(cmds).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={
+            "Authorization": f"Bearer {redis_token}",
+            "Content-Type": "application/json",
+        })
+        req.method = "POST"
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res_json = json.loads(response.read().decode("utf-8"))
+            _reset_breaker_success()
+            return res_json.get("result")
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as e:
+        print(f"[REDIS PIPELINE ERROR] Пачка из {len(cmds)} команд не доставлена: {e}")
+        _trip_breaker()
+        return None
+    except Exception as e:
+        print(f"[REDIS PIPELINE ERROR] Необработанная ошибка пачки из {len(cmds)} команд: {e}")
+        _trip_breaker()
+        return None
+
+
+class PipelineBatch:
+    """
+    Пакетный исполнитель §13.4/§27.3: буфер команд, flush пачками по max_batch
+    одним REST-запросом. Счётчик commands_used учитывается в football_data:meta
+    (§12.6.1, §13.1). dry_run=True — команды только буферизуются, flush не отправляет.
+    """
+
+    def __init__(self, dry_run: bool = False,
+                 max_batch: int = PIPELINE_BATCH_SIZE,
+                 batch_delay: float = PIPELINE_BATCH_DELAY):
+        self.dry_run = dry_run
+        self.max_batch = max(1, int(max_batch))
+        self.batch_delay = batch_delay
+        self._ops: List[List[Any]] = []
+        self.commands_used = 0
+
+    def add(self, *cmd_parts: Any) -> None:
+        self._ops.append(list(cmd_parts))
+        if len(self._ops) >= self.max_batch:
+            self.flush()
+
+    def flush(self) -> int:
+        if not self._ops:
+            return 0
+        ops, self._ops = self._ops, []
+        if self.dry_run:
+            return 0
+        sent = 0
+        for i in range(0, len(ops), self.max_batch):
+            chunk = ops[i:i + self.max_batch]
+            res = _execute_upstash_pipeline(chunk)
+            if res is None:
+                # Деградация транспорта: поштучная доставка через защищённый транспорт
+                for cmd in chunk:
+                    if redis_command(cmd) is not None:
+                        sent += 1
+            else:
+                sent += len(chunk)
+            if self.batch_delay > 0:
+                time.sleep(self.batch_delay)
+        self.commands_used += sent
+        return sent
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +399,7 @@ def batch_get_from_cache(keys: List[str], chunk_size: int = HMGET_CHUNK_SIZE) ->
 
 
 # ---------------------------------------------------------------------------
-# Публичный API: Root-ключи истории history:match:* (§1.7d, уровень 1)
+# Публичный API: Root-ключи истории history:match:* (§1.7.4, уровень 1)
 # ---------------------------------------------------------------------------
 # Топология: history:match:{canonical_id} — самостоятельные ключи в корне Redis,
 # вне хэша GatekeeperAI. Физически недостижимы для цикла очистки live-хэша
@@ -319,24 +418,38 @@ def _make_envelope(data: Any) -> str:
     return json.dumps(envelope, ensure_ascii=False)
 
 
-def upsert_history_match(canonical_id: str, match_data: Dict[str, Any]) -> bool:
+def upsert_history_match(canonical_id: str, match_data: Dict[str, Any],
+                         force: bool = False) -> bool:
     """
-    Записывает архивный матч в Root-ключ history:match:{canonical_id}.
-    Существующий архив не перезаписывается без force=True — защита от потери
-    первичной архивной записи (overwite разрешён только явным флагом).
+    §23/§12.6.1: запись архивного матча в Root-ключ history:match:{canonical_id}.
+    Raw JSON без конверта (§13.1) — history-записи не оборачиваются в v700-prod.
+    force=False — идемпотентная запись (SET NX): существующий ключ не перезаписывается.
+    force=True — force-merge (§12.6.1): live-обогащение (source_ids, h2h, created_at)
+    сохраняется, CSV-производные поля перезаписываются.
     """
     if not canonical_id:
         return False
     key = f"{HISTORY_PREFIX}{canonical_id}"
-    return bool(redis_command(["SET", key, _make_envelope(match_data)]))
+    if not force:
+        res = redis_command(["SET", key, json.dumps(match_data, ensure_ascii=False), "NX"])
+        return bool(res == "OK")
+    existing = get_history_match(canonical_id)
+    if isinstance(existing, dict):
+        merged = dict(match_data)
+        for protected in ("source_ids", "h2h"):
+            existing_val = existing.get(protected)
+            if isinstance(existing_val, dict) and existing_val and not merged.get(protected):
+                merged[protected] = existing_val
+        if existing.get("created_at") and merged.get("created_at"):
+            merged["created_at"] = existing["created_at"]
+        merged["version"] = 1
+        return bool(redis_command(["SET", key, json.dumps(merged, ensure_ascii=False)]))
+    return bool(redis_command(["SET", key, json.dumps(match_data, ensure_ascii=False)]))
 
 
 def upsert_history_match_force(canonical_id: str, match_data: Dict[str, Any]) -> bool:
-    """Запись архивного матча с перезаписью (только для reconcile/migrate)."""
-    if not canonical_id:
-        return False
-    key = f"{HISTORY_PREFIX}{canonical_id}"
-    return bool(redis_command(["SET", key, _make_envelope(match_data)]))
+    """Тонкий алиас force-режима (§23). Обратная совместимость вызовов reconcile/migrate."""
+    return upsert_history_match(canonical_id, match_data, force=True)
 
 
 def history_match_exists(canonical_id: str) -> bool:
@@ -369,12 +482,12 @@ def get_history_count() -> int:
 
 def delete_history_match(canonical_id: str) -> bool:
     """
-    Деструктивное удаление Root-ключа истории — УРОВЕНЬ 3 ЗАЩИТЫ (§1.7d).
+    Деструктивное удаление Root-ключа истории — УРОВЕНЬ 3 ЗАЩИТЫ (§1.7.4).
     Выполняется только при HISTORY_FLUSH_CONFIRM=1 (ручной режим redis_diagnostics).
     """
     if os.environ.get("HISTORY_FLUSH_CONFIRM", "") != "1":
         print("[REDIS HISTORY GUARD] Удаление history:match:* заблокировано. "
-              "Для ручного flush задайте HISTORY_FLUSH_CONFIRM=1 (§1.7d, уровень 3)")
+              "Для ручного flush задайте HISTORY_FLUSH_CONFIRM=1 (§1.7.4, уровень 3)")
         return False
     key = f"{HISTORY_PREFIX}{canonical_id}"
     res = redis_command(["DEL", key])

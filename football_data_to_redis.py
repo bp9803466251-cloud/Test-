@@ -1,38 +1,32 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v7.0 (CSV) — ALL columns, GatekeeperAI v710
+Football-Data Collector v8.12-patched (CSV) — ALL columns, GatekeeperAI v710
 Источник: football-data.co.uk
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
 
-v7.0 (Phase 2):
-  - upsert_match() через хаб (не прямой SET) — match hub envelope
-  - source/sources в payload — хаб видит football_data
-  - idempotency_key — защита от дублей при повторном CI
-  - team_registry.clean_team_name — единый реестр (257+ алиасов)
-  - team_registry.build_canonical_id — единый canonical_id (257+ алиасов)
-  - gatekeeper_config.now_msk — единое MSK-время
-  - flush_meta после каждой лиги (не в конце) — crash-safe
-  - run_id из хаба — трассировка
+v8.12-patched (Шаг 13-B):
+  - Строгий импорт хаба (13-G1): без gatekeeper_hub прогон не стартует;
+    локальные fallback-реализации upsert/PipelineBatch удалены (§1.11)
+  - Плоский odds_1x2 с ключами "1"/"X"/"2" + closing-снапшоты odds_history
+    (Гейт 28, §1.21/§12.8)
+  - CLOSING_CASCADE: PPCH → MaxCH → AvgCH → B365CH → BWH → IWH → PSH (§12.8)
+  - source_map: types=["closing"], upstream="multi_bookmaker";
+    opening-колонки живут только в csv_raw (анти-leakage)
+  - predictions/value_analysis из payload удалены (§13.2)
+  - Дедупликация через GET history:match:{cid} + force-merge (§12.6.1)
+  - Индексы history:league/team/index:* — Root-ключи в том же PipelineBatch (R-5, R-7)
+  - Стоп-лосс COMMAND_SOFT_LIMIT (§13.4) + processed_files для дозагрузки
+  - Плоская football_data:meta через redis_hub (12-10, R-1); статус degraded (13-G1)
+  - --history-days с env HISTORY_DAYS (12-11)
 
-v6.3 (предыдущая):
-  - SET history:match:* (не HSET) — match hub get_key
-  - canonical_id: .replace(" ", "_") — match hub format
-  - Team SET keys: .replace(" ", "_") — match hub update_history_indexes
-  - save_meta: SET football_data:meta (не HSET) — match diagnostics get_key
-  - TEAM_ALIASES: ~130 алиасов — fallback
-  - download_csv: 3 попытки (2 retry) с backoff
-  - safe_float: return float (FIX-1)
-  - build_ou25: убран мёртвый параметр suffix
-  - Graceful shutdown через is_shutdown_requested()
-
-Schema: v710
-CSV:    120 колонок (opening + closing odds, O/U 2.5, Asian Handicap)
+Schema: v710 (Гейт 28)
+CSV:    120 колонок (opening + closing odds, O/U 2.5, Asian Handicap) — целиком в csv_raw
 Stats:  12 метрик + _source + _updated_at
-Odds:   1x2 (opening+closing per-bookmaker), O/U 2.5, Asian Handicap
-Raw:    ALL CSV columns stored in csv_raw{}
-Transport: gatekeeper_hub.upsert_match (единый транспортный слой через хаб)
+Transport: только gatekeeper_hub.upsert_match(mode="history") — §23
 """
+
+
 import argparse
 import csv
 import io
@@ -44,24 +38,23 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-
-# Единый транспортный слой — хаб
+# ─── Строгий импорт (13-G1): хаб обязателен, дублей записи нет (§1.11) ───
 try:
     from gatekeeper_hub import (
         upsert_match,
-        upsert_history_match,
         is_shutdown_requested,
         run_initialization,
         UPSTREAM_MAP,
     )
-    _HUB_AVAILABLE = True
-except ImportError:
-    _HUB_AVAILABLE = False
-    UPSTREAM_MAP = {}
+except ImportError as _hub_err:
+    print(f"[FATAL] gatekeeper_hub недоступен ({_hub_err}) — Strict Degradation Protocol "
+          "(13-G1): запись мимо доменного шлюза запрещена, прогон прерван.")
+    raise SystemExit(1)
 
 try:
     from gatekeeper_hub import register_module, log_event
 except ImportError:
+    # Только декоратор/логирование — не запись данных, fallback легален
     def register_module(name, **kwargs):
         def deco(func):
             return func
@@ -69,41 +62,7 @@ except ImportError:
     def log_event(source, level, message, **kwargs):
         pass
 
-    def upsert_match(payload, source=None, idempotency_key=None, dry_run=False):
-        """Fallback: прямой SET через redis_hub PipelineBatch."""
-        from redis_hub import PipelineBatch
-        if not hasattr(upsert_match, "_batch"):
-            upsert_match._batch = PipelineBatch(dry_run=dry_run, max_batch=50, batch_delay=0.15)
-        key = f"history:match:{payload['canonical_id']}"
-        upsert_match._batch.add("SET", key, json.dumps(payload, ensure_ascii=False))
-        # ZADD league index
-        try:
-            dt = datetime.fromisoformat(payload["date_utc"].replace("Z", "+00:00"))
-            score = dt.timestamp()
-        except (ValueError, TypeError):
-            score = 0
-        league_code = payload.get("league_code", "")
-        if league_code:
-            upsert_match._batch.add("ZADD", f"history:league:{league_code}",
-                                    str(score), payload["canonical_id"])
-        # SADD team indexes
-        home_clean = payload.get("home_clean", "").replace(" ", "_")
-        away_clean = payload.get("away_clean", "").replace(" ", "_")
-        if home_clean:
-            upsert_match._batch.add("SADD", f"history:team:{home_clean}",
-                                   payload["canonical_id"])
-        if away_clean:
-            upsert_match._batch.add("SADD", f"history:team:{away_clean}",
-                                   payload["canonical_id"])
-        upsert_match._batch.flush()
-        return True
-
-    def is_shutdown_requested():
-        return False
-
-    def run_initialization(collector=None):
-        from redis_hub import is_redis_available
-        return {"redis_available": is_redis_available(), "run_id": "fallback"}
+from redis_hub import PipelineBatch, is_redis_available
 
 # Единый реестр команд
 try:
@@ -119,44 +78,17 @@ try:
     _NOW_MSK_AVAILABLE = True
 except ImportError:
     _NOW_MSK_AVAILABLE = False
-
-# redis_hub для fallback и is_redis_available
-try:
-    from redis_hub import PipelineBatch, is_redis_available
-    _PIPELINE_BATCH_AVAILABLE = True
-except ImportError:
-    from redis_hub import is_redis_available
-    _PIPELINE_BATCH_AVAILABLE = False
-
-    class PipelineBatch:
-        """Fallback: simple batch using redis_hub.set_key."""
-        def __init__(self, dry_run=False, max_batch=50, batch_delay=0.15):
-            self.dry_run = dry_run
-            self._ops = []
-        def add(self, *args):
-            self._ops.append(args)
-        def flush(self):
-            from redis_hub import set_key as _sk
-            if self.dry_run:
-                self._ops.clear()
-                return
-            for op in self._ops:
-                if op[0] == "SET":
-                    _sk(op[1], op[2])
-            self._ops.clear()
-
 # ============================================================================
 # CONFIG
 # ============================================================================
 
-VERSION = "8.11-patched"
-__version__ = "8.11-patched"
+VERSION = "8.12-patched"
+__version__ = "8.12-patched"
 
 # FIX-3: Убран logging.basicConfig
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
-
 __all__ = [
     "FootballDataCollector",
     "PipelineBatch",
@@ -170,6 +102,21 @@ SCHEMA_VERSION = "v710"
 SOURCE_NAME = "football_data"
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
+# §12.8: closing-каскад PPCH → MaxCH → AvgCH → B365CH → BWH → IWH → PSH.
+# Порядок = приоритет; первый полный набор "1"/"X"/"2" становится odds_1x2.
+# IW/PS в CSV 2425+ отсутствуют (IW мёртв, PS → PP rebranded) — оставлены для legacy CSV.
+CLOSING_CASCADE = [
+    ("PPCH",   "PPCD",   "PPCA",   "pinnacle"),
+    ("MaxCH",  "MaxCD",  "MaxCA",  "market_max"),
+    ("AvgCH",  "AvgCD",  "AvgCA",  "market_avg"),
+    ("B365CH", "B365CD", "B365CA", "bet365"),
+    ("BWCH",   "BWCD",   "BWCA",   "bwin"),
+    ("IWCH",   "IWD",    "IWA",    "interwetten"),
+    ("PSCH",   "PSCD",   "PSCA",   "pinnacle"),
+]
+
+# §13.4: стоп-лосс — 90% суточного бюджета команд Upstash (10 000/день)
+COMMAND_SOFT_LIMIT = 9000
 
 LEAGUES = {
     "E0":  {"name": "Premier League",       "country": "England",    "division": 1},
@@ -195,17 +142,8 @@ LEAGUES = {
     "T1":  {"name": "Süper Lig",             "country": "Turkey",     "division": 1},
     "G1":  {"name": "Super League",          "country": "Greece",     "division": 1},
 }
-
 # Bookmaker prefixes for 1X2 odds (IW, VC, WH removed — dead in CSV 2425+)
 # PS → PP (Pinnacle rebranded prefix), BF → BFD (Betfair 3-letter prefix)
-BOOKMAKERS_1X2 = [
-    ("B365", "bet365"),
-    ("BW",   "bwin"),
-    ("PP",   "pinnacle"),
-    ("BFD",  "betfair"),
-]
-
-# Team name aliases — fallback если team_registry недоступен (130 алиасов)
 TEAM_ALIASES = {
     # Premier League
     "manchester united": "manchester united",
@@ -440,12 +378,6 @@ TEAM_ALIASES = {
     "heracles": "heracles",
     "heracles almelo": "heracles",
 }
-
-# Upstream из UPSTREAM_MAP хаба, не хардкод
-_FD_UPSTREAM = UPSTREAM_MAP.get("football_data", "bet365")
-_PINNACLE_UPSTREAM = UPSTREAM_MAP.get("propline", "pinnacle")
-
-
 # ============================================================================
 # HELPERS
 # ============================================================================
@@ -553,46 +485,14 @@ def safe_float(val):
     except (ValueError, TypeError):
         return None
 
-
-def build_price(row, h_key, d_key, a_key):
-    """Build {home, draw, away} from 3 CSV columns, or None."""
+def _price_1x2(row, h_key, d_key, a_key):
+    """Плоский вектор {"1", "X", "2"} из трёх CSV-колонок (Гейт 28, §1.21)."""
     h = safe_float(row.get(h_key, ""))
     d = safe_float(row.get(d_key, ""))
     a = safe_float(row.get(a_key, ""))
     if h and d and a:
-        return {"home": h, "draw": d, "away": a}
+        return {"1": h, "X": d, "2": a}
     return None
-
-
-def build_ou25(row, b365_prefix, p_prefix, max_prefix, avg_prefix):
-    """Build Over/Under 2.5 block."""
-    result = {}
-    for name, prefix in [("bet365", b365_prefix), ("pinnacle", p_prefix),
-                          ("max", max_prefix), ("avg", avg_prefix)]:
-        o = safe_float(row.get(f"{prefix}>2.5", ""))
-        u = safe_float(row.get(f"{prefix}<2.5", ""))
-        if o and u:
-            result[name] = {"over": o, "under": u}
-    return result if result else None
-
-
-def build_ah(row, suffix, b365_prefix, p_prefix, max_prefix, avg_prefix):
-    """Build Asian Handicap block."""
-    result = {}
-    if suffix == "C":
-        size_key = "AHCh"
-    else:
-        size_key = "AHh"
-    size = safe_float(row.get(size_key, ""))
-    if size:
-        result["size"] = size
-    for name, prefix in [("bet365", b365_prefix), ("pinnacle", p_prefix),
-                          ("max", max_prefix), ("avg", avg_prefix)]:
-        h = safe_float(row.get(f"{prefix}AHH", ""))
-        a = safe_float(row.get(f"{prefix}AHA", ""))
-        if h and a:
-            result[name] = {"home": h, "away": a}
-    return result if result else None
 
 
 def detect_flags(stats, score):
@@ -624,16 +524,16 @@ def build_stats(row, ts):
         "_source": SOURCE_NAME,
         "_updated_at": ts,
     }
-
-
 def build_source_map(ts):
+    """§12.8: source_map загрузчика. Заголовочный upstream — multi_bookmaker;
+    upstream по источнику колонки даёт каскад CLOSING_CASCADE.
+    Opening-колонки в структуру не идут — только csv_raw (анти-leakage)."""
     return {
         "odds": {
             "source": SOURCE_NAME,
-            "upstream": _FD_UPSTREAM,
+            "upstream": "multi_bookmaker",
             "timestamp": ts,
             "independent": True,
-            "type": "closing",
         },
         "stats": {
             "source": SOURCE_NAME,
@@ -641,8 +541,8 @@ def build_source_map(ts):
             "timestamp": ts,
             "independent": True,
         },
-        "types": ["opening", "closing"],
-        "sharp_benchmark": _PINNACLE_UPSTREAM,
+        "types": ["closing"],
+        "sharp_benchmark": "pinnacle",
         "soft_bookmakers": ["bet365", "bwin", "betfair"],
     }
 
@@ -658,104 +558,29 @@ def build_csv_raw(row):
             continue
         raw[k] = safe_str(val)
     return raw
-
-
-def build_odds_block(row, ts):
-    """Build comprehensive odds block: 1x2 (opening+closing), O/U 2.5, Asian Handicap.
-    Все коэффициенты — float (FIX-1)."""
-    opening_bm = {}
-    closing_bm = {}
-    for prefix, name in BOOKMAKERS_1X2:
-        op = build_price(row, f"{prefix}H", f"{prefix}D", f"{prefix}A")
-        if op:
-            opening_bm[name] = op
-        cl = build_price(row, f"{prefix}CH", f"{prefix}CD", f"{prefix}CA")
-        if cl:
-            closing_bm[name] = cl
-
-    max_opening = build_price(row, "MaxH", "MaxD", "MaxA")
-    avg_opening = build_price(row, "AvgH", "AvgD", "AvgA")
-    max_closing = build_price(row, "MaxCH", "MaxCD", "MaxCA")
-    avg_closing = build_price(row, "AvgCH", "AvgCD", "AvgCA")
-
-    ou25_opening = build_ou25(row, "B365", "PP", "Max", "Avg")
-    ou25_closing = build_ou25(row, "B365C", "PPC", "MaxC", "AvgC")
-
-    ah_opening = build_ah(row, "", "B365", "PP", "Max", "Avg")
-    ah_closing = build_ah(row, "C", "B365C", "PPC", "MaxC", "AvgC")
-
-    current = closing_bm.get("pinnacle") or max_closing
-    if not current and closing_bm:
-        current = list(closing_bm.values())[0]
-
-    opening = opening_bm.get("pinnacle") or max_opening
-    if not opening and opening_bm:
-        opening = list(opening_bm.values())[0]
-
-    best = max_closing or max_opening
-
-    # FIX-1: closing
-    closing = max_closing or closing_bm.get("pinnacle") or (list(closing_bm.values())[0] if closing_bm else None)
-
-    sources = []
-    if opening_bm.get("pinnacle"):
-        sources.append({"source": SOURCE_NAME, "upstream": _PINNACLE_UPSTREAM,
-                        "price": opening_bm["pinnacle"], "timestamp": ts, "type": "opening"})
-    if closing_bm.get("pinnacle"):
-        sources.append({"source": SOURCE_NAME, "upstream": _PINNACLE_UPSTREAM,
-                        "price": closing_bm["pinnacle"], "timestamp": ts, "type": "closing"})
-    if not sources and opening_bm.get("bet365"):
-        sources.append({"source": SOURCE_NAME, "upstream": _FD_UPSTREAM,
-                        "price": opening_bm["bet365"], "timestamp": ts, "type": "opening"})
-    if not sources and closing_bm.get("bet365"):
-        sources.append({"source": SOURCE_NAME, "upstream": _FD_UPSTREAM,
-                        "price": closing_bm["bet365"], "timestamp": ts, "type": "closing"})
-
+def build_odds_flat(row, ts):
+    """§12.8: плоский odds_1x2 по closing-каскаду + снапшоты odds_history.
+    Возвращает (odds_1x2, snapshots). Дедупликация снапшотов по {upstream, type} (12-7)."""
     odds_1x2 = {}
-    if current:
-        odds_1x2["current"] = current
-    if opening:
-        odds_1x2["opening"] = opening
-    if best:
-        odds_1x2["best"] = best
-    if closing:
-        odds_1x2["closing"] = closing
-    if sources:
-        odds_1x2["sources"] = sources
-    if opening_bm:
-        odds_1x2["bookmakers_opening"] = opening_bm
-    if closing_bm:
-        odds_1x2["bookmakers_closing"] = closing_bm
-    if max_opening:
-        odds_1x2["max_opening"] = max_opening
-    if avg_opening:
-        odds_1x2["avg_opening"] = avg_opening
-    if max_closing:
-        odds_1x2["max_closing"] = max_closing
-    if avg_closing:
-        odds_1x2["avg_closing"] = avg_closing
-
-    odds_block = {}
-    if odds_1x2:
-        odds_block["1x2"] = odds_1x2
-
-    if ou25_opening or ou25_closing:
-        ou25 = {}
-        if ou25_opening:
-            ou25["opening"] = ou25_opening
-        if ou25_closing:
-            ou25["closing"] = ou25_closing
-        odds_block["over_under_25"] = ou25
-
-    if ah_opening or ah_closing:
-        ah = {}
-        if ah_opening:
-            ah["opening"] = ah_opening
-        if ah_closing:
-            ah["closing"] = ah_closing
-        odds_block["asian_handicap"] = ah
-
-    return odds_block
+    snapshots = []
+    seen_upstream = set()
+    for h_key, d_key, a_key, upstream in CLOSING_CASCADE:
+        price = _price_1x2(row, h_key, d_key, a_key)
+        if not price:
+            continue
+        if not odds_1x2:
+            odds_1x2 = price  # первый полный набор каскада = наивысший приоритет
+        if upstream in seen_upstream:
+            continue
+        snapshots.append({
+            "source": SOURCE_NAME,
+            "upstream": upstream,
+            "price": price,
+            "timestamp": ts,
+            "type": "closing",
+        })
+        seen_upstream.add(upstream)
+    return odds_1x2, snapshots
 
 
 def build_payload(row, season, league_code, run_id=None):
@@ -783,7 +608,7 @@ def build_payload(row, season, league_code, run_id=None):
     ts = now_iso()
 
     stats = build_stats(row, ts)
-    odds_block = build_odds_block(row, ts)
+    odds_1x2, odds_snapshots = build_odds_flat(row, ts)
     source_map = build_source_map(ts)
     csv_raw = build_csv_raw(row)
 
@@ -816,9 +641,9 @@ def build_payload(row, season, league_code, run_id=None):
         "schema_version": SCHEMA_VERSION,
         "source": SOURCE_NAME,
         "sources": [SOURCE_NAME],
-        "odds": odds_block,
-        "predictions": {},
-        "value_analysis": {},
+        "odds_1x2": odds_1x2,
+        "odds_history": odds_snapshots,
+        "source_ids": {"football_data": f"csv_{season}_{league_code}"},
         "h2h": {},
         "stats": stats,
         "source_map": source_map,
@@ -829,21 +654,52 @@ def build_payload(row, season, league_code, run_id=None):
     }
 
     return payload
-
-
 # ============================================================================
 # COLLECTOR
 # ============================================================================
 
 class FootballDataCollector:
+    """CSV-загрузчик §13: запись только через gatekeeper_hub.upsert_match(mode="history").
+    13-G1: Strict Degradation Protocol; 13-G2: batch-режим PipelineBatch."""
+
     def __init__(self, dry_run=False, run_id=None):
         self.dry_run = dry_run
         self.run_id = run_id or "manual"
         self.matches_processed = 0
         self.errors = 0
         self.skipped = 0
-        self._meta_entries = {}
-        self._batch = PipelineBatch(dry_run=dry_run, max_batch=50, batch_delay=0.15) if (not _HUB_AVAILABLE and _PIPELINE_BATCH_AVAILABLE) else None
+        self.skipped_past = 0
+        self.skipped_future = 0
+        self.written = 0
+        self.deduped = 0
+        self.collision_warnings = 0
+        self.alias_misses = 0
+        self._manual_commands = 0      # GET/SET вне батча (дедуп, meta)
+        self._batch = PipelineBatch(dry_run=dry_run, max_batch=50, batch_delay=0.15)
+        self._meta_fields = {}
+        self.processed_files = self._load_processed_files()
+
+    def _load_processed_files(self):
+        """processed_files из football_data:meta (§13.4) — 1 GET на прогон."""
+        if self.dry_run:
+            return []
+        try:
+            from redis_hub import redis_command
+            raw = redis_command(["GET", "football_data:meta"])
+            self._manual_commands += 1
+            if raw:
+                meta = json.loads(raw) if isinstance(raw, str) else {}
+                pf = meta.get("processed_files", [])
+                if isinstance(pf, list):
+                    return list(pf)
+        except Exception as e:
+            logger.warning(f"processed_files не загружены: {e}")
+        return []
+
+    @property
+    def commands_used(self):
+        """Суммарный расход команд §13.4: батч + одиночные GET/SET."""
+        return self._batch.commands_used + self._manual_commands
 
     def download_csv(self, season, league_code):
         """Download CSV for a season+league from football-data.co.uk. 3 попытки."""
@@ -882,19 +738,22 @@ class FootballDataCollector:
         path = os.path.join(archive_dir, f"{season}_{league_code}.csv")
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-
     def process_csv(self, csv_content, season, league_code, limit=0, history_days=0):
-        """Parse CSV and write matches to Redis through gatekeeper_hub.upsert_match.
-        v7.0: через хаб (не прямой SET), с idempotency_key."""
+        """Парсинг CSV и запись через хаб. §13.4: дедуп, стоп-лосс, счётчики, индексы в батч."""
         reader = csv.DictReader(io.StringIO(csv_content))
         count = 0
         now = datetime.now(timezone.utc)
+        file_key = f"{season}_{league_code}"
+        file_done = file_key in set(self.processed_files)
 
         for row in reader:
             if is_shutdown_requested():
                 logger.info("    [SHUTDOWN] Graceful shutdown — прерываем CSV-обработку")
                 break
             if limit and count >= limit:
+                break
+            if not self.dry_run and self.commands_used >= COMMAND_SOFT_LIMIT:
+                logger.warning("[STOP-LOSS §13.4] 90% дневного бюджета команд — финализация прогона")
                 break
 
             try:
@@ -907,112 +766,158 @@ class FootballDataCollector:
             if payload is None:
                 self.skipped += 1
                 continue
-
-            # History filter
-            if history_days > 0:
-                try:
-                    match_dt = datetime.fromisoformat(
-                        payload["date_utc"].replace("Z", "+00:00")
-                    )
-                    if (now - match_dt).days > history_days:
-                        self.skipped += 1
-                        continue
-                except (ValueError, TypeError):
-                    pass
-
-            # v7.0: idempotency_key — защита от дублей при повторном CI
-            idempotency_key = f"{self.run_id}:{payload['canonical_id']}"
-
-            # v7.0: Запись через хаб (upsert_match), не прямой SET
-            try:
-                if _HUB_AVAILABLE:
-                    upsert_history_match(payload["canonical_id"], payload)
-                else:
-                    upsert_match(
-                        payload,
-                        source=SOURCE_NAME,
-                        idempotency_key=idempotency_key,
-                        dry_run=self.dry_run,
-                    )
-            except Exception as e:
-                self.errors += 1
-                logger.error(f"Write error: {e}")
+            if not payload.get("full_time_result"):
+                self.skipped += 1
                 continue
 
+            # Фильтр глубины (§23): прошедшие записываются, будущие отклоняются
+            match_dt = None
+            if history_days > 0:
+                try:
+                    match_dt = datetime.fromisoformat(payload["date_utc"].replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    self.skipped += 1
+                    continue
+                if match_dt >= now:
+                    self.skipped_future += 1
+                    continue
+                if (now - match_dt).days > history_days:
+                    self.skipped_past += 1
+                    continue
+
+            cid = payload["canonical_id"]
+
+            # Дедуп: GET существующей записи — и существование, и protected-поля одной командой
+            existing = None
+            if not self.dry_run:
+                from redis_hub import get_history_match
+                existing = get_history_match(cid)
+                self._manual_commands += 1
+            if isinstance(existing, dict):
+                if file_done:
+                    self.deduped += 1
+                    continue
+                self.collision_warnings += 1
+                logger.warning(f"    [COLLISION] {cid}: запись вне processed_files — force-merge (§12.6.1)")
+                ex_ids = existing.get("source_ids")
+                if isinstance(ex_ids, dict) and ex_ids:
+                    payload["source_ids"] = {**ex_ids, **(payload.get("source_ids") or {})}
+                ex_h2h = existing.get("h2h")
+                if isinstance(ex_h2h, dict) and ex_h2h:
+                    payload["h2h"] = ex_h2h
+                if existing.get("created_at"):
+                    payload["created_at"] = existing["created_at"]
+
+            if not self.dry_run:
+                try:
+                    # §23/13-G2: запись через доменный шлюз; batch — пакетно; merge — до вызова
+                    result = upsert_match(
+                        payload["home_team"], payload["away_team"], payload["date_utc"],
+                        competition=payload["competition"], country=payload["country"],
+                        status=payload["status"], source=SOURCE_NAME,
+                        mode="history", force=True, batch=self._batch,
+                        **{k: v for k, v in payload.items()
+                           if k not in ("canonical_id", "home_team", "away_team", "date_utc",
+                                        "competition", "country", "status", "source")},
+                    )
+                    if not result:
+                        self.errors += 1
+                        continue
+                except Exception as e:
+                    self.errors += 1
+                    logger.error(f"Write error {cid}: {e}")
+                    continue
+
+            self.written += 1
             count += 1
             self.matches_processed += 1
+
+            # Индексы — Root-ключи через тот же batch (§13.1, R-5/R-7)
+            score = "0"
+            try:
+                dt = match_dt or datetime.fromisoformat(payload["date_utc"].replace("Z", "+00:00"))
+                score = str(dt.timestamp())
+            except (ValueError, TypeError):
+                pass
+            cid_written = result.get("canonical_id") if isinstance(result, dict) else None
+            cid_key = cid_written or cid  # canonical_id строит хаб (H-6)
+            league_val = payload.get("league_code", "")
+            if league_val:
+                self._batch.add("ZADD", f"history:league:{league_val}", score, cid_key)
+            if payload.get("home_clean"):
+                self._batch.add("SADD", f"history:team:{payload['home_clean'].replace(' ', '_')}", cid_key)
+            if payload.get("away_clean"):
+                self._batch.add("SADD", f"history:team:{payload['away_clean'].replace(' ', '_')}", cid_key)
+            day = payload["date_utc"][:10].replace("-", "")
+            if day:
+                self._batch.add("RPUSH", f"history:index:{day}", cid_key)
 
         return count
 
     def save_meta(self, season, league_code, matches, errors):
-        """Save metadata about this run. v7.0: пишется после каждой лиги (crash-safe)."""
+        """Плоская football_data:meta (12-10, §13.1) — flush после каждой лиги (crash-safe)."""
         ts = now_iso()
-        field = f"{season}_{league_code}"
-        meta = {
-            "season": season,
-            "league_code": league_code,
-            "matches": matches,
-            "stored_matches": matches,
-            "errors": errors,
-            "error_count": errors,
+        self._meta_fields.update({
             "last_run": ts,
-            "last_run_at": ts,
             "version": VERSION,
             "schema_version": SCHEMA_VERSION,
             "run_id": self.run_id,
-        }
-        self._meta_entries[field] = meta
-        # v7.0: flush_meta после каждой лиги (не в конце) — crash-safe
+            "last_league": f"{season}_{league_code}",
+            "error_count": self.errors,
+            "total_events": self.matches_processed + self.deduped + self.skipped
+                            + self.skipped_past + self.skipped_future,
+            "stored_matches": self.matches_processed,
+            "skipped_past": self.skipped_past,
+            "skipped_future": self.skipped_future,
+            "deduped": self.deduped,
+            "written": self.written,
+            "commands_used": self.commands_used,
+            "collision_warnings": self.collision_warnings,
+            "alias_misses": self.alias_misses,
+        })
+        if season and league_code:
+            file_key = f"{season}_{league_code}"
+            pf = self._meta_fields.setdefault("processed_files", [])
+            if file_key not in pf:
+                pf.append(file_key)
+        # 13-G1: тихий пустой прогон фиксируется как degraded
+        if (self.written == 0 and self.deduped == 0 and self.skipped == 0
+                and self.skipped_past == 0 and self.skipped_future == 0 and self.errors == 0):
+            self._meta_fields["status"] = "degraded"
         self._flush_meta()
 
     def _flush_meta(self):
-        """Write accumulated meta. v7.0: вызывается после каждой лиги (crash-safe).
-        FIX §1.27: merge с существующей meta — не перезаписывать предыдущие запуски."""
-        if not self._meta_entries:
+        """Merge-перезапись Root-ключа football_data:meta (R-1: через redis_hub, не live-хэш)."""
+        if self.dry_run or not self._meta_fields:
             return
-        key = "football_data:meta"
-
-        if _HUB_AVAILABLE:
-            try:
-                from gatekeeper_hub import save_to_cache as _hub_save_cache
-                from gatekeeper_hub import get_from_cache as _hub_get_cache
-                # §1.27 FIX: читаем существующую meta, мерджим новые записи
-                existing = _hub_get_cache(key) or {}
-                if not isinstance(existing, dict):
-                    existing = {}
-                existing.update(self._meta_entries)
-                _hub_save_cache(key, existing)
-            except Exception:
-                # Fallback на прямой SET через redis_hub
+        try:
+            from redis_hub import redis_command
+            existing = {}
+            raw = redis_command(["GET", "football_data:meta"])
+            self._manual_commands += 1
+            if raw:
                 try:
-                    from redis_hub import get_key, set_key
-                    existing_raw = get_key(key) if not self.dry_run else None
-                    existing = json.loads(existing_raw) if existing_raw else {}
-                    if not isinstance(existing, dict):
-                        existing = {}
-                    existing.update(self._meta_entries)
-                    if not self.dry_run:
-                        set_key(key, json.dumps(existing, ensure_ascii=False))
-                except Exception as e:
-                    logger.error(f"flush_meta fallback failed: {e}")
-        else:
-            try:
-                from redis_hub import get_key, set_key
-                existing_raw = get_key(key) if not self.dry_run else None
-                existing = json.loads(existing_raw) if existing_raw else {}
-                if not isinstance(existing, dict):
+                    existing = json.loads(raw) if isinstance(raw, str) else {}
+                except json.JSONDecodeError:
+                    logger.warning("football_data:meta повреждён — перезаписывается новой мета")
                     existing = {}
-                existing.update(self._meta_entries)
-                if not self.dry_run:
-                    set_key(key, json.dumps(existing, ensure_ascii=False))
-            except Exception as e:
-                logger.error(f"flush_meta failed: {e}")
+            if not isinstance(existing, dict):
+                existing = {}
+            merged = {**existing, **self._meta_fields}
+            merged["processed_files"] = sorted(set(
+                (existing.get("processed_files") or [])
+                + (self._meta_fields.get("processed_files") or [])
+            ))
+            res = redis_command(["SET", "football_data:meta", json.dumps(merged, ensure_ascii=False)])
+            self._manual_commands += 1
+            if res is None:
+                logger.error("flush_meta: SET не доставлен")
+        except Exception as e:
+            logger.error(f"flush_meta failed: {e}")
 
     def flush_remaining(self):
-        """Финальный flush для fallback batch."""
-        if self._batch:
-            self._batch.flush()
-
+        """Финальный flush PipelineBatch (§13.4)."""
+        self._batch.flush()
 
 # ============================================================================
 # COLLECT_AND_PROCESS — единая точка входа для CI/CD
@@ -1080,11 +985,16 @@ def collect_and_process(seasons: str = "", leagues: str = "",
         "total_errors": total_errors,
         "collector_errors": collector.errors,
         "skipped": collector.skipped,
+        "skipped_past": collector.skipped_past,
+        "skipped_future": collector.skipped_future,
+        "written": collector.written,
+        "deduped": collector.deduped,
+        "collision_warnings": collector.collision_warnings,
+        "commands_used": collector.commands_used,
+        "processed_files": collector.processed_files,
         "dry_run": dry_run,
         "run_id": run_id,
     }
-
-
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1094,8 +1004,9 @@ def main():
     parser.add_argument("--seasons", default="", help="Seasons comma-separated (e.g. 2425,2526)")
     parser.add_argument("--leagues", default="", help="League codes (empty = all 22)")
     parser.add_argument("--limit", type=int, default=0, help="Max matches per league (0 = all)")
-    parser.add_argument("--history-days", type=int, default=0,
-                        help="Only matches within N days (0 = all)")
+    parser.add_argument("--history-days", type=int,
+                        default=int(os.getenv("HISTORY_DAYS", "0")),
+                        help="Только матчи в пределах N дней (0 = весь CSV; 12-11)")
     parser.add_argument("--dry-run", action="store_true", help="Don't write to Redis")
     args = parser.parse_args()
 
@@ -1105,7 +1016,7 @@ def main():
     logger.info(f"  Leagues: {args.leagues or 'all 22'}")
     logger.info(f"  Limit: {args.limit or 'none'}")
     logger.info(f"  History days: {args.history_days or 'all'}")
-    logger.info(f"  Hub: {'available' if _HUB_AVAILABLE else 'fallback (direct redis_hub)'}")
+    logger.info("  Hub: strict mode (13-G1) — запись только через gatekeeper_hub")
     logger.info(f"  Registry: {'available' if _REGISTRY_AVAILABLE else 'fallback (local TEAM_ALIASES)'}")
 
     # Инициализация хаба
@@ -1171,11 +1082,14 @@ def main():
 
     collector.flush_remaining()
 
-    logger.info(f"\n=== DONE ===")
     logger.info(f"  Total matches: {total_matches}")
-    logger.error(f"  Total errors: {total_errors}")
-    logger.error(f"  Collector errors: {collector.errors}")
+    logger.info(f"  Total download errors: {total_errors}")
+    logger.info(f"  Collector errors: {collector.errors}")
     logger.info(f"  Skipped (invalid/old): {collector.skipped}")
+    logger.info(f"  Skipped past: {collector.skipped_past}, skipped future: {collector.skipped_future}")
+    logger.info(f"  Written: {collector.written}, deduped: {collector.deduped}")
+    logger.info(f"  Collision warnings: {collector.collision_warnings}")
+    logger.info(f"  Commands used: {collector.commands_used}")
     if args.dry_run:
         logger.info(f"  (dry-run: nothing written to Redis)")
 
