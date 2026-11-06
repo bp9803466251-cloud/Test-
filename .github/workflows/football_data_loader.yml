@@ -25,7 +25,7 @@ on:
         required: false
         default: false
       flush:
-        description: 'Очистить старые ключи перед загрузкой'
+        description: 'Очистить football_data:* (meta/артефакты) перед загрузкой'
         type: boolean
         required: false
         default: false
@@ -34,7 +34,6 @@ env:
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: "1"
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
-
 
 permissions:
   contents: read
@@ -46,12 +45,13 @@ concurrency:
 jobs:
   load:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       SEASONS_INPUT: ${{ github.event.inputs.seasons || '' }}
       LEAGUES_INPUT: ${{ github.event.inputs.leagues || '' }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days || '0' }}
+      HISTORY_DAYS: ${{ github.event.inputs.history_days || '0' }}
       LIMIT_INPUT: ${{ github.event.inputs.limit || '0' }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
       FLUSH_INPUT: ${{ github.event.inputs.flush || 'false' }}
@@ -61,7 +61,6 @@ jobs:
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || '' }}
-      FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY || '' }}
 
     steps:
       - name: Checkout
@@ -78,10 +77,21 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Flush old keys (optional)
+      - name: Memory precheck (§13.4, 12-9a)
+        run: |
+          if [ -f redis_diagnostics.py ]; then
+            python redis_diagnostics.py --memory-check --min-free-mb 1.5 || {
+              echo "::error::Free memory below 1.5 MB — abort before load (§13.4 stop-loss protection)"
+              exit 1
+            }
+          else
+            echo "::warning::redis_diagnostics.py not found — memory precheck skipped"
+          fi
+
+      - name: Flush football_data keys (optional)
         if: ${{ github.event.inputs.flush == 'true' }}
         run: |
-          echo "Flushing football_data:* keys..."
+          echo "Flushing football_data:* keys (meta and artifacts only; history:match:* protected by level 3, §1.7d)..."
           python -c "
           import os, json, urllib.request
           URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '').rstrip('/')
@@ -102,23 +112,19 @@ jobs:
               )
               with urllib.request.urlopen(req, timeout=30) as r:
                   return json.loads(r.read()).get('result')
-          patterns = ['football_data:*']
-          total_deleted = 0
-          for pattern in patterns:
-              cursor = '0'
-              deleted = 0
-              while True:
-                  result = cmd('SCAN', cursor, 'MATCH', pattern, 'COUNT', 100)
-                  cursor = result[0]
-                  keys = result[1]
-                  if keys:
-                      cmd('DEL', *keys)
-                      deleted += len(keys)
-                  if cursor == '0':
-                      break
-              print(f'  {pattern}: flushed {deleted} keys')
-              total_deleted += deleted
-          print(f'Total flushed: {total_deleted} keys')
+          pattern = 'football_data:*'
+          cursor = '0'
+          deleted = 0
+          while True:
+              result = cmd('SCAN', cursor, 'MATCH', pattern, 'COUNT', 100)
+              cursor = result[0]
+              keys = result[1]
+              if keys:
+                  cmd('DEL', *keys)
+                  deleted += len(keys)
+              if cursor in (0, '0', None):
+                  break
+          print(f'  {pattern}: flushed {deleted} keys')
           "
 
       - name: Run Football Data Collector
@@ -140,7 +146,6 @@ jobs:
         run: |
           python -c "
           import os, json, urllib.request, sys
-          from datetime import datetime, timezone
 
           URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '') or os.environ.get('UPSTASH_REDIS_REST_URL', '')
           URL = URL.rstrip('/')
@@ -171,6 +176,23 @@ jobs:
               print('FATAL: Redis unavailable')
               sys.exit(1)
 
+          # football_data:meta — Root-ключ (R-1), читаем GET и печатаем телеметрию 12-10
+          raw = cmd('GET', 'football_data:meta')
+          if raw:
+              try:
+                  meta = json.loads(raw) if isinstance(raw, str) else {}
+                  print('--- football_data:meta ---')
+                  for k in ('last_run', 'status', 'written', 'deduped', 'skipped_past',
+                            'skipped_future', 'collision_warnings', 'alias_misses',
+                            'commands_used', 'stored_matches', 'total_events',
+                            'processed_files'):
+                      if k in meta:
+                          print(f'  {k}: {meta[k]}')
+              except (json.JSONDecodeError, TypeError):
+                  print('WARN: football_data:meta damaged or not JSON')
+          else:
+              print('INFO: football_data:meta not found (fresh state or dry-run)')
+
           print('=== Verify Done ===')
           "
 
@@ -195,4 +217,3 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}"
-            
