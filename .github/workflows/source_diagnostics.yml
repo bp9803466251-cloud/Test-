@@ -1,13 +1,14 @@
 name: Source Diagnostics
-# [MERGE 10.0.0] Единый диагностический воркфлоу: поглощает check_redis.yml,
-# redis_diagnostics.yml, diagnostic_matches.yml (match_dump), redis_flush read-режимы.
-# Режимы ядра: full|redis|sources|matches|indexes|errors|sample|propline|keys|history-contracts|memory
 
+# [10.0.0-merged] Единый диагностический воркфлоу. Заменяет шесть:
+#   check_redis.yml, redis_diagnostics.yml (старый), match_dump.yml,
+#   а также исторические ветки verify_history и скан-модуля ключей загрузчиков.
+# Модуль: source_diagnostics.py (read-only ядро, 11 режимов).
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Режим диагностики ядра'
+        description: 'Режим: full, redis, sources, matches, indexes, errors, sample, propline, keys, history-contracts, memory'
         required: false
         type: choice
         options:
@@ -24,23 +25,22 @@ on:
           - memory
         default: full
       min_free_mb:
-        description: 'Минимум свободной памяти для memory-режима (§13.4)'
+        description: 'Порог свободной памяти для режима memory (МБ, §13.4)'
         required: false
-        type: string
-        default: ''
+        default: '512'
 
 permissions:
-  contents: read # Least privilege по правилу §1.10
+  contents: read
 
-# [MERGE 10.0.0] Каноническая группа §16.4 — одна очередь для всей read-only диагностики
-# (ранее: gatekeeper-diagnostics / redis-diagnostics / source-diagnostics / match_dump)
+# §16.4: каноническая группа диагностики — все read-only прогоны в одной очереди
 concurrency:
   group: gatekeeper-diagnostics
   cancel-in-progress: false
 
 env:
-  # [MERGE 10.0.0] 3.11: канон §1.10 (аннотации "3.12: синхрон с 9.6.8" не подтверждались
-  # содержанием цикла — матрица с 3.12 им как раз удалялась; honest green получен на 3.11)
+  # [10.0.0] §1.10: единый интерпретатор по репозиторию — 3.11.
+  # Аннотации «3.12: синхрон с патч-циклом 9.6.8» не подтверждаются содержанием
+  # цикла (он матрицу с 3.12 удалял) — см. guide-delta.
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
@@ -48,9 +48,11 @@ env:
 jobs:
   diagnostic:
     runs-on: ubuntu-latest
-    # [MERGE 10.0.0] 5 минут по §1.10: ядро на stdlib, pip install убран
-    # (аргумент "numpy/scipy съедает 5 минут" относился к старым YML с requirements)
-    timeout-minutes: 5
+    # [10.0.0] §1.10 «диагностика — 5 минут» с документированным исключением:
+    # строгий импорт ядра тянет redis_hub/gatekeeper_hub, чья поверхность зависимостей
+    # требует requirements.txt (numpy/scipy ~1-2 мин установки). Исключение зафиксировано
+    # в guide-delta; после изоляции зависимостей хабов порог возвращается к 5.
+    timeout-minutes: 15
 
     env:
       # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
@@ -70,57 +72,43 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          # [MERGE 10.0.0] cache: pip убран — pip-установок в воркфлоу нет
+          cache: pip
 
-      - name: Validate mode
+      - name: Install Core Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Diagnostics
         env:
-          # [9.6.8 FIX, перенесено] type: choice НЕ валидируется сервером при запуске
-          # через API — произвольная строка доходит до скрипта как есть; чтение из env
+          # [FIXED 9.6.8, сохранён] Инъекция закрыта: ручной ввод интерполируется
+          # только в env-блок; type: choice не валидируется при запуске через API
           DIAG_MODE: ${{ github.event.inputs.mode || 'full' }}
-          DIAG_MIN_FREE_MB: ${{ github.event.inputs.min_free_mb || '' }}
+          DIAG_MIN_FREE_MB: ${{ github.event.inputs.min_free_mb || '512' }}
         run: |
           case "$DIAG_MODE" in
             full|redis|sources|matches|indexes|errors|sample|propline|keys|history-contracts|memory)
               ;;
             *)
-              echo "⚠ Неизвестный режим '$DIAG_MODE' — откат на full"
+              echo "⚠ Неизвестный режим '$DIAG_MODE' - откат на full"
               DIAG_MODE=full
               ;;
           esac
-          echo "FLUSH_MODE_NOT_USED=true" > /dev/null  # no-op: явный маркер read-only прогона
-          echo "DIAG_MODE=$DIAG_MODE" >> "$GITHUB_ENV"
-          echo "DIAG_MIN_FREE_MB=$DIAG_MIN_FREE_MB" >> "$GITHUB_ENV"
           echo "Mode: $DIAG_MODE"
-
-      - name: Run diagnostics (stdlib only, no pip install)
-        run: |
-          # [MERGE 10.0.0] Строгий импорт 13-G1: отсутствие хабов — осознанный exit 1
-          if [ -n "$DIAG_MIN_FREE_MB" ] && [ "$DIAG_MODE" = "memory" ]; then
-            python -u source_diagnostics.py --mode memory --min-free-mb "$DIAG_MIN_FREE_MB"
-          elif [ "$DIAG_MODE" = "full" ]; then
-            python -u source_diagnostics.py
+          if [ "$DIAG_MODE" = "memory" ]; then
+            python -u source_diagnostics.py --mode "$DIAG_MODE" --min-free-mb "$DIAG_MIN_FREE_MB"
           else
             python -u source_diagnostics.py --mode "$DIAG_MODE"
           fi
-
-      - name: Summary
-        if: always()
-        env:
-          MODE: ${{ github.event.inputs.mode || 'full' }}
-        run: |
-          echo "=== Source Diagnostics Summary (merged v10.0.0) ==="
-          echo "Mode: $MODE"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Telegram alert on failure
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
-          DIAG_MODE: ${{ env.DIAG_MODE }}
+          DIAG_MODE: ${{ github.event.inputs.mode || 'full' }}
         run: |
-          # [9.6.8 FIX, перенесено] Убран || true: отказ доставки алерта виден в логе.
+          # [FIXED] Убран || true: отказ доставки алерта должен быть виден в логе.
           # curl — системная утилита раннера, §1.3 регулирует Python-код пакета.
           MSG="❌ <b>Source Diagnostics FAILED</b>%0AMode: ${DIAG_MODE}%0ARun: ${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \

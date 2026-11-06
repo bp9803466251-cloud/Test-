@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12' # [FIXED] 3.11 -> 3.12: синхрон с Dockerfile (python:3.12-slim), арбитраж 10.0.0
   PYTHONUNBUFFERED: '1'
 
 jobs:
@@ -24,6 +24,8 @@ jobs:
     env:
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }} # [FIXED] Добавлено среднее звено лестницы приоритетов §1.10
+      SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       GATEKEEPER_ENV: production
@@ -44,5 +46,6 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Match Linker
-        run: python match_linker.py
-        
+        # [10.0.0 DECISION] Дашборд — за пайплайном (он шлёт сводку сам).
+        # Standalone-прогон работает без дублирующей отправки.
+        run: python match_linker.py --no-dashboard

@@ -1,6 +1,9 @@
 name: Team Registry Tests
 
 # §1.2: workflow_dispatch only, no push/pull_request triggers
+# [FIXED 10.0.0] Матрица сведена к единому Python по вердикту арбитража:
+# CI-версия = рантайм-версия (Dockerfile python:3.12-slim-bookworm).
+# Формулировка "единый Python 3.11" (§1.10 цикла 9.6.8) отозвана.
 on:
   workflow_dispatch:
 
@@ -13,7 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12'
   PYTHONUNBUFFERED: '1'
 
 jobs:
@@ -35,8 +38,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Принудительно разворачиваем математическое ядро, используемое в контрактах
-          pip install numpy scipy jsonschema
+          # [REMOVED 10.0.0] Принудительный "pip install numpy scipy jsonschema" без пинов:
+          # дублирует requirements.txt (numpy<2.0.0, scipy<1.14, jsonschema<5.0).
+          # Паттерн синхронизирован с fix sports_pipeline.yml цикла 9.6.8.
 
       - name: Check Compiler Syntax
         run: |

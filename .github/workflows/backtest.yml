@@ -35,8 +35,11 @@ concurrency:
   group: gatekeeper-pipeline
   cancel-in-progress: false
 
+# [FIXED 10.0.0] 3.11 -> 3.12: вердикт арбитража цикла консолидации —
+# CI-версия = рантайм-версия (Dockerfile python:3.12-slim-bookworm). Прежний
+# "канон 3.11" отозван: он опирался на устаревшую формулировку README §1.10.
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12'
   PYTHONUNBUFFERED: '1'
   GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # Единая системная константа конфигурации
 
@@ -48,6 +51,10 @@ jobs:
     env:
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      # [FIXED 10.0.0] Среднее звено лестницы §1.10 (SHARED_REDIS_REST_*) —
+      # прежде отсутствовало, как и в match_dump.yml до цикла 9.6.8
+      SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+      SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       GATEKEEPER_ENV: backtest
@@ -66,7 +73,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install numpy scipy pyyaml
+          # [REMOVED 10.0.0] Принудительный "pip install numpy scipy pyyaml" без пинов:
+          # дублирует requirements.txt и может поднять numpy 2.x при его отсутствии.
+          # Паттерн синхронизирован с fix sports_pipeline.yml цикла 9.6.8.
 
       - name: Run backtest
         run: |

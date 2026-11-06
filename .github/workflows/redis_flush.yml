@@ -1,5 +1,8 @@
 name: Redis Flush
 
+# WRITE-контур Redis (деструктивное обслуживание). Не входит в диагностику:
+# отдельная группа redis-flush — write-операция не должна стоять в очереди
+# за read-only прогонами (§16.4, решение аудита 10.0.0).
 on:
   workflow_dispatch:
     inputs:
@@ -32,11 +35,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: redis-flush # [KEEP] Собственная группа была корректна — сохранена
+  group: redis-flush
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.12' # [FIXED] 3.11 -> 3.12: синхрон с патч-циклом 9.6.8
+  # [10.0.0] §1.10: единый интерпретатор — 3.11 (канон, см. guide-delta)
+  PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
 
 jobs:
@@ -45,18 +49,15 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # Сетевой транспорт кэш-слоя Redis — полная лестница приоритетов §1.10
-      # [FIXED] Добавлено среднее звено SHARED_REDIS_REST_*, отсутствовавшее в исходнике
-      # [REMOVED] TELEGRAM_* из job-env: redis_flush.py Telegram не шлёт — это была
-      # мёртвая экспозиция секретов на весь job; токен теперь только в шаге алерта
+      # [10.0.0] TELEGRAM_* из job-env убраны: flush не шлёт сам — только алерт шага
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
       SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
       SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
-      GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml' # Прямая передача строки без вызова ${{ env }}
-      GATEKEEPER_ENV: production # [FIXED] prod -> production: синхрон с docker_compose.yml
+      GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
+      GATEKEEPER_ENV: production
 
     steps:
       - name: Checkout Repository
@@ -72,14 +73,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # [REMOVED] Непривязанный "pip install numpy scipy": мог поднять numpy 2.x
-          # поверх пина numpy<2.0.0 из патченного requirements (ABI-конфликт со scipy<1.14).
-          # Версии уже зафиксированы в requirements.txt — второй установки не требуется.
 
       - name: Set mode for manual run
         env:
-          # [FIXED] Инъекция закрыта: ручной ввод интерполируется только в env-блоке,
-          # в run-скрипте — чтение из переменных окружения
+          # [FIXED 9.6.6, сохранён] Инъекция закрыта: ввод — только в env-блоке
           IN_MODE: ${{ github.event.inputs.mode }}
           IN_CONFIRM: ${{ github.event.inputs.confirm }}
           IN_DRY_RUN: ${{ github.event.inputs.dry_run_only }}
@@ -102,7 +99,6 @@ jobs:
         run: |
           echo "=== Redis Flush - Dry Run ==="
           echo "Mode: $FLUSH_MODE"
-          # -u: небуферизированный вывод в логи Actions
           python -u redis_flush.py --dry-run --mode "$FLUSH_MODE" --yes
 
       - name: Stop if dry-run-only
@@ -111,20 +107,15 @@ jobs:
           echo "=== Dry-run-only mode - skipping execution ==="
           exit 0
 
+      # [10.0.0] Отдельный шаг Verify после flush удалён: проверка выполняется
+      # внутри execute через --post-verify (тот же процесс, минус один полный SCAN)
       - name: Execute flush
         if: success() && env.FLUSH_DRY_RUN != 'true'
         timeout-minutes: 20
         run: |
           echo "=== Redis Flush - Execute ==="
           echo "Mode: $FLUSH_MODE"
-          python -u redis_flush.py --mode "$FLUSH_MODE" --yes
-
-      - name: Verify after flush
-        if: always() && env.FLUSH_MODE != 'reset-breaker'
-        timeout-minutes: 10
-        run: |
-          echo "=== Post-Flush Verify ==="
-          python -u redis_flush.py --dry-run --mode soft --yes
+          python -u redis_flush.py --mode "$FLUSH_MODE" --yes --post-verify
 
       - name: Summary
         if: always()
@@ -144,12 +135,8 @@ jobs:
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           FLUSH_MODE: ${{ env.FLUSH_MODE }}
         run: |
-          # [FIXED] Битый URL -> канонический api.telegram.org/bot + sendMessage.
-          # [FIXED] Убран || true: отказ доставки алерта должен быть виден в логе.
-          # curl — системная утилита раннера, §1.3 регулирует Python-код пакета.
           MSG="❌ <b>Redis Flush FAILED</b>%0AMode: ${FLUSH_MODE}%0ARun: ${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" \
             -d parse_mode="HTML"
-            
