@@ -1,7 +1,15 @@
 """
-Транспортный слой Gatekeeper-AI Ecosystem v9.6.8-patched.
+Транспортный слой Gatekeeper-AI Ecosystem v9.6.9-pipeline-response.
 Единый инкапсулированный шлюз к Upstash Redis REST API.
 Только urllib.request. Никаких сторонних клиентов.
+
+Обновления v9.6.9-pipeline-response (2026-11-07):
+  - Эндпоинт пайплайна исправлен: /pipeline вместо / (двумерный массив
+    команд по документации Upstash; / ожидает ["CMD", ...] — отсюда 400)
+  - Разбор ответа: /pipeline возвращает JSON-массив по элементу на команду,
+    а не объект с полем "result" ( AttributeError 'list' has no 'get' )
+  - Честный подсчёт доставки: команды с {"error": ...} в слоте массива
+    не считаются доставленными + лог тела HTTP-ошибки для дежурства
 
 Обновления v9.6.8-patched:
   - Транспортный конверт поднят до v700-prod (ENVELOPE_VERSION)
@@ -11,16 +19,6 @@
     get_history_match(), delete_history_match() (только с HISTORY_FLUSH_CONFIRM=1)
   - Совместимость со старым API сохранена: save_to_cache / get_from_cache /
     get_all_fields / batch_get_from_cache без изменения сигнатур
-
-
-Обновления v9.6.8-pipeline-hotfix (2026-11-07):
-  - FIX: _execute_upstash_pipeline отправлял двумерный массив команд на эндпоинт
-    одиночной команды "/" — Upstash отвечал 400 Bad Request на КАЖДУЮ пачку
-    (первым элементом тела был массив, а не имя команды). Пайплайн теперь
-    уходит на канонический эндпоинт /pipeline (официальная документация REST API).
-  - FIX: при 400/5xx в лог печатается тело ответа Upstash (точная причина ошибки).
-  - FIX: счётчик доставки в flush() считает только команды с успешным result
-    (Upstash возвращает 200 даже при ошибках отдельных команд в пачке).
 
 
 Обновления 10.0.0-compat (2026-11-06):
@@ -155,16 +153,7 @@ def _execute_upstash_cmd(cmd_parts: List[Any], timeout: int = REDIS_TIMEOUT) -> 
             res_json = json.loads(response.read().decode("utf-8"))
             _reset_breaker_success()
             return res_json.get("result")
-    except urllib.error.HTTPError as e:
-        try:
-            body = (e.read() or b"").decode("utf-8", errors="replace")
-        except Exception:
-            body = "<unreadable>"
-        cmd_name = cmd_parts[0].upper() if cmd_parts else "UNKNOWN"
-        print(f"[REDIS SYSTEM ERROR] HTTP {e.code} команда {cmd_name}: {body[:500]}")
-        _trip_breaker()
-        return None
-    except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as e:
         cmd_name = cmd_parts[0].upper() if cmd_parts else "UNKNOWN"
         target_field = cmd_parts[2] if len(cmd_parts) > 2 else "ROOT"
         print(f"[REDIS SYSTEM ERROR] Ошибка команды {cmd_name} для поля '{target_field}': {e}")
@@ -225,7 +214,8 @@ PIPELINE_BATCH_DELAY = float(os.getenv("GATEKEEPER_PIPELINE_BATCH_DELAY", "0.15"
 def _execute_upstash_pipeline(cmds: List[List[Any]], timeout: int = REDIS_TIMEOUT) -> Optional[Any]:
     """
     Пайплайн-вызов §13.4: массив команд одним REST-запросом к Upstash.
-    Эндпоинт — /pipeline (двумерный JSON-массив); одиночные команды идут на "/".
+    Эндпоинт /pipeline возвращает JSON-массив: по элементу на команду
+    ({"result": ...} или {"error": "..."} в слоте упавшей команды).
     Возвращает список результатов или None при ошибке транспорта.
     """
     if not cmds:
@@ -239,7 +229,7 @@ def _execute_upstash_pipeline(cmds: List[List[Any]], timeout: int = REDIS_TIMEOU
         print("[CRITICAL ERROR] Конфигурация Upstash Redis не найдена в окружении!")
         _trip_breaker()
         return None
-    url = f"{redis_url}/pipeline"  # FIX: канонический эндпоинт пайплайна Upstash (было "/" -> 400 на каждую пачку)
+    url = f"{redis_url}/pipeline"
     try:
         payload = json.dumps(cmds).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers={
@@ -248,25 +238,29 @@ def _execute_upstash_pipeline(cmds: List[List[Any]], timeout: int = REDIS_TIMEOU
         })
         req.method = "POST"
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            res_json = json.loads(response.read().decode("utf-8"))
+            body = json.loads(response.read().decode("utf-8"))
+            if not isinstance(body, list):
+                raise ValueError(f"unexpected /pipeline response type: {type(body).__name__}")
             _reset_breaker_success()
-            return res_json.get("result")
+            return body
     except urllib.error.HTTPError as e:
+        err_body = ""
         try:
-            body = (e.read() or b"").decode("utf-8", errors="replace")
+            err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
-            body = "<unreadable>"
-        print(f"[REDIS PIPELINE ERROR] Пачка из {len(cmds)} команд: HTTP {e.code}: {body[:500]}")
+            pass
+        print(f"[REDIS PIPELINE ERROR] Пачка из {len(cmds)} команд: HTTP {e.code}: {err_body or e}")
         _trip_breaker()
         return None
     except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
-        print(f"[REDIS PIPELINE ERROR] Пачка из {len(cmds)} команд не доставлена (транспорт): {e}")
+        print(f"[REDIS PIPELINE ERROR] Пачка из {len(cmds)} команд не доставлена: {e}")
         _trip_breaker()
         return None
     except Exception as e:
         print(f"[REDIS PIPELINE ERROR] Необработанная ошибка пачки из {len(cmds)} команд: {e}")
         _trip_breaker()
         return None
+
 
 
 class PipelineBatch:
@@ -306,12 +300,20 @@ class PipelineBatch:
                     if redis_command(cmd) is not None:
                         sent += 1
             elif isinstance(res, list):
-                # Upstash возвращает 200 даже при ошибках отдельных команд пачки
-                ok_count = sum(1 for r in res if isinstance(r, dict) and "error" not in r)
-                err_count = len(res) - ok_count
-                if err_count:
-                    print(f"[REDIS PIPELINE WARNING] В пачке из {len(chunk)} команд неудачных: {err_count} (доставлено {ok_count})")
-                sent += ok_count
+                # /pipeline возвращает массив по элементу на команду (200 даже при
+                # ошибке отдельной команды) — считаем доставленными только успешные.
+                if len(res) != len(chunk):
+                    print(f"[REDIS PIPELINE WARNING] Ответ {len(res)} элементов на "
+                          f"{len(chunk)} команд — доставляем пачку поштучно")
+                    for cmd in chunk:
+                        if redis_command(cmd) is not None:
+                            sent += 1
+                else:
+                    for cmd, item in zip(chunk, res):
+                        if isinstance(item, dict) and "error" in item:
+                            print(f"[REDIS PIPELINE ITEM ERROR] {cmd[0]}: {item.get('error')}")
+                        else:
+                            sent += 1
             else:
                 sent += len(chunk)
             if self.batch_delay > 0:
