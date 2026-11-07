@@ -71,22 +71,31 @@ SCAN_COUNT = "250"               # батч SCAN — экономия bandwidth 
 HISTORY_SAMPLE_TRUNCATE = 1200
 DEFAULT_LIMIT = 15
 SAMPLE_SIZE = 5
-DEFAULT_MIN_FREE_MB = 100        # §13.4
+# [10.0.1 FIX #79] 100 MB физически недостижим на Upstash-инстансе 64 МБ —
+# precheck в full-режиме блокировал загрузчик навсегда. Рабочий порог 32;
+# после апгрейда Upstash вернуть 100.
+DEFAULT_MIN_FREE_MB = 32         # §13.4
 
 MODES = ("full", "redis", "sources", "matches", "indexes", "errors",
          "sample", "propline", "keys", "history-contracts", "memory")
 
-COLLECTORS = ["sharpapi", "odds_api", "bzzoiro", "propline", "football_data", "main"]
+# [10.0.1 FIX] Структура контура выправлена: 4 коллектора live-данных + 1 загрузчик
+# истории. football_data вынесен в LOADERS: это писатель пула истории
+# (football_data_to_redis, открытые CSV football-data.co.uk), а не коллектор.
+# "main" удалён: виртуальный источник без ключа, meta и писателя давал вечный
+# STALE-шум в каждом прогоне (#78/#79).
+COLLECTORS = ["sharpapi", "odds_api", "bzzoiro", "propline"]
+LOADERS = ["football_data"]
 
+# [10.0.1 FIX] football_data НАМЕРЕННО отсутствует в карте: источник
+# football-data.co.uk — открытые CSV, ключа нет по природе сервиса.
+# НЕ ПУТАТЬ с одноимённым близнецом football-data.org (REST API с ключом) —
+# близость имён уже вызвала ошибку конфигурации; близнеца в контуре нет.
 _KEY_ENV = {
     "sharpapi": "SHARP_API_KEY",
     "odds_api": "ODDS_API_KEY",
     "bzzoiro": "BZZOIRO_API_KEY",
     "propline": "PROPLINE_API_KEY",
-    # [10.0.1 FIX] football-data.co.uk — открытые CSV, ключа нет по природе источника.
-    # (не путать с football-data.org — это другой сервис, в контуре не используется)
-    "football_data": None,
-    "main": None,
 }
 
 SCAN_PATTERNS = ("history:match:*", "history:*", "system:*", "index:*", "search:results:*")
@@ -595,11 +604,19 @@ def cmd_sources(ctx):
     print("\n" + "=" * 60)
     print("📡 ДИАГНОСТИКА ИСТОЧНИКОВ (мета-мониторинг коллекторов §18.4)")
     print("=" * 60)
-    for c in COLLECTORS:
+    # [10.0.1 FIX] Раздельная печать: коллекторы (ключ обязателен) и загрузчик
+    # истории (ключ не требуется). STALE-отчёт покрывает обе группы.
+    all_sources = COLLECTORS + LOADERS
+    for c in all_sources:
+        is_loader = c in LOADERS
         meta = _read_meta(f"{c}:meta")
         env_key = _KEY_ENV.get(c)
+        if is_loader:
+            key_status = "не требуется"
+        else:
+            key_status = "✅" if (env_key and os.getenv(env_key)) else ("—" if not env_key else "❌")
         entry = {
-            "key": "✅" if (env_key and os.getenv(env_key)) else ("—" if not env_key else "❌"),
+            "key": key_status,
             "last_run": "нет данных",
             "stale": True,
         }
@@ -619,7 +636,11 @@ def cmd_sources(ctx):
         stale_mark = " ⚠️ STALE" if entry["stale"] else ""
         extras = {k: v for k, v in entry.items()
                   if k not in ("key", "last_run", "stale")}
-        print(f"   📊 {c}: ключ {entry['key']}, last_run: {entry['last_run']}{stale_mark}")
+        if is_loader:
+            print(f"   ⚙ {c} [загрузчик истории]: ключ не требуется "
+                  f"(football-data.co.uk, открытые CSV), last_run: {entry['last_run']}{stale_mark}")
+        else:
+            print(f"   📊 {c}: ключ {entry['key']}, last_run: {entry['last_run']}{stale_mark}")
         if extras and VERBOSE:
             print(f"      {extras}")
 
