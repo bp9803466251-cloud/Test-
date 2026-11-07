@@ -83,7 +83,9 @@ _KEY_ENV = {
     "odds_api": "ODDS_API_KEY",
     "bzzoiro": "BZZOIRO_API_KEY",
     "propline": "PROPLINE_API_KEY",
-    "football_data": "FOOTBALL_DATA_API_KEY",
+    # [10.0.1 FIX] football-data.co.uk — открытые CSV, ключа нет по природе источника.
+    # (не путать с football-data.org — это другой сервис, в контуре не используется)
+    "football_data": None,
     "main": None,
 }
 
