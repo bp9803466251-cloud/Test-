@@ -82,7 +82,7 @@ INDEX_PATTERNS = ("idx:*", "index:*", "search:results:*")
 # ---------------------------------------------------------------------------
 try:
     import redis_hub
-    from redis_hub import (IMMUTABLE_ROOT_ADDRESS, get_all_fields, is_redis_available,
+    from redis_hub import (HASH_NAME, get_all_fields, is_redis_available,
                            redis_command, get_circuit_breaker_status)
 except ImportError as e:
     print(f"❌ source_diagnostics: критический сбой импорта redis_hub: {e}")
@@ -446,7 +446,7 @@ def cmd_redis(ctx):
     print(f"   Redis сконфигурирован: {'✅' if info['redis_configured'] else '❌'}")
     print(f"   Доступен (run_initialization): {'✅' if info['redis_available'] else '❌'}")
     print(f"   Circuit Breaker: {info['circuit_breaker']} (failures: {info['cb_failures']})")
-    print(f"   Хэш '{IMMUTABLE_ROOT_ADDRESS}': {info['hash_fields_total']} полей "
+    print(f"   Хэш '{HASH_NAME}': {info['hash_fields_total']} полей "
           f"(match:*: {info['match_keys']}, канонических без префикса: {info['canonical_keys']})")
     if info["raw_canonical_no_prefix"]:
         print("   ⚠️ Коллектор пишет ключи сырым canonical_id без префикса 'match:'")
@@ -715,7 +715,7 @@ def cmd_keys(ctx, limit=DEFAULT_LIMIT):
     print("\n=== АУДИТ КОНТРАКТА ИСТОРИИ + КАРТА КЛЮЧЕЙ ===")
     fields = ctx.all_fields
     hash_history = [k for k in fields if k.lower().startswith("history")]
-    print(f"   Полей history:* в хэше '{IMMUTABLE_ROOT_ADDRESS}': {len(hash_history)}")
+    print(f"   Полей history:* в хэше '{HASH_NAME}': {len(hash_history)}")
 
     standalone = {}
     for pattern in SCAN_PATTERNS:
@@ -943,27 +943,27 @@ def main(argv=None):
 
     if mode == "full":
         VERBOSE = False
-        run("redis", cmd_redis, {})
-        run("sources", cmd_sources, {})
-        run("indexes", cmd_indexes, {})
-        run("errors", cmd_errors, {})
-        run("matches", cmd_matches, {})
-        run("sample", cmd_sample, {})
-        run("propline", cmd_propline, {"limit": 3})
-        run("keys", cmd_keys, {})
-        run("history-contracts", cmd_history_contracts, {})
+        run("redis", cmd_redis, {"ctx": ctx})
+        run("sources", cmd_sources, {"ctx": ctx})
+        run("indexes", cmd_indexes, {"ctx": ctx})
+        run("errors", cmd_errors, {"ctx": ctx})
+        run("matches", cmd_matches, {"ctx": ctx})
+        run("sample", cmd_sample, {"ctx": ctx})
+        run("propline", cmd_propline, {"ctx": ctx, "limit": 3})
+        run("keys", cmd_keys, {"ctx": ctx})
+        run("history-contracts", cmd_history_contracts, {"ctx": ctx})
         run("memory", cmd_memory, {})
     else:
         dispatch = {
-            "redis": (cmd_redis, {}),
-            "sources": (cmd_sources, {}),
+            "redis": (cmd_redis, {"ctx": ctx}),
+            "sources": (cmd_sources, {"ctx": ctx}),
             "matches": (cmd_matches, {"limit": args.limit}),
             "indexes": (cmd_indexes, {"limit": args.limit}),
             "errors": (cmd_errors, {"limit": args.limit}),
             "sample": (cmd_sample, {"limit": args.limit}),
-            "propline": (cmd_propline, {"limit": args.limit}),
+            "propline": (cmd_propline, {"ctx": ctx, "limit": args.limit}),
             "keys": (cmd_keys, {"limit": args.limit}),
-            "history-contracts": (cmd_history_contracts, {}),
+            "history-contracts": (cmd_history_contracts, {"ctx": ctx}),
             "memory": (cmd_memory, {"min_free_mb": args.min_free_mb}),
         }
         fn, kw = dispatch[mode]
