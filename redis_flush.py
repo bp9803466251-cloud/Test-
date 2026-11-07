@@ -43,6 +43,7 @@ try:
         reset_circuit_breaker,
         HASH_NAME,
         redis_command,
+        delete_history_match,
     )
     from source_diagnostics import (
         scan_redis_state,
@@ -123,11 +124,10 @@ def _build_plan(mode, scan_result):
         desc_parts.append(f"index:* — {len(scats['index'])} ключей")
         desc_parts.append(f"СОХРАНЕНО: history:match:* — {len(scats['history'])} ключей")
     elif mode == "purge":
-        to_del_hash.extend(hcats["match"])
-        to_del_hash.extend(hcats["meta"])
-        to_del_hash.extend(hcats["search"])
-        to_del_hash.extend(hcats["system_hash"])
-        to_del_hash.extend(hcats["other"])
+        # [10.0.0 FIX] Честный полный план: ранее purge собирал категории и
+        # пропускал match_no_odds (легаси-матчи) — освобождал 4% вместо 43 МБ.
+        # Теперь берутся ВСЕ поля хэша и ВСЕ категории standalone.
+        to_del_hash.extend(fields)
         to_del_standalone.extend(scats["history"])
         to_del_standalone.extend(scats["system"])
         to_del_standalone.extend(scats["index"])
@@ -167,7 +167,27 @@ def _execute_delete(to_del_hash, to_del_standalone, batch_size=50):
                     deleted_hash += 1
                 else:
                     errors += 1
+    guard_on = os.environ.get("HISTORY_FLUSH_CONFIRM") == "1"
     for key in to_del_standalone:
+        if key.startswith("history:match:"):
+            # [10.0.0 FIX] Guard §1.7.4: история удаляется только через хаб-метод
+            # delete_history_match, у которого внутренняя проверка HISTORY_FLUSH_CONFIRM.
+            # Flush ставит флаг программно и только на время execute (см. main).
+            if not guard_on:
+                errors += 1
+                logger.warning("Guard: HISTORY_FLUSH_CONFIRM не активен — %s НЕ удалён", key)
+                continue
+            cid = key[len("history:match:"):]
+            try:
+                result = delete_history_match(cid)
+                if result is not None:
+                    deleted_standalone += 1
+                else:
+                    errors += 1
+            except Exception as e:
+                errors += 1
+                logger.warning("delete_history_match(%s): %s", cid, e)
+            continue
         result = redis_command(["DEL", key])
         if result is not None:
             try:
@@ -258,7 +278,14 @@ def main():
         return
 
     print("\n🚀 Запуск транзакции очистки оперативной памяти...")
-    del_h, del_s, errs = _execute_delete(to_h, to_s)
+    has_history = any(k.startswith("history:match:") for k in to_s)
+    if has_history:
+        # Guard §1.7.4: флаг живёт ровно на время исполнения (finally — снятие)
+        os.environ["HISTORY_FLUSH_CONFIRM"] = "1"
+    try:
+        del_h, del_s, errs = _execute_delete(to_h, to_s)
+    finally:
+        os.environ.pop("HISTORY_FLUSH_CONFIRM", None)
 
     print("=" * 60)
     print("🏁 РЕЗУЛЬТАТЫ ВЫПОЛНЕНИЯ ОЧИСТКИ:")

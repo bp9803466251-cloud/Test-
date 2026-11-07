@@ -345,6 +345,78 @@ def fetch_history_pool(all_fields):
 # ===========================================================================
 # Контекст прогона: один HGETALL на прогон
 # ===========================================================================
+# ---------------------------------------------------------------------------
+# [10.0.0] Flush-поверхность (§1.11): единые скан и классификаторы для redis_flush.
+# Flush импортирует отсюда — таксономия flush и аудита совпадает.
+# ---------------------------------------------------------------------------
+MATCH_FIELD_PREFIX = "match:"
+HISTORY_KEY_PREFIX = "history:match:"
+
+
+def scan_redis_state():
+    """Снимок состояния Redis для flush: поля хэша (пагинированный HSCAN через
+    Context.all_fields) + обособленные ключи (SCAN-паттерны SCAN_PATTERNS)."""
+    fields = Context().all_fields
+    standalone = []
+    for pattern in SCAN_PATTERNS:
+        standalone.extend(scan_by_pattern(pattern))
+    return {"hash_fields": fields, "standalone_keys": sorted(set(standalone))}
+
+
+def classify_hash_fields(fields):
+    """Категории полей хэша. Легаси-матчи без котировок (match_no_odds) —
+    отдельная категория: главные кандидаты очистки; раньше выпадали из плана
+    purge, и он освобождал 4% вместо 43 МБ."""
+    cats = {"match": [], "match_no_odds": [], "history": [], "meta": [],
+            "meta_stale": [], "search": [], "system_hash": [], "other": []}
+    for field, value in fields.items():
+        if field.startswith(MATCH_FIELD_PREFIX):
+            data, err = _parse_entry(field, value)
+            if err or not isinstance(data, dict):
+                cats["match_no_odds"].append(field)
+                continue
+            if _has_odds_1x2(_payload(data)):
+                cats["match"].append(field)
+            else:
+                cats["match_no_odds"].append(field)
+        elif field.startswith("history:"):
+            cats["history"].append(field)
+        elif field.endswith(":meta"):
+            data, err = _parse_entry(field, value)
+            raw = data if not err else None
+            last_run = None
+            if isinstance(raw, dict):
+                last_run = raw.get("last_run") or raw.get("updated_at") or raw.get("timestamp")
+            if last_run and not _check_stale(str(last_run)):
+                cats["meta"].append(field)
+            else:
+                cats["meta_stale"].append(field)
+        elif field.startswith("search:"):
+            cats["search"].append(field)
+        elif field.startswith("system:"):
+            cats["system_hash"].append(field)
+        else:
+            cats["other"].append(field)
+    return cats
+
+
+def classify_standalone_keys(keys):
+    """Категории обособленных Root-ключей."""
+    cats = {"history": [], "system": [], "index": [], "search": [], "other": []}
+    for key in keys:
+        if key.startswith("history:"):
+            cats["history"].append(key)
+        elif key.startswith("system:"):
+            cats["system"].append(key)
+        elif key.startswith("index:") or key.startswith("idx:"):
+            cats["index"].append(key)
+        elif key.startswith("search:"):
+            cats["search"].append(key)
+        else:
+            cats["other"].append(key)
+    return cats
+
+
 class Context:
     def __init__(self):
         self._fields = None
@@ -352,24 +424,51 @@ class Context:
     @property
     def all_fields(self):
         if self._fields is None:
-            try:
-                fields = get_all_fields()
-            except Exception as e:
-                raise NetworkError(f"get_all_fields: {e}")
-            if not isinstance(fields, dict):
-                raise NetworkError(f"get_all_fields: не-dict ответ транспорта: {fields!r}")
-            if not fields:
-                # [10.0.0 FIX] Пустая выборка HGETALL подтверждается HLEN: таймаут
-                # транспорта, заглушенный до {}, раньше маскировался «0 полей».
-                hlen = None
+            # [10.0.0 FIX #77] Пагинированный HSCAN вместо единого HGETALL:
+            # 43 МБ легаси-хэша (9925 полей) не помещаются в таймаут транспорта,
+            # таймаут заглушался до {} и маскировался «0 полей». Размер страницы —
+            # GATEKEEPER_DIAG_HSCAN_COUNT (по умолчанию 250). Полнота выборки
+            # сверяется с HLEN: расхождение, сбой страницы или нечётные пары —
+            # честный NetworkError, никакого частичного плана.
+            page = max(50, int(os.environ.get("GATEKEEPER_DIAG_HSCAN_COUNT", "250") or 250))
+            fields = {}
+            cursor = "0"
+            pages = 0
+            while True:
                 try:
-                    hlen = redis_command(["HLEN", HASH_NAME])
-                except Exception:
-                    hlen = None
-                if hlen is None or hlen != 0:
-                    raise NetworkError(
-                        f"Пустая выборка HGETALL не подтверждена HLEN={hlen!r} — сбой транспорта"
-                    )
+                    raw = redis_command(["HSCAN", HASH_NAME, str(cursor), "COUNT", str(page)])
+                except Exception as e:
+                    raise NetworkError(f"HSCAN {HASH_NAME}: сбой транспорта: {e}")
+                if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+                    raise NetworkError(f"HSCAN {HASH_NAME}: неожиданный формат ответа: {raw!r}")
+                next_cursor, chunk = raw[0], raw[1]
+                if isinstance(next_cursor, bytes):
+                    next_cursor = next_cursor.decode("utf-8")
+                cursor = str(next_cursor)
+                if isinstance(chunk, list):
+                    if len(chunk) % 2 != 0:
+                        raise NetworkError(
+                            f"HSCAN: нечётное число элементов ({len(chunk)}) — нарушение пар поле/значение"
+                        )
+                    for i in range(0, len(chunk), 2):
+                        k = chunk[i].decode("utf-8") if isinstance(chunk[i], bytes) else str(chunk[i])
+                        v = chunk[i + 1].decode("utf-8") if isinstance(chunk[i + 1], bytes) else chunk[i + 1]
+                        fields[k] = v
+                    pages += 1
+                    if pages % 10 == 0:
+                        print(f"   [DIAG] HSCAN: страниц {pages}, накоплено полей {len(fields)}...")
+                if cursor in ("0", 0):
+                    break
+            try:
+                hlen = redis_command(["HLEN", HASH_NAME])
+            except Exception as e:
+                raise NetworkError(f"HLEN {HASH_NAME}: сбой транспорта: {e}")
+            if hlen is None:
+                raise NetworkError("HLEN вернул None — сбой транспорта")
+            if hlen != len(fields):
+                raise NetworkError(
+                    f"Полнота выборки нарушена: HSCAN собрал {len(fields)} полей, HLEN={hlen}"
+                )
             self._fields = fields
         return self._fields
 
