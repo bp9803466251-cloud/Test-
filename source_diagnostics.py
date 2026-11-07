@@ -3,6 +3,9 @@
 """
 source_diagnostics.py — Единый read-only диагностический модуль Gatekeeper-AI.
 Версия 10.0.0-merged — результат аудита объединения 7 диагностических единиц.
+[10.0.2] Патч: режим history-sample — разбор живой истории v8.13 (SCAN, MGET-гистограмма дат, образцы xG/O/U/AH). Семантика сверки: stored_matches
+ — поргонный счётчик; консистентность мета = written+deduped+skipped == total_events.
+ __version__ не меняется (пин test_contracts.py не тронут).
 
 [10.0.0 MERGE] Вшиты и удалены как отдельные файлы:
     - check_redis.py      -> режимы propline, keys (аудит контракта истории v1.1);
@@ -77,7 +80,8 @@ SAMPLE_SIZE = 5
 DEFAULT_MIN_FREE_MB = 32         # §13.4
 
 MODES = ("full", "redis", "sources", "matches", "indexes", "errors",
-         "sample", "propline", "keys", "history-contracts", "memory")
+         "sample", "propline", "keys", "history-contracts", "memory",
+         "history-sample")
 
 # [10.0.1 FIX] Структура контура выправлена: 4 коллектора live-данных + 1 загрузчик
 # истории. football_data вынесен в LOADERS: это писатель пула истории
@@ -1051,6 +1055,147 @@ def cmd_memory(min_free_mb=DEFAULT_MIN_FREE_MB):
 # ===========================================================================
 # CLI
 # ===========================================================================
+
+
+def cmd_history_sample(ctx, limit=None, sample_league=None):
+    """[10.0.2] Режим history-sample: разбор живых записей формата v8.13.
+    1) SCAN history:match:* — счётчик ключей;
+    2) Внутренняя консистентность football_data:meta:
+       written + deduped + skipped_past + skipped_future == total_events.
+       ВАЖНО: stored_matches — ПОРГОННЫЙ счётчик (сколько записано этим прогоном),
+       а не накопительный; сравнивать его с числом ключей базы нельзя —
+       на инкрементальных прогонах это ложный exit 1 (ловушка v10.0.1).
+       Сверка keys vs stored печатается как ИНФОРМАЦИЯ, не вердикт.
+    3) Распределение дат (MGET чанками по 50) — ответ на вопрос
+       «обновился ли источник между прогонами» без поштучного GET.
+    4) Разбор образцов: xg_home/xg_away, плоский odds_over_under
+       (2.5 с closing-каскадом; 1.5/3.5 — None как норма резерва),
+       odds_asian_handicap (линия AHCh), odds_1x2, объём csv_raw.
+    Read-only: SCAN + MGET-чанки + до limit GET (потолок 200)."""
+    limit = limit if isinstance(limit, int) and limit > 0 else 3
+    keys = scan_by_pattern("history:match:*")
+    total_keys = len(keys)
+    print(f"\n=== РАЗБОР ЖИВОЙ ИСТОРИИ (HISTORY-SAMPLE) ===")
+    print(f"   history:match:* ключей: {total_keys}")
+
+    # --- Мета: внутренняя консистентность (12-10) ---
+    meta = _read_meta("football_data:meta")
+    issues = []
+    if not isinstance(meta, dict):
+        if total_keys > 0:
+            issues.append("football_data:meta отсутствует при непустой истории "
+                          "(flush без загрузчика?)")
+            print(f"   ❌ Мета отсутствует при {total_keys} записях истории")
+        else:
+            print("   ℹ Мета отсутствует, история пуста — легитимное состояние до первой загрузки")
+    else:
+        parts = [meta.get(k) for k in ("written", "deduped", "skipped_past", "skipped_future")]
+        total_events = meta.get("total_events")
+        if all(isinstance(p, int) for p in parts) and isinstance(total_events, int):
+            s = sum(parts)
+            if s == total_events:
+                print(f"   ✅ Мета консистентна: written+deduped+skipped = {s} = total_events")
+            else:
+                issues.append(f"мета: сумма {s} != total_events {total_events}")
+        else:
+            issues.append("мета: неполные счётчики")
+        last_run = meta.get("last_run")
+        stale = _check_stale(str(last_run)) if last_run else True
+        print(f"   last_run: {last_run} | stale: {'да (>2ч)' if stale else 'нет'}")
+        if stale:
+            issues.append("мета устарела (>2ч)")
+        # Информационная сверка (НЕ вердикт): stored_matches — поргонный счётчик
+        stored = meta.get("stored_matches")
+        print(f"   stored_matches (поргонный): {stored} | обработанных файлов: "
+              f"{len(meta.get('processed_files', []))}")
+
+    # --- Распределение дат: MGET чанками по 50 ---
+    date_hist = defaultdict(int)
+    league_hist = defaultdict(int)
+    unreadable = 0
+    CHUNK = 50
+    for i in range(0, min(total_keys, 5000), CHUNK):
+        chunk = keys[i:i + CHUNK]
+        raw = redis_command(["MGET", *chunk])
+        if not isinstance(raw, list) or len(raw) != len(chunk):
+            raise NetworkError(f"MGET чанк {i}: неожиданный ответ")
+        for k, v in zip(chunk, raw):
+            if v is None:
+                continue
+            try:
+                data = json.loads(v) if isinstance(v, (str, bytes)) else v
+            except (json.JSONDecodeError, ValueError):
+                unreadable += 1
+                continue
+            if not isinstance(data, dict):
+                unreadable += 1
+                continue
+            date = data.get("date_utc") or ""
+            month = str(date)[:7] or "неизвестно"
+            date_hist[month] += 1
+            lg = data.get("league_code") or data.get("competition") or "неизвестно"
+            league_hist[str(lg)] += 1
+    if date_hist:
+        print(f"   Распределение дат ({sum(date_hist.values())} записей):")
+        for month in sorted(date_hist):
+            print(f"     {month}: {date_hist[month]}")
+    if league_hist:
+        tops = sorted(league_hist.items(), key=lambda x: -x[1])[:8]
+        print(f"   Топ лиг по записям: " + ", ".join(f"{k}={v}" for k, v in tops))
+    if unreadable:
+        issues.append(f"нечитаемых записей: {unreadable}")
+
+    # --- Разбор образцов ---
+    def _fmt(v, n=200):
+        try:
+            s = json.dumps(v, ensure_ascii=False)
+        except (TypeError, ValueError):
+            s = str(v)
+        return s[:n] + ("…" if len(s) > n else "")
+
+    shown = 0
+    for key in keys:
+        if shown >= limit:
+            break
+        cid = key[len("history:match:"):] if isinstance(key, str) else str(key)
+        rec = get_history_record(cid)
+        if not isinstance(rec, dict):
+            continue
+        if sample_league:
+            comp = (str(rec.get("league_code") or rec.get("competition") or "")).upper()
+            if sample_league.upper() not in comp:
+                continue
+        shown += 1
+        stats = rec.get("stats") if isinstance(rec.get("stats"), dict) else {}
+        ou = rec.get("odds_over_under") if isinstance(rec.get("odds_over_under"), dict) else {}
+        ah = rec.get("odds_asian_handicap")
+        flat = rec.get("odds_1x2")
+        csv_raw = rec.get("csv_raw")
+        print(f"\n   --- Образец {shown}: {cid} ---")
+        print(f"     лига: {rec.get('league_code') or rec.get('competition')} | "
+              f"дата: {rec.get('date_utc')} | счёт: {rec.get('home_goals')}-{rec.get('away_goals')}")
+        print(f"     xg: {stats.get('xg_home')} / {stats.get('xg_away')} "
+              f"(None = колонок xG нет в CSV этой лиги/сезона — норма)")
+        print(f"     odds_1x2: {_fmt(flat, 120)}")
+        print(f"     O/U 2.5: {_fmt(ou.get('2.5'), 250)}")
+        print(f"     O/U 1.5 / 3.5: {ou.get('1.5')} / {ou.get('3.5')} "
+              f"(None — резерв линий, норма v8.13)")
+        print(f"     AH: {_fmt(ah, 200)}")
+        print(f"     csv_raw: {len(csv_raw) if csv_raw else 0} полей")
+    if sample_league and shown == 0:
+        issues.append(f"записей лиги '{sample_league}' не найдено в выборке")
+
+    if issues:
+        for it in issues:
+            print(f"   ❌ {it}")
+        print("   ✗ История: есть замечания")
+        return {"keys": total_keys, "issues": issues,
+                "date_hist": dict(date_hist)}, False
+    print("   ✅ История: разбор чист")
+    return {"keys": total_keys, "date_hist": dict(date_hist),
+            "league_top": dict(sorted(league_hist.items(), key=lambda x: -x[1])[:8])}, True
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=f"Единая диагностика Gatekeeper-AI v{__version__} (read-only)")
@@ -1066,6 +1211,8 @@ def build_parser():
                         help="Лимит вывода записей (propline/sample/keys/matches/indexes)")
     parser.add_argument("--min-free-mb", type=int, default=DEFAULT_MIN_FREE_MB,
                         help="Порог свободной памяти для режима memory (§13.4)")
+    parser.add_argument("--sample-league", default=None,
+                        help="[history-sample] фильтр образцов по лиге (league_code/competition)")
     return parser
 
 
@@ -1117,6 +1264,8 @@ def main(argv=None):
             "propline": (cmd_propline, {"ctx": ctx, "limit": args.limit}),
             "keys": (cmd_keys, {"ctx": ctx, "limit": args.limit}),
             "history-contracts": (cmd_history_contracts, {"ctx": ctx}),
+            "history-sample": (cmd_history_sample, {"ctx": ctx, "limit": args.limit,
+                                                     "sample_league": args.sample_league}),
             "memory": (cmd_memory, {"min_free_mb": args.min_free_mb}),
         }
         fn, kw = dispatch[mode]
