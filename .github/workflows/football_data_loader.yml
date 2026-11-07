@@ -45,18 +45,19 @@ concurrency:
 jobs:
   load:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60  # [10.0.1 FIX] §1.10: конвейеры 30-60 мин
 
     env:
       SEASONS_INPUT: ${{ github.event.inputs.seasons || '' }}
       LEAGUES_INPUT: ${{ github.event.inputs.leagues || '' }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days || '0' }}
-      HISTORY_DAYS: ${{ github.event.inputs.history_days || '0' }}
       LIMIT_INPUT: ${{ github.event.inputs.limit || '0' }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
       FLUSH_INPUT: ${{ github.event.inputs.flush || 'false' }}
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
       SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+      SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+      SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
@@ -77,16 +78,15 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Memory precheck (§13.4, 12-9a)
+      # [10.0.1 FIX] Precheck переведён на ядро: redis_diagnostics.py удалён при
+      # консолидации 10.0.0 — прежний шаг всегда уходил в warning и пропускал
+      # проверку памяти (§13.4). Канонический порог 32 МБ (гид, guide-delta #79-#80).
+      - name: Memory precheck (§13.4)
         run: |
-          if [ -f redis_diagnostics.py ]; then
-            python redis_diagnostics.py --memory-check --min-free-mb 1.5 || {
-              echo "::error::Free memory below 1.5 MB — abort before load (§13.4 stop-loss protection)"
-              exit 1
-            }
-          else
-            echo "::warning::redis_diagnostics.py not found — memory precheck skipped"
-          fi
+          python -u source_diagnostics.py --mode memory --min-free-mb 32 || {
+            echo "::error::Free memory below 32 MB — abort before load (§13.4 stop-loss protection)"
+            exit 1
+          }
 
       - name: Flush football_data keys (optional)
         if: ${{ github.event.inputs.flush == 'true' }}
@@ -97,7 +97,11 @@ jobs:
           URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '').rstrip('/')
           TOKEN = os.environ.get('SHARED_UPSTASH_REDIS_REST_TOKEN', '')
           if not URL or not TOKEN:
-              print('WARN: No SHARED_* Redis creds, trying UPSTASH_*')
+              print('WARN: No SHARED_UPSTASH_* creds, trying SHARED_REDIS_*')
+              URL = os.environ.get('SHARED_REDIS_REST_URL', '').rstrip('/')
+              TOKEN = os.environ.get('SHARED_REDIS_REST_TOKEN', '')
+          if not URL or not TOKEN:
+              print('WARN: No SHARED_REDIS_* creds, trying UPSTASH_*')
               URL = os.environ.get('UPSTASH_REDIS_REST_URL', '').rstrip('/')
               TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
           if not URL or not TOKEN:
@@ -147,9 +151,13 @@ jobs:
           python -c "
           import os, json, urllib.request, sys
 
-          URL = os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '') or os.environ.get('UPSTASH_REDIS_REST_URL', '')
+          URL = (os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '')
+                 or os.environ.get('SHARED_REDIS_REST_URL', '')
+                 or os.environ.get('UPSTASH_REDIS_REST_URL', ''))
           URL = URL.rstrip('/')
-          TOKEN = os.environ.get('SHARED_UPSTASH_REDIS_REST_TOKEN', '') or os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
+          TOKEN = (os.environ.get('SHARED_UPSTASH_REDIS_REST_TOKEN', '')
+                   or os.environ.get('SHARED_REDIS_REST_TOKEN', '')
+                   or os.environ.get('UPSTASH_REDIS_REST_TOKEN', ''))
 
           if not URL or not TOKEN:
               print('ERROR: Redis credentials not configured')
