@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v8.13-metrics (CSV) — ALL columns, GatekeeperAI v710
+Football-Data Collector v8.14-dedup-mget (CSV) — ALL columns, GatekeeperAI v710
 Источник: football-data.co.uk
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
+
+v8.14-dedup-mget (дедуп через MGET-чанки, §13.4):
+  - process_csv трёхфазный: пасс 1 — парсинг без Redis; пасс 1.5 — MGET-префетч
+    дедупа чанками по 50 ключей (1 команда на чанк вместо 50 GET на матч);
+    пасс 2 — дедуп/force-merge §12.6.1, запись через хаб, индексы в тот же батч
+  - Fallback: сбой MGET -> поштучный GET (семантика v8.13); _manual_commands
+    считает чанки MGET, а не матчи — бюджет §13.4 экономится ~15k команд
+  - FIX: в dry-run переменная result могла быть не определена (латентный NameError)
+  - Нюанс телеметрии: при limit>0 счётчики skipped_* отражают весь файл
+    (пасс 1 парсит всё), а не только отсканированную до лимита часть
 
 v8.13-metrics (метрическое расширение):
   - parse_stat: NA/пусто -> None для метрик stats (различение «нет данных» и «0»)
@@ -91,8 +101,8 @@ except ImportError:
 # CONFIG
 # ============================================================================
 
-VERSION = "8.13-metrics"
-__version__ = "8.13-metrics"
+VERSION = "8.14-dedup-mget"
+__version__ = "8.14-dedup-mget"
 
 # FIX-3: Убран logging.basicConfig
 logger = logging.getLogger(__name__)
@@ -149,6 +159,10 @@ AH_CLOSING_CASCADE = [
 
 # §13.4: стоп-лосс — 90% суточного бюджета команд Upstash (10 000/день)
 COMMAND_SOFT_LIMIT = 9000
+
+# v8.14: дедуп через MGET-чанки (пасс 1.5) — 1 команда на 50 матчей вместо 50 GET
+MGET_CHUNK_SIZE = 50
+HISTORY_KEY_PREFIX = "history:match:"  # синхронно с redis_hub.HISTORY_PREFIX
 
 LEAGUES = {
     "E0":  {"name": "Premier League",       "country": "England",    "division": 1},
@@ -866,23 +880,25 @@ class FootballDataCollector:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
     def process_csv(self, csv_content, season, league_code, limit=0, history_days=0):
-        """Парсинг CSV и запись через хаб. §13.4: дедуп, стоп-лосс, счётчики, индексы в батч."""
+        """Парсинг CSV и запись через хаб.
+
+        v8.14-dedup-mget: трёхфазная схема (§13.4):
+          Пасс 1   — парсинг всех строк без обращений к Redis (фильтры §23, счётчики);
+          Пасс 1.5 — MGET-префетч дедупа чанками по 50 ключей (1 команда на чанк);
+          Пасс 2   — дедуп/force-merge (§12.6.1), запись через хаб, индексы в тот же батч.
+        Семантика счётчиков (written/deduped/collision_warnings) сохранена байт в байт.
+        """
         reader = csv.DictReader(io.StringIO(csv_content))
-        count = 0
         now = datetime.now(timezone.utc)
         file_key = f"{season}_{league_code}"
         file_done = file_key in set(self.processed_files)
 
+        # ── Пасс 1: парсинг всех строк без обращений к Redis ──
+        prepared = []
         for row in reader:
             if is_shutdown_requested():
                 logger.info("    [SHUTDOWN] Graceful shutdown — прерываем CSV-обработку")
                 break
-            if limit and count >= limit:
-                break
-            if not self.dry_run and self.commands_used >= COMMAND_SOFT_LIMIT:
-                logger.warning("[STOP-LOSS §13.4] 90% дневного бюджета команд — финализация прогона")
-                break
-
             try:
                 payload = build_payload(row, season, league_code, run_id=self.run_id)
             except Exception as e:
@@ -912,14 +928,44 @@ class FootballDataCollector:
                     self.skipped_past += 1
                     continue
 
+            prepared.append((payload, match_dt))
+
+        # ── Пасс 1.5: MGET-префетч дедупа чанками по 50 ключей ──
+        from redis_hub import get_history_match, redis_command
+        existing_map = {}
+        cids = [p[0]["canonical_id"] for p in prepared]
+        if not self.dry_run and cids:
+            for i in range(0, len(cids), MGET_CHUNK_SIZE):
+                chunk = cids[i:i + MGET_CHUNK_SIZE]
+                keys = [f"{HISTORY_KEY_PREFIX}{c}" for c in chunk]
+                res = redis_command(["MGET", *keys])
+                self._manual_commands += 1
+                if res is None or not isinstance(res, list) or len(res) != len(chunk):
+                    # Деградация MGET: fallback на поштучный GET (как в v8.13)
+                    logger.warning(f"    [DEDUP] MGET-чанк {i // MGET_CHUNK_SIZE} не доставлен — fallback на GET")
+                    for c in chunk:
+                        existing_map[c] = get_history_match(c)
+                        self._manual_commands += 1
+                else:
+                    for c, raw in zip(chunk, res):
+                        existing_map[c] = self._parse_existing(raw) if raw else None
+
+        # ── Пасс 2: дедуп, force-merge, запись через хаб, индексы ──
+        count = 0
+        for payload, match_dt in prepared:
+            if is_shutdown_requested():
+                logger.info("    [SHUTDOWN] Graceful shutdown — прерываем запись")
+                break
+            if limit and count >= limit:
+                break
+            if not self.dry_run and self.commands_used >= COMMAND_SOFT_LIMIT:
+                logger.warning("[STOP-LOSS §13.4] 90% дневного бюджета команд — финализация прогона")
+                break
+
             cid = payload["canonical_id"]
 
-            # Дедуп: GET существующей записи — и существование, и protected-поля одной командой
-            existing = None
-            if not self.dry_run:
-                from redis_hub import get_history_match
-                existing = get_history_match(cid)
-                self._manual_commands += 1
+            # Дедуп: существование и protected-поля одной операцией (из MGET-префетча)
+            existing = existing_map.get(cid) if not self.dry_run else None
             if isinstance(existing, dict):
                 if file_done:
                     self.deduped += 1
@@ -935,6 +981,7 @@ class FootballDataCollector:
                 if existing.get("created_at"):
                     payload["created_at"] = existing["created_at"]
 
+            result = None  # FIX v8.14: в dry-run result не определялся (латентный NameError)
             if not self.dry_run:
                 try:
                     # §23/13-G2: запись через доменный шлюз; batch — пакетно; merge — до вызова
@@ -980,6 +1027,19 @@ class FootballDataCollector:
                 self._batch.add("RPUSH", f"history:index:{day}", cid_key)
 
         return count
+
+    @staticmethod
+    def _parse_existing(raw):
+        """Разбор raw-значения из MGET: JSON с распаковкой конверта v700-prod (§13.1).
+        Повреждённая запись считается отсутствующей -> путь force-merge (безопаснее скипа)."""
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("    [DEDUP] Повреждённый JSON в существующей записи — считаем отсутствующей")
+            return None
+        if isinstance(data, dict) and "payload" in data:
+            data = data["payload"]
+        return data if isinstance(data, dict) else None
 
     def save_meta(self, season, league_code, matches, errors):
         """Плоская football_data:meta (12-10, §13.1) — flush после каждой лиги (crash-safe)."""
