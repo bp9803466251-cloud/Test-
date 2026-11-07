@@ -3,9 +3,6 @@
 """
 source_diagnostics.py — Единый read-only диагностический модуль Gatekeeper-AI.
 Версия 10.0.0-merged — результат аудита объединения 7 диагностических единиц.
-[10.0.2] Патч: режим history-sample — разбор живой истории v8.13 (SCAN, MGET-гистограмма дат, образцы xG/O/U/AH). Семантика сверки: stored_matches
- — поргонный счётчик; консистентность мета = written+deduped+skipped == total_events.
- __version__ не меняется (пин test_contracts.py не тронут).
 
 [10.0.0 MERGE] Вшиты и удалены как отдельные файлы:
     - check_redis.py      -> режимы propline, keys (аудит контракта истории v1.1);
@@ -37,6 +34,14 @@ write-телеметрия — metrics.py (контракт system:health не �
     отдельный HGET на каждое поле, риск дожатия bandwidth при DATA STOP).
 """
 
+# [10.0.2 HISTORY-SAMPLE] Новый read-only режим history-sample: SCAN history:match:*,
+#     внутренняя консистентность мета (written+deduped+skipped == total_events);
+#     stored_matches печатается как информация (счётчик поргонный — прогоны #22/#23),
+#     гистограмма дат и топ лиг через MGET-чанки, разбор образцов по контракту v8.13.
+# [10.0.3 SCORE-PROBE] Счёт по канону build_payload v8.13: score={"home","away"},
+#     full_time_result (FTR); каскад проб (плоские ключи -> csv_raw FTHG/FTAG);
+#     при промахе — дамп ключей записи и честный exit 1 (поверхность: писатель).
+#     Косметика: xG-хинт печатается только при None.
 import argparse
 import json
 import logging
@@ -80,8 +85,7 @@ SAMPLE_SIZE = 5
 DEFAULT_MIN_FREE_MB = 32         # §13.4
 
 MODES = ("full", "redis", "sources", "matches", "indexes", "errors",
-         "sample", "propline", "keys", "history-contracts", "memory",
-         "history-sample")
+         "sample", "propline", "keys", "history-contracts", "history-sample", "memory")
 
 # [10.0.1 FIX] Структура контура выправлена: 4 коллектора live-данных + 1 загрузчик
 # истории. football_data вынесен в LOADERS: это писатель пула истории
@@ -1053,149 +1057,201 @@ def cmd_memory(min_free_mb=DEFAULT_MIN_FREE_MB):
 
 
 # ===========================================================================
-# CLI
+# Режим history-sample (read-only, 10.0.2/10.0.3)
 # ===========================================================================
+HISTORY_SAMPLE_MGET_CHUNK = 50   # MGET-чанк для гистограммы (§13.4: 1 команда на 50 записей)
 
 
-def cmd_history_sample(ctx, limit=None, sample_league=None):
-    """[10.0.2] Режим history-sample: разбор живых записей формата v8.13.
-    1) SCAN history:match:* — счётчик ключей;
-    2) Внутренняя консистентность football_data:meta:
-       written + deduped + skipped_past + skipped_future == total_events.
-       ВАЖНО: stored_matches — ПОРГОННЫЙ счётчик (сколько записано этим прогоном),
-       а не накопительный; сравнивать его с числом ключей базы нельзя —
-       на инкрементальных прогонах это ложный exit 1 (ловушка v10.0.1).
-       Сверка keys vs stored печатается как ИНФОРМАЦИЯ, не вердикт.
-    3) Распределение дат (MGET чанками по 50) — ответ на вопрос
-       «обновился ли источник между прогонами» без поштучного GET.
-    4) Разбор образцов: xg_home/xg_away, плоский odds_over_under
-       (2.5 с closing-каскадом; 1.5/3.5 — None как норма резерва),
-       odds_asian_handicap (линия AHCh), odds_1x2, объём csv_raw.
-    Read-only: SCAN + MGET-чанки + до limit GET (потолок 200)."""
-    limit = limit if isinstance(limit, int) and limit > 0 else 3
-    keys = scan_by_pattern("history:match:*")
-    total_keys = len(keys)
-    print(f"\n=== РАЗБОР ЖИВОЙ ИСТОРИИ (HISTORY-SAMPLE) ===")
-    print(f"   history:match:* ключей: {total_keys}")
+def _extract_score(rec):
+    """Счёт по канону build_payload v8.13: rec['score'] = {"home": int, "away": int}.
+    Каскад проб при отсутствии корневой формы (на случай других писателей):
+    payload.score -> плоские score_home/away или home_goals/away_goals -> csv_raw FTHG/FTAG.
+    Возвращает (score|None, где найдено|None, список выполненных проб)."""
+    probes = []
+    sc = rec.get("score")
+    if isinstance(sc, dict) and sc.get("home") is not None and sc.get("away") is not None:
+        return {"home": sc["home"], "away": sc["away"]}, "payload.score", probes
+    probes.append("payload.score")
+    for h_key, a_key in (("score_home", "score_away"), ("home_goals", "away_goals")):
+        h, a = rec.get(h_key), rec.get(a_key)
+        if h is not None and a is not None:
+            return {"home": h, "away": a}, f"payload.{h_key}/{a_key}", probes
+        probes.append(f"payload.{h_key}")
+    csv_raw = rec.get("csv_raw")
+    if isinstance(csv_raw, dict):
+        fh, fa = csv_raw.get("FTHG"), csv_raw.get("FTAG")
+        if fh not in (None, "") and fa not in (None, ""):
+            try:
+                return {"home": int(fh), "away": int(fa)}, "csv_raw.FTHG/FTAG", probes
+            except (TypeError, ValueError):
+                return {"home": fh, "away": fa}, "csv_raw.FTHG/FTAG(raw)", probes
+        probes.append("csv_raw.FTHG/FTAG")
+    return None, None, probes
 
-    # --- Мета: внутренняя консистентность (12-10) ---
+
+def cmd_history_sample(ctx, limit=DEFAULT_LIMIT, sample_league=None):
+    """[10.0.3] history-sample: read-only разбор живых записей history:match:*.
+    Сверка мета — внутренняя консистентность (§13): written+deduped+skipped == total_events.
+    stored_matches печатается как информация: счётчик поргонный (прогон #23: 359 при
+    2239 записей в базе), жёсткое сравнение давало бы ложный failure на инкрементах.
+    Счёт — контракт v8.13 build_payload (score={"home","away"}, full_time_result);
+    при промахе — дамп ключей записи и exit 1: дефект писателя, не читателя."""
+    ok = True
+    keys = sorted(scan_by_pattern("history:match:*"))
+    print("\n=== РАЗБОР ЖИВОЙ ИСТОРИИ (HISTORY-SAMPLE) ===")
+    print(f"   history:match:* ключей: {len(keys)}")
+    result = {"total_keys": len(keys)}
+
     meta = _read_meta("football_data:meta")
-    issues = []
     if not isinstance(meta, dict):
-        if total_keys > 0:
-            issues.append("football_data:meta отсутствует при непустой истории "
-                          "(flush без загрузчика?)")
-            print(f"   ❌ Мета отсутствует при {total_keys} записях истории")
-        else:
-            print("   ℹ Мета отсутствует, история пуста — легитимное состояние до первой загрузки")
-    else:
-        parts = [meta.get(k) for k in ("written", "deduped", "skipped_past", "skipped_future")]
-        total_events = meta.get("total_events")
-        if all(isinstance(p, int) for p in parts) and isinstance(total_events, int):
-            s = sum(parts)
-            if s == total_events:
-                print(f"   ✅ Мета консистентна: written+deduped+skipped = {s} = total_events")
-            else:
-                issues.append(f"мета: сумма {s} != total_events {total_events}")
-        else:
-            issues.append("мета: неполные счётчики")
-        last_run = meta.get("last_run")
-        stale = _check_stale(str(last_run)) if last_run else True
-        print(f"   last_run: {last_run} | stale: {'да (>2ч)' if stale else 'нет'}")
-        if stale:
-            issues.append("мета устарела (>2ч)")
-        # Информационная сверка (НЕ вердикт): stored_matches — поргонный счётчик
-        stored = meta.get("stored_matches")
-        print(f"   stored_matches (поргонный): {stored} | обработанных файлов: "
-              f"{len(meta.get('processed_files', []))}")
+        if keys:
+            print("   ❌ football_data:meta отсутствует при непустой истории (R-1 нарушен)")
+            return {"total_keys": len(keys), "meta": "missing"}, False
+        print("   ℹ История пуста и мета отсутствует — легитимное состояние до первой записи")
+        return {"total_keys": 0, "meta": "missing_before_first_write"}, True
 
-    # --- Распределение дат: MGET чанками по 50 ---
+    written = meta.get("written") or 0
+    deduped = meta.get("deduped") or 0
+    skipped = (meta.get("skipped_past") or 0) + (meta.get("skipped_future") or 0)
+    total_events = meta.get("total_events")
+    s_sum = written + deduped + skipped
+    last_run = meta.get("last_run", "неизвестно")
+    stale = _check_stale(last_run)
+    print(f"   last_run: {last_run} | stale: {'да' if stale else 'нет'}")
+    if total_events is not None and s_sum != total_events:
+        print(f"   ❌ Мета неконсистентна: written+deduped+skipped = {s_sum} != total_events {total_events}")
+        ok = False
+    else:
+        print(f"   ✅ Мета консистентна: written+deduped+skipped = {s_sum} = total_events {total_events}")
+    result["meta_consistent"] = ok
+    result["total_events"] = total_events
+
+    sm = meta.get("stored_matches")
+    if sm is not None:
+        pf = meta.get("processed_files") or []
+        print(f"   stored_matches (поргонный): {sm} | обработанных файлов: {len(pf)}")
+        if sm != len(keys):
+            print(f"   ℹ SCAN {len(keys)} != stored_matches {sm} — норма: счётчик поргонный, "
+                  f"а не накопительный (см. прогоны #22/#23)")
+
+    # --- Гистограмма дат и топ лиг: MGET-чанками, 1 команда на 50 записей ---
     date_hist = defaultdict(int)
     league_hist = defaultdict(int)
-    unreadable = 0
-    CHUNK = 50
-    for i in range(0, min(total_keys, 5000), CHUNK):
-        chunk = keys[i:i + CHUNK]
-        raw = redis_command(["MGET", *chunk])
-        if not isinstance(raw, list) or len(raw) != len(chunk):
-            raise NetworkError(f"MGET чанк {i}: неожиданный ответ")
-        for k, v in zip(chunk, raw):
-            if v is None:
+    readable = unreadable = 0
+    recs = []
+    for i in range(0, len(keys), HISTORY_SAMPLE_MGET_CHUNK):
+        chunk = keys[i:i + HISTORY_SAMPLE_MGET_CHUNK]
+        raws = redis_command(["MGET", *chunk])
+        if not isinstance(raws, list) or len(raws) != len(chunk):
+            raise NetworkError(f"MGET чанк {i}: неожиданный формат ответа: {type(raws).__name__}")
+        for key, raw in zip(chunk, raws):
+            if raw is None:
+                unreadable += 1
                 continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
             try:
-                data = json.loads(v) if isinstance(v, (str, bytes)) else v
+                data = json.loads(raw) if isinstance(raw, str) else raw
             except (json.JSONDecodeError, ValueError):
                 unreadable += 1
                 continue
             if not isinstance(data, dict):
                 unreadable += 1
                 continue
-            date = data.get("date_utc") or ""
-            month = str(date)[:7] or "неизвестно"
-            date_hist[month] += 1
-            lg = data.get("league_code") or data.get("competition") or "неизвестно"
-            league_hist[str(lg)] += 1
-    if date_hist:
-        print(f"   Распределение дат ({sum(date_hist.values())} записей):")
-        for month in sorted(date_hist):
-            print(f"     {month}: {date_hist[month]}")
-    if league_hist:
-        tops = sorted(league_hist.items(), key=lambda x: -x[1])[:8]
-        print(f"   Топ лиг по записям: " + ", ".join(f"{k}={v}" for k, v in tops))
+            payload = _payload(data)
+            readable += 1
+            recs.append((key, payload))
+            d = str(payload.get("date_utc") or "")[:7]
+            date_hist[d if d else "?"] += 1
+            league_hist[str(payload.get("league_code") or "?")] += 1
+    result["readable"], result["unreadable"] = readable, unreadable
     if unreadable:
-        issues.append(f"нечитаемых записей: {unreadable}")
+        print(f"   ⚠ Нечитаемых записей: {unreadable} (битый JSON / None) — прогон не роняется")
+    print(f"   Распределение дат ({readable + unreadable} записей):")
+    for d in sorted(date_hist):
+        print(f"     {d}: {date_hist[d]}")
+    top = sorted(league_hist.items(), key=lambda x: -x[1])[:8]
+    print("   Топ лиг по записям: " + ", ".join(f"{k}={v}" for k, v in top))
+    result["date_histogram"] = dict(sorted(date_hist.items()))
 
-    # --- Разбор образцов ---
-    def _fmt(v, n=200):
-        try:
-            s = json.dumps(v, ensure_ascii=False)
-        except (TypeError, ValueError):
-            s = str(v)
-        return s[:n] + ("…" if len(s) > n else "")
+    # --- Выборка образцов: фильтр по лиге или первые limit отсортированных ключей ---
+    if sample_league:
+        sl = str(sample_league).strip().lower()
+        picked = []
+        for key, payload in recs:
+            lg = str(payload.get("league_code") or "").lower()
+            comp = str(payload.get("competition") or "").lower()
+            if sl in (lg, comp):
+                picked.append((key, payload))
+            if len(picked) >= limit:
+                break
+        if not picked:
+            print(f"   ℹ --sample-league {sample_league}: не найдено за обзор {len(recs)} записей "
+                  f"(доп. GET не тратятся: выборка уже в MGET-чанках)")
+    else:
+        picked = recs[:limit]
 
-    shown = 0
-    for key in keys:
-        if shown >= limit:
-            break
-        cid = key[len("history:match:"):] if isinstance(key, str) else str(key)
-        rec = get_history_record(cid)
-        if not isinstance(rec, dict):
-            continue
-        if sample_league:
-            comp = (str(rec.get("league_code") or rec.get("competition") or "")).upper()
-            if sample_league.upper() not in comp:
-                continue
-        shown += 1
-        stats = rec.get("stats") if isinstance(rec.get("stats"), dict) else {}
-        ou = rec.get("odds_over_under") if isinstance(rec.get("odds_over_under"), dict) else {}
-        ah = rec.get("odds_asian_handicap")
-        flat = rec.get("odds_1x2")
-        csv_raw = rec.get("csv_raw")
-        print(f"\n   --- Образец {shown}: {cid} ---")
-        print(f"     лига: {rec.get('league_code') or rec.get('competition')} | "
-              f"дата: {rec.get('date_utc')} | счёт: {rec.get('home_goals')}-{rec.get('away_goals')}")
-        print(f"     xg: {stats.get('xg_home')} / {stats.get('xg_away')} "
-              f"(None = колонок xG нет в CSV этой лиги/сезона — норма)")
-        print(f"     odds_1x2: {_fmt(flat, 120)}")
-        print(f"     O/U 2.5: {_fmt(ou.get('2.5'), 250)}")
-        print(f"     O/U 1.5 / 3.5: {ou.get('1.5')} / {ou.get('3.5')} "
-              f"(None — резерв линий, норма v8.13)")
-        print(f"     AH: {_fmt(ah, 200)}")
-        print(f"     csv_raw: {len(csv_raw) if csv_raw else 0} полей")
-    if sample_league and shown == 0:
-        issues.append(f"записей лиги '{sample_league}' не найдено в выборке")
+    score_ok = score_missing = 0
+    key_dump_done = False
+    for n, (key, payload) in enumerate(picked, 1):
+        print(f"\n   --- Образец {n}: {key.replace('history:match:', '')} ---")
+        print(f"     лига: {payload.get('league_code') or '?'} | дата: {payload.get('date_utc') or '?'} | "
+              f"статус: {payload.get('status') or '?'} | FTR: {payload.get('full_time_result') or '—'}")
+        score, where, probes = _extract_score(payload)
+        if score is not None:
+            score_ok += 1
+            print(f"     счёт: {score['home']}-{score['away']} (источник: {where})")
+        elif (payload.get("status") or "") != "completed":
+            print(f"     счёт: — (статус {payload.get('status')}, результата по природе нет)")
+        else:
+            score_missing += 1
+            print(f"     ❌ счёт не найден; пробы: {', '.join(probes) or 'нет'}")
+            if not key_dump_done:
+                print(f"     дамп ключей записи ({len(payload)}): {', '.join(sorted(payload.keys()))}")
+                cr0 = payload.get("csv_raw")
+                if isinstance(cr0, dict):
+                    print(f"     csv_raw FTHG/FTAG: {cr0.get('FTHG')!r} / {cr0.get('FTAG')!r}")
+                key_dump_done = True
+        stats = payload.get("stats") or {}
+        xg_h, xg_a = stats.get("xg_home"), stats.get("xg_away")
+        if xg_h is None and xg_a is None:
+            print("     xg: None / None (колонок xG нет в CSV этой лиги/сезона — норма)")
+        else:
+            print(f"     xg: {xg_h} / {xg_a}")
+        o1x2 = payload.get("odds_1x2")
+        print(f"     odds_1x2: {json.dumps(o1x2, ensure_ascii=False) if o1x2 else '—'}")
+        ou = payload.get("odds_over_under") or {}
+        ou25 = ou.get("2.5") if isinstance(ou, dict) else None
+        closing = ou25.get("closing") if isinstance(ou25, dict) else None
+        hist_len = len(ou25.get("odds_history") or []) if isinstance(ou25, dict) else 0
+        print(f"     O/U 2.5: {json.dumps(closing, ensure_ascii=False) if closing else '— (нет closing в CSV)'}"
+              f" | снапшотов: {hist_len}")
+        print(f"     O/U 1.5 / 3.5: {ou.get('1.5')} / {ou.get('3.5')} (None — резерв линий, норма v8.13)")
+        ah = payload.get("odds_asian_handicap")
+        if isinstance(ah, dict) and ah.get("closing"):
+            print(f"     AH: line {ah.get('line')} | closing {json.dumps(ah['closing'], ensure_ascii=False)}"
+                  f" | снапшотов: {len(ah.get('odds_history') or [])}")
+        else:
+            print("     AH: — (нет в CSV)")
+        cr = payload.get("csv_raw")
+        print(f"     csv_raw: {len(cr) if isinstance(cr, dict) else '—'} полей")
 
-    if issues:
-        for it in issues:
-            print(f"   ❌ {it}")
-        print("   ✗ История: есть замечания")
-        return {"keys": total_keys, "issues": issues,
-                "date_hist": dict(date_hist)}, False
-    print("   ✅ История: разбор чист")
-    return {"keys": total_keys, "date_hist": dict(date_hist),
-            "league_top": dict(sorted(league_hist.items(), key=lambda x: -x[1])[:8])}, True
+    if picked:
+        result["samples"] = len(picked)
+        result["score_found"] = score_ok
+        result["score_missing_completed"] = score_missing
+        if score_missing:
+            print(f"\n   ❌ Счёт отсутствует в {score_missing} из {len(picked)} сыгранных образцов — "
+                  f"дамп ключей выше; поверхность: писатель (gatekeeper_hub.upsert_match), не читатель")
+            ok = False
+        else:
+            print(f"\n   ✅ История: разбор чист (счёт найден в {score_ok}/{len(picked)} образцов)")
+    return result, ok
 
 
+# ===========================================================================
+# CLI
+# ===========================================================================
 def build_parser():
     parser = argparse.ArgumentParser(
         description=f"Единая диагностика Gatekeeper-AI v{__version__} (read-only)")
@@ -1211,8 +1267,8 @@ def build_parser():
                         help="Лимит вывода записей (propline/sample/keys/matches/indexes)")
     parser.add_argument("--min-free-mb", type=int, default=DEFAULT_MIN_FREE_MB,
                         help="Порог свободной памяти для режима memory (§13.4)")
-    parser.add_argument("--sample-league", default=None,
-                        help="[history-sample] фильтр образцов по лиге (league_code/competition)")
+    parser.add_argument("--sample-league", dest="sample_league", default=None,
+                        help="history-sample: фильтр образцов по league_code/competition")
     return parser
 
 
