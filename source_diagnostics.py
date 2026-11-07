@@ -43,6 +43,19 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 __version__ = "10.0.0-merged"  # Контрактная строка версии — сверить пин в test_contracts.py
+# [10.0.0 FIX #76] Диспетчер: всем обработчикам с сигнатурой (ctx, ...) передаётся
+#     "ctx": ctx — в full-ветке и в dispatch-таблице (run #74/#75: TypeError).
+# [10.0.0 FIX §18.1] cmd_redis НЕ вызывает run_initialization: по поверхности
+#     gatekeeper_hub v9.6.9-history тот выполняет WRITE-операции (migrate_schema,
+#     cleanup_expired(auto_migrate=True), _flush_health_metrics -> save_to_cache
+#     system:health). Read-only диагностика не запускает write-контур; доступность
+#     транспорта проверяется is_redis_available() (read-only PING).
+# [10.0.0 FIX] CB-статус: реальные ключи поверхности redis_hub —
+#     {"open": bool, "error_count": int, "threshold": int} (ранее — state/status,
+#     отсюда «unknown» в run #76).
+# [10.0.0 FIX] Пустая выборка HGETALL подтверждается HLEN: None-ответ или
+#     расхождение — NetworkError (анти-fake-empty; в #76 таймаут HGETALL маскировался
+#     «Хэш: 0 полей» при живом bzzoiro:meta).
 
 __all__ = [
     "MODES", "resolve_classification", "is_value_signal", "fetch_history_pool",
@@ -343,7 +356,21 @@ class Context:
                 fields = get_all_fields()
             except Exception as e:
                 raise NetworkError(f"get_all_fields: {e}")
-            self._fields = fields if isinstance(fields, dict) else {}
+            if not isinstance(fields, dict):
+                raise NetworkError(f"get_all_fields: не-dict ответ транспорта: {fields!r}")
+            if not fields:
+                # [10.0.0 FIX] Пустая выборка HGETALL подтверждается HLEN: таймаут
+                # транспорта, заглушенный до {}, раньше маскировался «0 полей».
+                hlen = None
+                try:
+                    hlen = redis_command(["HLEN", HASH_NAME])
+                except Exception:
+                    hlen = None
+                if hlen is None or hlen != 0:
+                    raise NetworkError(
+                        f"Пустая выборка HGETALL не подтверждена HLEN={hlen!r} — сбой транспорта"
+                    )
+            self._fields = fields
         return self._fields
 
 
@@ -419,16 +446,20 @@ def cmd_redis(ctx):
             info["errors"].append(f"redis_config: {e}")
     else:
         info["errors"].append("redis_config недоступен — статус конфигурации не проверен")
+    # [10.0.0 FIX §18.1] run_initialization() — write-контур хаба (миграция,
+    # cleanup_expired(auto_migrate=True), запись system:health). Из read-only
+    # диагностики не вызывается. Доступность — честный read-only PING.
     try:
-        init = run_initialization(collector="source_diagnostics")
-        info["redis_available"] = bool(init.get("redis_available", False))
+        info["redis_available"] = bool(is_redis_available())
     except Exception as e:
-        info["errors"].append(f"run_initialization: {e}")
+        info["errors"].append(f"redis_available: {e}")
     try:
         cb = get_circuit_breaker_status()
         if isinstance(cb, dict):
-            info["circuit_breaker"] = cb.get("state", cb.get("status", "unknown"))
-            info["cb_failures"] = cb.get("failures", 0)
+            # [10.0.0 FIX] Реальная поверхность redis_hub.get_circuit_breaker_status():
+            # {"open": bool, "error_count": int, "threshold": int}
+            info["circuit_breaker"] = "open" if cb.get("open") else "closed"
+            info["cb_failures"] = cb.get("error_count", 0)
     except Exception as e:
         info["errors"].append(f"circuit_breaker: {e}")
 
@@ -957,12 +988,12 @@ def main(argv=None):
         dispatch = {
             "redis": (cmd_redis, {"ctx": ctx}),
             "sources": (cmd_sources, {"ctx": ctx}),
-            "matches": (cmd_matches, {"limit": args.limit}),
-            "indexes": (cmd_indexes, {"limit": args.limit}),
-            "errors": (cmd_errors, {"limit": args.limit}),
-            "sample": (cmd_sample, {"limit": args.limit}),
+            "matches": (cmd_matches, {"ctx": ctx, "limit": args.limit}),
+            "indexes": (cmd_indexes, {"ctx": ctx, "limit": args.limit}),
+            "errors": (cmd_errors, {"ctx": ctx, "limit": args.limit}),
+            "sample": (cmd_sample, {"ctx": ctx, "limit": args.limit}),
             "propline": (cmd_propline, {"ctx": ctx, "limit": args.limit}),
-            "keys": (cmd_keys, {"limit": args.limit}),
+            "keys": (cmd_keys, {"ctx": ctx, "limit": args.limit}),
             "history-contracts": (cmd_history_contracts, {"ctx": ctx}),
             "memory": (cmd_memory, {"min_free_mb": args.min_free_mb}),
         }
