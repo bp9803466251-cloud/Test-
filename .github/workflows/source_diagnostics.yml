@@ -27,7 +27,9 @@ on:
       min_free_mb:
         description: 'Порог свободной памяти для режима memory (МБ, §13.4)'
         required: false
-        default: '512'
+        # [FIX] Порог 512 (и канонический 100) физически недостижим для инстанса 64 МБ —
+        # загрузчик был бы заблокирован навсегда. 32 — рабочий порог текущего плана Upstash.
+        default: '32'
 
 permissions:
   contents: read
@@ -63,6 +65,10 @@ jobs:
       UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       GATEKEEPER_ENV: production
+      # [FIX] Таймаут транспорта 15 с вместо дефолтных 6: пагинированный HSCAN
+      # (~40 страниц по 250 полей на легаси-хэше 43 МБ) на медленном Upstash
+      # иначе ловит интермиттентные read-timeout (#76/#77).
+      GATEKEEPER_REDIS_TIMEOUT: '15'
 
     steps:
       - name: Checkout Repository
@@ -84,7 +90,9 @@ jobs:
           # [FIXED 9.6.8, сохранён] Инъекция закрыта: ручной ввод интерполируется
           # только в env-блок; type: choice не валидируется при запуске через API
           DIAG_MODE: ${{ github.event.inputs.mode || 'full' }}
-          DIAG_MIN_FREE_MB: ${{ github.event.inputs.min_free_mb || '512' }}
+          # [FIX] Fallback 512 -> 32: при запуске через API input min_free_mb может
+          # не прийти, и fallback вернул бы недостижимый порог
+          DIAG_MIN_FREE_MB: ${{ github.event.inputs.min_free_mb || '32' }}
         run: |
           case "$DIAG_MODE" in
             full|redis|sources|matches|indexes|errors|sample|propline|keys|history-contracts|memory)

@@ -58,6 +58,9 @@ jobs:
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
       GATEKEEPER_CONFIG_FILE: 'gatekeeper_config.yaml'
       GATEKEEPER_ENV: production
+      # [10.0.0 FIX #78] Таймаут транспорта 15 с: HSCAN-страницы легаси-хэша
+      # (9925 полей) не помещаются в дефолтные 6 с — Upstash местами медленный
+      GATEKEEPER_REDIS_TIMEOUT: '15'
 
     steps:
       - name: Checkout Repository
