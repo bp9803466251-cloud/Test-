@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v8.12-patched (CSV) — ALL columns, GatekeeperAI v710
+Football-Data Collector v8.13-metrics (CSV) — ALL columns, GatekeeperAI v710
 Источник: football-data.co.uk
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
+
+v8.13-metrics (метрическое расширение):
+  - parse_stat: NA/пусто -> None для метрик stats (различение «нет данных» и «0»)
+  - build_stats: + xg_home/xg_away из HxG/AxG (optional; None если колонки нет)
+  - odds_over_under: closing-каскад O/U 2.5 (PC -> MaxC -> B365C -> AvgC -> BFEC);
+    линии 1.5/3.5 = null (резерв под живой сбор Prompt №2)
+  - odds_asian_handicap: линия AHCh (float, 0 валиден) + closing-каскад квот
+  - CLOSING_CASCADE: + X1XBCH перед B365, + BFDCH/BFECH в конце
+  - source_map: soft_bookmakers синхронизированы с каскадом; xG-блок с provider-атрибуцией
 
 v8.12-patched (Шаг 13-B):
   - Строгий импорт хаба (13-G1): без gatekeeper_hub прогон не стартует;
@@ -22,7 +31,7 @@ v8.12-patched (Шаг 13-B):
 
 Schema: v710 (Гейт 28)
 CSV:    120 колонок (opening + closing odds, O/U 2.5, Asian Handicap) — целиком в csv_raw
-Stats:  12 метрик + _source + _updated_at
+Stats:  12 метрик + xG (optional) + _source + _updated_at
 Transport: только gatekeeper_hub.upsert_match(mode="history") — §23
 """
 
@@ -82,8 +91,8 @@ except ImportError:
 # CONFIG
 # ============================================================================
 
-VERSION = "8.12-patched"
-__version__ = "8.12-patched"
+VERSION = "8.13-metrics"
+__version__ = "8.13-metrics"
 
 # FIX-3: Убран logging.basicConfig
 logger = logging.getLogger(__name__)
@@ -109,10 +118,33 @@ CLOSING_CASCADE = [
     ("PPCH",   "PPCD",   "PPCA",   "pinnacle"),
     ("MaxCH",  "MaxCD",  "MaxCA",  "market_max"),
     ("AvgCH",  "AvgCD",  "AvgCA",  "market_avg"),
+    ("X1XBCH", "X1XBD",  "X1XBA",  "1xbet"),
     ("B365CH", "B365CD", "B365CA", "bet365"),
     ("BWCH",   "BWCD",   "BWCA",   "bwin"),
     ("IWCH",   "IWD",    "IWA",    "interwetten"),
     ("PSCH",   "PSCD",   "PSCA",   "pinnacle"),
+    ("BFDCH",  "BFDCD",  "BFDCA",  "betfair_sportsbook"),
+    ("BFECH",  "BFECD",  "BFECA",  "betfair_exchange"),
+]
+
+# v8.13: closing-каскады O/U и AH. В CSV football-data линия O/U только 2.5;
+# 1.5/3.5 зарезервированы под живой сбор Prompt №2 (null в структуре, не 0).
+# Max/Avg — агрегаты агрегатора, в декларации независимости источниками не считаются.
+OU_CLOSING_CASCADE = [
+    ("PC>2.5",    "PC<2.5",    "pinnacle"),
+    ("MaxC>2.5",  "MaxC<2.5",  "market_max"),
+    ("B365C>2.5", "B365C<2.5", "bet365"),
+    ("AvgC>2.5",  "AvgC<2.5",  "market_avg"),
+    ("BFEC>2.5",  "BFEC<2.5",  "betfair_exchange"),
+]
+OU_LINES = {"1.5": None, "2.5": OU_CLOSING_CASCADE, "3.5": None}
+
+AH_CLOSING_CASCADE = [
+    ("PCAHH",    "PCAHA",    "pinnacle"),
+    ("MaxCAHH",  "MaxCAHA",  "market_max"),
+    ("B365CAHH", "B365CAHA", "bet365"),
+    ("AvgCAHH",  "AvgCAHA",  "market_avg"),
+    ("BFECAHH",  "BFECAHA",  "betfair_exchange"),
 ]
 
 # §13.4: стоп-лосс — 90% суточного бюджета команд Upstash (10 000/день)
@@ -467,6 +499,21 @@ def safe_int(val):
         return 0
 
 
+def parse_stat(val):
+    """Статистика матча: пусто/NA/None -> None («данных нет»), отличимо от 0 (v8.13).
+    Заменяет safe_int в build_stats: фальшивые нули искажали дисперсию для
+    шринкейджа (§8), пост-аудит E003 и DQS-Statistics."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s == "" or s.upper() == "NA":
+        return None
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return None
+
+
 def safe_str(val):
     if val is None:
         return ""
@@ -499,7 +546,9 @@ def detect_flags(stats, score):
     total_goals = score["home"] + score["away"]
     extreme = total_goals >= 7
     abnormal = total_goals >= 8
-    red_driven = stats.get("red_home", 0) > 0 or stats.get("red_away", 0) > 0
+    red_home = stats.get("red_home") or 0
+    red_away = stats.get("red_away") or 0
+    red_driven = red_home > 0 or red_away > 0
     return {
         "extreme_result": extreme,
         "abnormal_score": abnormal,
@@ -508,19 +557,25 @@ def detect_flags(stats, score):
 
 
 def build_stats(row, ts):
+    """12 метрик + xG (optional). NA/пусто -> None, не 0 (v8.13).
+    xG (HxG/AxG) появился в CSV только с сезона 2526: отсутствие колонки
+    -> None, чтобы Model A откатывался в xG-NULL, а не активировался с нулевым xG.
+    xGA команды = xG соперника из той же записи (добывать не нужно)."""
     return {
-        "shots_home": safe_int(row.get("HS", 0)),
-        "shots_away": safe_int(row.get("AS", 0)),
-        "shots_on_target_home": safe_int(row.get("HST", 0)),
-        "shots_on_target_away": safe_int(row.get("AST", 0)),
-        "corners_home": safe_int(row.get("HC", 0)),
-        "corners_away": safe_int(row.get("AC", 0)),
-        "fouls_home": safe_int(row.get("HF", 0)),
-        "fouls_away": safe_int(row.get("AF", 0)),
-        "yellow_home": safe_int(row.get("HY", 0)),
-        "yellow_away": safe_int(row.get("AY", 0)),
-        "red_home": safe_int(row.get("HR", 0)),
-        "red_away": safe_int(row.get("AR", 0)),
+        "shots_home": parse_stat(row.get("HS")),
+        "shots_away": parse_stat(row.get("AS")),
+        "shots_on_target_home": parse_stat(row.get("HST")),
+        "shots_on_target_away": parse_stat(row.get("AST")),
+        "corners_home": parse_stat(row.get("HC")),
+        "corners_away": parse_stat(row.get("AC")),
+        "fouls_home": parse_stat(row.get("HF")),
+        "fouls_away": parse_stat(row.get("AF")),
+        "yellow_home": parse_stat(row.get("HY")),
+        "yellow_away": parse_stat(row.get("AY")),
+        "red_home": parse_stat(row.get("HR")),
+        "red_away": parse_stat(row.get("AR")),
+        "xg_home": safe_float(row.get("HxG", "")),
+        "xg_away": safe_float(row.get("AxG", "")),
         "_source": SOURCE_NAME,
         "_updated_at": ts,
     }
@@ -541,9 +596,17 @@ def build_source_map(ts):
             "timestamp": ts,
             "independent": True,
         },
+        "xg": {
+            "source": SOURCE_NAME,
+            "provider": "football_data",
+            "upstream": None,
+            "timestamp": ts,
+            "independent": True,
+        },
         "types": ["closing"],
         "sharp_benchmark": "pinnacle",
-        "soft_bookmakers": ["bet365", "bwin", "betfair"],
+        "soft_bookmakers": ["bet365", "bwin", "1xbet",
+                            "betfair_sportsbook", "betfair_exchange"],
     }
 
 
@@ -583,6 +646,66 @@ def build_odds_flat(row, ts):
     return odds_1x2, snapshots
 
 
+def build_odds_over_under(row, ts):
+    """v8.13: closing-каскад O/U по линии 2.5 (§12.8 по образцу 1X2).
+    Возвращает (ou_block, snapshots). Линии 1.5/3.5 -> null (рынка нет в CSV,
+    добирается живым сбором Prompt №2; null ≠ 0 — line identity §35.2).
+    Снапшот пишется только при полной паре over+under."""
+    snapshots = []
+    closing = None
+    for over_key, under_key, upstream in OU_CLOSING_CASCADE:
+        over = safe_float(row.get(over_key, ""))
+        under = safe_float(row.get(under_key, ""))
+        if over is None or under is None:
+            continue
+        price = {"over": over, "under": under}
+        if closing is None:
+            closing = price  # первый полный набор каскада = наивысший приоритет
+        snapshots.append({
+            "source": SOURCE_NAME,
+            "upstream": upstream,
+            "market": "over_under",
+            "line": 2.5,
+            "price": price,
+            "timestamp": ts,
+            "type": "closing",
+        })
+    block_25 = {"closing": closing, "odds_history": snapshots} if closing else None
+    return {"1.5": None, "2.5": block_25, "3.5": None}, snapshots
+
+
+def build_odds_asian_handicap(row, ts):
+    """v8.13: closing-каскад AH. Линия AHCh (float) + пары home/away квот.
+    Возвращает (ah_block, snapshots); ah_block=None если линии или квот нет
+    (линия остаётся в csv_raw). ВАЖНО: AHCh=0 (равная фора) — валидная линия,
+    проверка на is not None, не на truthiness (кейс легаси-записи #5)."""
+    line = safe_float(row.get("AHCh", ""))
+    if line is None:
+        return None, []
+    snapshots = []
+    closing = None
+    for h_key, a_key, upstream in AH_CLOSING_CASCADE:
+        home = safe_float(row.get(h_key, ""))
+        away = safe_float(row.get(a_key, ""))
+        if home is None or away is None:
+            continue
+        price = {"home": home, "away": away}
+        if closing is None:
+            closing = price
+        snapshots.append({
+            "source": SOURCE_NAME,
+            "upstream": upstream,
+            "market": "asian_handicap",
+            "line": line,
+            "price": price,
+            "timestamp": ts,
+            "type": "closing",
+        })
+    if closing is None:
+        return None, []  # линия есть, квот нет — рынок не верифицируем структурно
+    return {"line": line, "closing": closing, "odds_history": snapshots}, snapshots
+
+
 def build_payload(row, season, league_code, run_id=None):
     """Build full match payload — ALL CSV columns + structured data.
     v7.0: +source, +sources, +run_id для хаба."""
@@ -609,6 +732,8 @@ def build_payload(row, season, league_code, run_id=None):
 
     stats = build_stats(row, ts)
     odds_1x2, odds_snapshots = build_odds_flat(row, ts)
+    odds_over_under, _ = build_odds_over_under(row, ts)
+    odds_asian_handicap, _ = build_odds_asian_handicap(row, ts)
     source_map = build_source_map(ts)
     csv_raw = build_csv_raw(row)
 
@@ -643,6 +768,8 @@ def build_payload(row, season, league_code, run_id=None):
         "sources": [SOURCE_NAME],
         "odds_1x2": odds_1x2,
         "odds_history": odds_snapshots,
+        "odds_over_under": odds_over_under,
+        "odds_asian_handicap": odds_asian_handicap,
         "source_ids": {"football_data": f"csv_{season}_{league_code}"},
         "h2h": {},
         "stats": stats,
