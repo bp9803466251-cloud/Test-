@@ -3,12 +3,14 @@ name: Source Diagnostics
 # [10.0.0-merged] Единый диагностический воркфлоу. Заменяет шесть:
 #   check_redis.yml, redis_diagnostics.yml (старый), match_dump.yml,
 #   а также исторические ветки verify_history и скан-модуля ключей загрузчиков.
-# Модуль: source_diagnostics.py (read-only ядро, 11 режимов).
+# Модуль: source_diagnostics.py (read-only ядро, 12 режимов).
+# [10.0.2] Добавлен режим history-sample: разбор живой истории v8.13
+#   (SCAN, MGET-гистограмма дат, образцы xG/O/U/AH, консистентность мета).
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Режим: full, redis, sources, matches, indexes, errors, sample, propline, keys, history-contracts, memory'
+        description: 'Режим: full, redis, sources, matches, indexes, errors, sample, propline, keys, history-contracts, history-sample, memory'
         required: false
         type: choice
         options:
@@ -22,6 +24,7 @@ on:
           - propline
           - keys
           - history-contracts
+          - history-sample
           - memory
         default: full
       min_free_mb:
@@ -97,7 +100,7 @@ jobs:
           DIAG_MIN_FREE_MB: ${{ github.event.inputs.min_free_mb || '32' }}
         run: |
           case "$DIAG_MODE" in
-            full|redis|sources|matches|indexes|errors|sample|propline|keys|history-contracts|memory)
+            full|redis|sources|matches|indexes|errors|sample|propline|keys|history-contracts|history-sample|memory)
               ;;
             *)
               echo "⚠ Неизвестный режим '$DIAG_MODE' - откат на full"
