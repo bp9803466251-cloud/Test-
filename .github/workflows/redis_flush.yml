@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Режим: history-only, soft, hard, purge, reset-breaker'
+        description: 'Режим: history-only, soft, hard, purge (TOTAL WIPE — все ключи + все поля хэша), reset-breaker'
         required: true
         type: choice
         options:
