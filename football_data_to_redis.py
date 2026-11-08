@@ -1391,4 +1391,14 @@ def main():
 
 
 if __name__ == "__main__":
+    # v8.17.1-obs: FIX-3 убрал basicConfig ради библиотечного импорта (правильно),
+    # но script-режим остался с NullHandler — INFO-сводки (Season/Matches/итоги)
+    # не печатались вовсе, dry-run и боевые прогоны немы в CI-логе.
+    # Консольный хендлер ставится ТОЛЬКО при запуске как скрипта; библиотечное
+    # поведение (импорт движком) не затронуто.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     sys.exit(main())
