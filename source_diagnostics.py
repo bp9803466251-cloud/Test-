@@ -38,12 +38,6 @@ write-телеметрия — metrics.py (контракт system:health не �
 #     внутренняя консистентность мета (written+deduped+skipped == total_events);
 #     stored_matches печатается как информация (счётчик поргонный — прогоны #22/#23),
 #     гистограмма дат и топ лиг через MGET-чанки, разбор образцов по контракту v8.13.
-# [10.0.5 MEMFIX #85] cmd_memory: fake-empty устранён. redis_command при сбое
-#     транспорта возвращает None без исключения — прежний код попадал в ветку
-#     "maxmemory не задан" и давал зелёный precheck на мёртвом чтении (#85:
-#     used 0.0 MB при живых 3753 записях). Теперь: INFO=None -> NetworkError;
-#     used_memory обязателен; DBSIZE кросс-проверка: used=0 при DBSIZE>0 —
-#     невозможное состояние, честный NetworkError. Precheck стал fail-closed.
 # [10.0.3 SCORE-PROBE] Счёт по канону build_payload v8.13: score={"home","away"},
 #     full_time_result (FTR); каскад проб (плоские ключи -> csv_raw FTHG/FTAG);
 #     при промахе — дамп ключей записи и честный exit 1 (поверхность: писатель).
@@ -57,6 +51,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 __version__ = "10.0.5-memfix"  # Контрактная строка версии — сверить пин в test_contracts.py
+# [10.0.5 MEMFIX #85] cmd_memory: None-ответ INFO/DBSIZE -> NetworkError (fail-closed);
+#     used_memory обязателен; кросс-проверка used=0 при dbsize>0 — мёртвое чтение,
+#     честный exit 1 вместо зелёного precheck. В вывод добавлен dbsize.
 # [10.0.0 FIX #76] Диспетчер: всем обработчикам с сигнатурой (ctx, ...) передаётся
 #     "ctx": ctx — в full-ветке и в dispatch-таблице (run #74/#75: TypeError).
 # [10.0.0 FIX §18.1] cmd_redis НЕ вызывает run_initialization: по поверхности
@@ -1031,17 +1028,20 @@ def cmd_history_contracts(ctx):
 
 def cmd_memory(min_free_mb=DEFAULT_MIN_FREE_MB):
     """Режим memory (§13.4): precheck свободной памяти для football_data_loader.
-    Exit 1 при free_mb < min_free_mb; maxmemory=0 (квота не задана) — exit 0 с пометкой.
-    [10.0.5 MEMFIX] Fail-closed: мёртвое чтение INFO (None-ответ транспорта) —
-    NetworkError, а не ветка "квота не задана" (#85: зелёный свет на fake-empty)."""
+    Exit 1 при free_mb < min_free_mb; maxmemory=0 (квота не задана) — exit 0 с пометкой."""
     print("\n=== MEMORY PRECHECK (§13.4) ===")
+    # [10.0.5 MEMFIX #85] redis_command при сбое транспорта возвращает None БЕЗ
+    # исключения — прежний код превращал это в str(None), парсинг не находил
+    # used/maxmemory, и ветка "квота не задана" давала зелёный exit 0 на
+    # мёртвом чтении (#85: used 0.0 MB при живых 3753 ключах). Fail-closed:
+    # нечитаемый INFO — честный NetworkError.
     try:
         info = redis_command(["INFO", "memory"])
     except Exception as e:
         raise NetworkError(f"INFO memory: {e}")
-    # [10.0.5 MEMFIX] None-ответ транспорта — НЕ "квота не задана", а мёртвое чтение.
     if info is None:
-        raise NetworkError("INFO memory: транспорт вернул None (мёртвое чтение) — precheck fail-closed (#85)")
+        raise NetworkError("INFO memory: транспорт вернул пустой ответ (None) — "
+                           "чтение недостоверно, precheck fail-closed (см. #85)")
     text = info.decode("utf-8") if isinstance(info, bytes) else str(info)
     used = maxmem = None
     for line in text.splitlines():
@@ -1049,43 +1049,40 @@ def cmd_memory(min_free_mb=DEFAULT_MIN_FREE_MB):
             used = int(line.split(":", 1)[1])
         elif line.startswith("maxmemory:"):
             maxmem = int(line.split(":", 1)[1])
-    # [10.0.5 MEMFIX] used_memory обязателен всегда: живой INFO его содержит.
+    # [10.0.5 MEMFIX #85] used_memory обязателен в любом живом INFO.
     if used is None:
-        raise NetworkError("INFO memory: used_memory не распознан — ответ усечён или нечитаем")
-    result = {"min_free_mb": min_free_mb, "used_memory": used, "maxmemory": maxmem}
-    # [10.0.5 MEMFIX] Кросс-проверка с независимым источником: DBSIZE.
+        raise NetworkError("INFO memory: used_memory не разобран — чтение недостоверно")
+    # [10.0.5 MEMFIX #85] Кросс-проверка: used=0 при непустом keyspace —
+    # невозможное состояние, сигнатура мёртвого чтения. DBSIZE — одна read-команда.
+    dbsize_raw = redis_command(["DBSIZE"])
+    if dbsize_raw is None:
+        raise NetworkError("DBSIZE: транспорт вернул пустой ответ (None) — "
+                           "чтение недостоверно, precheck fail-closed")
     try:
-        dbsize = redis_command(["DBSIZE"])
-    except Exception as e:
-        raise NetworkError(f"DBSIZE: {e}")
-    if dbsize is None:
-        raise NetworkError("DBSIZE: транспорт вернул None — precheck fail-closed")
-    try:
-        dbsize = int(dbsize)
+        dbsize = int(dbsize_raw)
     except (ValueError, TypeError):
-        raise NetworkError(f"DBSIZE: неожиданный формат ответа: {dbsize!r}")
-    result["dbsize"] = dbsize
-    # [10.0.5 MEMFIX] Невозможное состояние: used=0 байт при живых ключах —
-    # сигнатура мёртвого/усечённого чтения, а не реальной памяти.
+        raise NetworkError(f"DBSIZE: нечисловой ответ {dbsize_raw!r}")
     if used == 0 and dbsize > 0:
-        raise NetworkError(
-            f"INFO memory: used=0 при DBSIZE={dbsize} — невозможное состояние, "
-            "чтение недостоверно (анти-fake-empty #85)")
+        raise NetworkError(f"INFO memory: used_memory=0 при dbsize={dbsize} — "
+                           "мёртвое чтение, сигнатура #85; precheck fail-closed")
+    result = {"min_free_mb": min_free_mb, "used_memory": used, "maxmemory": maxmem,
+              "dbsize": dbsize}
     if maxmem in (None, 0):
-        print(f"   ℹ maxmemory не задан (0) — квоту сервер определить нельзя; "
-              f"used: {used / 1048576:.1f} MB | dbsize: {dbsize}; "
+        print("   ℹ maxmemory не задан (0) — квоту сервер определить нельзя; "
               "контроль остаётся на стороне Upstash quota")
         result["free_mb"] = None
         return result, True
+    if used is None:
+        raise NetworkError("INFO memory: не удалось разобрать used_memory")
     free_mb = (maxmem - used) / 1048576
     result["free_mb"] = round(free_mb, 1)
     ok = free_mb >= min_free_mb
+    dbsize_out = f" | dbsize: {dbsize}" if dbsize is not None else ""
     print(f"   used: {used / 1048576:.1f} MB | max: {maxmem / 1048576:.1f} MB | "
-          f"free: {free_mb:.1f} MB | порог: {min_free_mb} MB | dbsize: {dbsize}")
+          f"free: {free_mb:.1f} MB | порог: {min_free_mb} MB{dbsize_out}")
     if not ok:
         print("   ❌ Недостаточно памяти — загрузчик должен быть приостановлен (§13.4)")
     return result, ok
-
 
 
 # ===========================================================================

@@ -15,19 +15,6 @@ Gatekeeper-AI Ecosystem: Очистка и балансировка операт
            процессе — воркфлоу теряет третий полный обход базы (bandwidth при DATA STOP).
   [10.0.0] Fallback-слой сохранён как заглушки, помечен к ревизии: удалить после
            перевода тестов на контракт v710 (см. guide-delta пункты ревизии).
-Обновления 10.1.0-batch (2026-11-08):
-  - [10.1.0 FIX #21] DEL-батчинг: обособленные ключи удаляются пачками
-    (DEL до 25 ключей на команду, до 10 команд одним /pipeline REST-запросом
-    = 250 ключей на вызов). 10 680 ключей — ~45 REST-вызовов вместо 10 680;
-    реальная скорость поштучного режима была ~460 ключ/мин (~3 DEL/сек),
-    что и уложило execute в таймаут 20 минут на 65% плана.
-  - [10.1.0 FIX] Прогресс-лог: счётчик печатается каждую пачку — устранены
-    «немые» минуты после «Запуск транзакции...» (наблюдаемость, а не подвисание).
-  - [10.1.0] Деградация транспорта сохранена: сбой /pipeline -> поштучный
-    redis_command (семантика PipelineBatch.flush хаба v9.6.9).
-  - Guard §1.7.4 сохранён дословно: HISTORY_FLUSH_CONFIRM=1 обязателен,
-    флаг живёт ровно на время execute (finally — снятие).
-
 Topology: Zero-Folder Architecture (Root Execution)
 Compliance: §1.3 — только urllib.request через redis_hub.py API.
 """
@@ -39,6 +26,15 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 __version__ = "10.1.0-batch"  # Контрактная строка версии для прохождения тестов
+
+# [10.1.0 BATCH #21] Дефект #21: _execute_delete для обособленных ключей делал
+# ОДИН REST-вызов на ключ (redis_command DEL / delete_history_match) — 10680
+# вызовов x ~300мс ~ час, при лимите шага 20 минут прогон убит на 65%.
+# Пайплайн-транспорт redis_hub (§13.4/§27.3) существовал и не использовался.
+# Теперь: DEL-команды по 25 ключей, пачки по 10 команд одним /pipeline-запросом
+# (250 ключей за REST-вызов), прогресс-лог каждой пачки, деградация до
+# поштучной доставки при сбое пайплайна. Guard §1.7.4 сохранён дословно:
+# флаг HISTORY_FLUSH_CONFIRM живёт только на время execute.
 
 logger = logging.getLogger("redis_flush")
 logging.basicConfig(
@@ -163,72 +159,17 @@ def _build_plan(mode, scan_result):
 # ---------------------------------------------------------------------------
 # Выполнение удаления (транспорт redis_command, v710)
 # ---------------------------------------------------------------------------
-# [10.1.0 BATCH] Параметры батчинга удаления обособленных ключей:
-# одна DEL-команда несёт до DEL_CHUNK ключей, группа из PIPE_CHUNK таких
-# команд уходит одним /pipeline REST-запросом (250 ключей на вызов).
-DEL_CHUNK = 25
-PIPE_CHUNK = 10
-
-
-def _del_keys_pipeline(keys, label):
-    """[10.1.0] Пачечное DEL через /pipeline; деградация — поштучный redis_command.
-
-    Возвращает (удалено, ошибок). Печатает прогресс каждой пачки — «немые»
-    минуты (#21) исключены. Деградация повторяет семантику PipelineBatch.flush
-    хаба v9.6.9: сбой транспорта не тихий, ошибки считаются честно.
-    """
-    deleted, errors = 0, 0
-    if not keys:
-        return deleted, errors
-    cmds = [["DEL"] + keys[i:i + DEL_CHUNK] for i in range(0, len(keys), DEL_CHUNK)]
-    done = 0
-    for ps in range(0, len(cmds), PIPE_CHUNK):
-        group = cmds[ps:ps + PIPE_CHUNK]
-        res = _execute_upstash_pipeline(group)
-        if res is None:
-            # Деградация транспорта: поштучная доставка (каждый вызов — до DEL_CHUNK ключей)
-            for cmd in group:
-                r = redis_command(cmd)
-                if r is None:
-                    errors += len(cmd) - 1
-                else:
-                    try:
-                        deleted += max(int(r), 0)
-                    except (ValueError, TypeError):
-                        deleted += len(cmd) - 1
-        elif isinstance(res, list):
-            if len(res) != len(group):
-                errors += abs(len(group) - len(res))
-            for slot in res:
-                if isinstance(slot, dict) and "error" in slot:
-                    errors += 1  # ошибка слота: фактический объём неизвестен, виден в post-verify
-                    logger.warning("DEL-слот пачки %s: ошибка %s", label, slot["error"])
-                else:
-                    try:
-                        r = slot.get("result") if isinstance(slot, dict) else slot
-                        deleted += max(int(r), 0)
-                    except (ValueError, TypeError, AttributeError):
-                        deleted += 0
-        else:
-            errors += sum(len(c) - 1 for c in group)
-        done = min((ps + len(group)) * DEL_CHUNK, len(keys))
-        print(f"   ... {label}: ~{done}/{len(keys)} ключей (удалено {deleted}, ошибок {errors})")
-    return deleted, errors
+DEL_KEYS_PER_CMD = 25      # ключей в одной DEL-команде (§13.4: безопасный батч)
+PIPE_CMDS_PER_REQ = 10     # DEL-команд в одном /pipeline-запросе
 
 
 def _execute_delete(to_del_hash, to_del_standalone, batch_size=50):
-    """[10.1.0-batch] Удаление с батчингом и прогресс-логом.
-
-    Поля хэша — как в 10.0.0: HDEL пачками по batch_size (1 REST на 50 полей).
-    Обособленные ключи — пайплайн-батчи: ~45 REST-вызовов на 10 680 ключей
-    вместо 10 680 поштучных. Guard §1.7.4 для history:match:* сохранён:
-    HISTORY_FLUSH_CONFIRM=1 обязателен (флаг ставит main на время execute).
-    """
+    """[10.1.0 BATCH] Удаление: HDEL полей хэша (как в 10.0.0), обособленные
+    ключи — пайплайн-батчами (250 ключей за REST-вызов) вместо поштучного DEL.
+    Возвращает (deleted_hash, deleted_standalone, errors)."""
     deleted_hash = 0
     deleted_standalone = 0
     errors = 0
-
-    # --- поля хэша: HDEL пачками (как в 10.0.0) ---
     for i in range(0, len(to_del_hash), batch_size):
         batch = to_del_hash[i:i + batch_size]
         result = redis_command(["HDEL", HASH_NAME] + batch)
@@ -243,28 +184,62 @@ def _execute_delete(to_del_hash, to_del_standalone, batch_size=50):
                     deleted_hash += 1
                 else:
                     errors += 1
-        if len(to_del_hash):
-            print(f"   ... HDEL: {min(i + batch_size, len(to_del_hash))}/{len(to_del_hash)} полей")
 
-    # --- обособленные ключи: guard-разделение + пайплайн ---
+    # Guard §1.7.4: история удаляется только при HISTORY_FLUSH_CONFIRM=1,
+    # флаг ставится программно и только на время execute (см. main).
     guard_on = os.environ.get("HISTORY_FLUSH_CONFIRM") == "1"
     hist_keys = [k for k in to_del_standalone if k.startswith("history:match:")]
     other_keys = [k for k in to_del_standalone if not k.startswith("history:match:")]
+    if not guard_on and hist_keys:
+        errors += len(hist_keys)
+        logger.warning("Guard: HISTORY_FLUSH_CONFIRM не активен — %d ключей истории НЕ удалены",
+                       len(hist_keys))
 
-    if hist_keys:
-        if not guard_on:
-            errors += len(hist_keys)
-            logger.warning("Guard: HISTORY_FLUSH_CONFIRM не активен — %d history-ключей НЕ удалено",
-                           len(hist_keys))
-        else:
-            d, e = _del_keys_pipeline(hist_keys, "DEL history")
-            deleted_standalone += d
-            errors += e
+    def _flush_group(label, keys):
+        nonlocal deleted_standalone, errors
+        total = len(keys)
+        if total == 0:
+            return
+        done = 0
+        step = DEL_KEYS_PER_CMD * PIPE_CMDS_PER_REQ
+        for i in range(0, total, DEL_KEYS_PER_CMD):
+            chunk = keys[i:i + DEL_KEYS_PER_CMD]
+            # Команда DEL принимает список ключей: ["DEL", k1, k2, ...]
+            pipeline_cmds.append(["DEL"] + chunk)
+            if len(pipeline_cmds) >= PIPE_CMDS_PER_REQ or i + DEL_KEYS_PER_CMD >= total:
+                cmds, pipeline_cmds[:] = list(pipeline_cmds), []
+                res = _execute_upstash_pipeline(cmds)
+                if res is None:
+                    # Деградация: пайплайн недоступен — поштучная доставка
+                    logger.warning("Пайплайн недоступен (%s) — деградация до поштучной доставки", label)
+                    for cmd in cmds:
+                        for key in cmd[1:]:
+                            r = redis_command(cmd)
+                            if r is not None:
+                                try:
+                                    deleted_standalone += max(int(r), 0)
+                                except (ValueError, TypeError):
+                                    deleted_standalone += 1
+                            else:
+                                errors += 1
+                    continue
+                for cmd, slot in zip(cmds, res):
+                    if isinstance(slot, dict) and slot.get("error"):
+                        errors += len(cmd) - 1
+                        logger.warning("%s: слот пайплайна вернул ошибку: %s", label, slot["error"])
+                        continue
+                    n = slot.get("result") if isinstance(slot, dict) else slot
+                    try:
+                        deleted_standalone += max(int(n), 0)
+                    except (ValueError, TypeError):
+                        deleted_standalone += len(cmd) - 1
+                    done += len(cmd) - 1
+                if done % step == 0 or done >= total:
+                    print(f"   ... DEL {label}: ~{done}/{total} ключей (удалено {deleted_standalone}, ошибок {errors})")
 
-    d, e = _del_keys_pipeline(other_keys, "DEL прочие")
-    deleted_standalone += d
-    errors += e
-
+    pipeline_cmds = []
+    _flush_group("history", hist_keys if guard_on else [])
+    _flush_group("прочие", other_keys)
     return deleted_hash, deleted_standalone, errors
 
 
