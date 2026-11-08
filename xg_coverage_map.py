@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-xG Coverage Map v1.0 — карта xG-покрытия CSV football-data.co.uk
+xG Coverage Map v1.1 — карта xG-покрытия CSV football-data.co.uk
+
+v1.1: fix KeyError — ключи cells приведены к именам блоков
+      ('1x2_close', '1x2_open' вместо '1x2c'/'1x2o').
 
 Задача: до патча обогатителя (Understat) показать точную карту — в каких
 лигах×сезонах xG есть в самом CSV (HxG/AxG, появилась с сезона 2526),
@@ -139,7 +142,7 @@ def block_status(cols, block_cols):
         return "OK"
     if present:
         return f"partial({len(present)}/{len(block_cols)})"
-    return "-"
+    return "—"
 
 
 def run_map(seasons, leagues, allow_download=True):
@@ -163,9 +166,10 @@ def run_map(seasons, leagues, allow_download=True):
                 print(f"{season:<6} {league:<5} {'EMPTY':<8}")
                 continue
             cells = {name: block_status(info["header"], cols) for name, cols in BLOCKS.items()}
-            xg_pct = f"{100 * info['xg_filled'] / info['rows']:.0f}%" if info["rows"] else "-"
+            xg_pct = f"{100 * info['xg_filled'] / info['rows']:.0f}%" if info["rows"] else "—"
             print(f"{season:<6} {league:<5} {src:<8} {info['rows']:>6}  {cells['xg']:<9} {xg_pct:>7}  "
-                  f"{cells['stats']:<9} {cells['1x2c']:<10} {cells['1x2o']:<7} {cells['ou']:<7} {cells['ah']:<7}")
+                  f"{cells['stats']:<9} {cells['1x2_close']:<10} {cells['1x2_open']:<7} "
+                  f"{cells['ou']:<7} {cells['ah']:<7}")
             summary[(season, league)] = {"xg": cells["xg"], "xg_filled": info["xg_filled"],
                                          "rows": info["rows"], "src": src}
             if src == "http":
@@ -188,15 +192,21 @@ def run_map(seasons, leagues, allow_download=True):
 def run_selftest():
     """Синтетические CSV: два профиля — с xG-колонками и без."""
     base_cols = ("Div,Date,Time,HomeTeam,AwayTeam,FTHG,FTAG,FTR,HTHG,HTAG,HTR,HS,AS,HST,AST,"
-                 "HC,AC,HF,AF,HY,AY,HR,AR,B365H,B365D,B365A,PPH,PSD,PSA,AHCh,PCAHH,PCAHA,PC>2.5,PC<2.5,B365CH,B365CD,B365CA")
+                 "HC,AC,HF,AF,HY,AY,HR,AR,"
+                 "B365H,B365D,B365A,B365CH,B365CD,B365CA,"
+                 "PPH,PSD,PSA,AHCh,PCAHH,PCAHA,PC>2.5,PC<2.5")
     with_xg = base_cols + ",HxG,AxG"
-    r1 = "E0,13/08/2023,15:00,Alpha,Beta,2,1,H,1,0,H,10,8,4,3,5,4,11,10,1,2,0,0,2.1,3.4,3.6,2.2,3.3,3.5,0.5,1.95,1.9,1.85,2.05"
-    r2 = "E0,20/08/2023,16:30,Gamma,Delta,0,0,D,0,0,D,9,9,3,3,4,6,12,9,2,1,1,0,1.9,3.5,4.0,1.8,3.4,4.2,-0.25,2.1,1.75,1.8,2.15"
-    close_row = ",2.0,3.5,3.7"
-    xg_row = ",1.42,1.05"
+    r1 = ("E0,13/08/2023,15:00,Alpha,Beta,2,1,H,1,0,H,10,8,4,3,5,4,11,10,1,2,0,0,"
+          "2.1,3.4,3.6,2.05,3.3,3.65,2.2,3.3,3.5,0.5,1.95,1.9,1.85,2.05,1.25,2.9,1.42,1.05")
+    r2 = ("E0,20/08/2023,16:30,Gamma,Delta,0,0,D,0,0,D,9,9,3,3,4,6,12,9,2,1,1,0,"
+          "1.9,3.5,4.0,1.85,3.4,4.1,1.8,3.4,4.2,-0.25,2.1,1.75,1.8,2.15,1.3,2.85,1.15,1.18")
+    no_xg_r1 = ("E0,13/08/2023,15:00,Alpha,Beta,2,1,H,1,0,H,10,8,4,3,5,4,11,10,1,2,0,0,"
+                "2.1,3.4,3.6,2.05,3.3,3.65,2.2,3.3,3.5,0.5,1.95,1.9,1.85,2.05,1.25,2.9")
+    no_xg_r2 = ("E0,20/08/2023,16:30,Gamma,Delta,0,0,D,0,0,D,9,9,3,3,4,6,12,9,2,1,1,0,"
+                "1.9,3.5,4.0,1.85,3.4,4.1,1.8,3.4,4.2,-0.25,2.1,1.75,1.8,2.15,1.3,2.85")
 
-    content_with = with_xg + "\n" + r1 + close_row + xg_row + "\n" + r2 + close_row + xg_row + "\n"
-    content_without = base_cols + "\n" + r1 + close_row + "\n" + r2 + close_row + "\n"
+    content_with = with_xg + "\n" + r1 + "\n" + r2 + "\n"
+    content_without = base_cols + "\n" + no_xg_r1 + "\n" + no_xg_r2 + "\n"
 
     a = scan_csv(content_with)
     b = scan_csv(content_without)
@@ -205,11 +215,12 @@ def run_selftest():
         assert c in a["header"], f"selftest A: нет {c}"
     assert block_status(a["header"], XG_COLS) == "OK"
     assert block_status(a["header"], OU_COLS) == "OK"
+    assert block_status(a["header"], ODDS_CLOSING_COLS) == "partial(1/10)"  # только B365CH из 10
     assert b and b["rows"] == 2 and b["xg_filled"] == 0, f"selftest B: {b}"
-    assert block_status(b["header"], XG_COLS) == "-"
-    assert block_status(b["header"], OU_COLS) == "OK"       # OU-колонки есть в базовом профиле
+    assert block_status(b["header"], XG_COLS) == "—"
+    assert block_status(b["header"], OU_COLS) == "OK"   # OU-колонки есть и без xG
     assert block_status(b["header"], AH_COLS) == "OK"
-    assert block_status(b["header"], ODDS_CLOSING_COLS).startswith("partial")  # B365 есть, каскада нет
+    assert block_status(b["header"], ODDS_CLOSING_COLS) == "partial(1/10)"
     print("Selftest OK: оба профиля разобраны корректно (с xG / без xG)")
     return 0
 
