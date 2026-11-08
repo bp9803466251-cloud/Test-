@@ -56,8 +56,11 @@ jobs:
       LEAGUES_INPUT: ${{ github.event.inputs.leagues || '' }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days || '0' }}
       LIMIT_INPUT: ${{ github.event.inputs.limit || '0' }}
-      # [8.15] Настраиваемый стоп-лосс §13.4: 0 = отключён (восстановительные прогоны)
-      GATEKEEPER_COMMAND_SOFT_LIMIT: ${{ github.event.inputs.soft_limit || '9000' }}
+      # [8.16] Прямая мапа без фоллбека-выражения: в GH-выражениях строка "0"
+      # кастуется в число и считается falsy, поэтому прежний маппинг мог поглотить
+      # введённый ноль (отключение стоп-лосса для восстановительных прогонов).
+      # Пустое значение подстраховывает guard загрузчика (дефолт 9000).
+      GATEKEEPER_COMMAND_SOFT_LIMIT: ${{ github.event.inputs.soft_limit }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
       FLUSH_INPUT: ${{ github.event.inputs.flush || 'false' }}
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
@@ -194,7 +197,7 @@ jobs:
               try:
                   meta = json.loads(raw) if isinstance(raw, str) else {}
                   print('--- football_data:meta ---')
-                  for k in ('last_run', 'status', 'written', 'deduped', 'skipped',
+                  for k in ('last_run', 'status', 'version', 'written', 'deduped', 'skipped',
                             'skipped_past', 'skipped_future', 'collision_warnings',
                             'alias_misses', 'commands_used', 'stored_matches',
                             'total_events', 'pending_files', 'processed_files'):
