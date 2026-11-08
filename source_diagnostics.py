@@ -50,7 +50,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-__version__ = "10.0.0-merged"  # Контрактная строка версии — сверить пин в test_contracts.py
+__version__ = "10.0.4-formula"  # Контрактная строка версии — сверить пин в test_contracts.py
 # [10.0.0 FIX #76] Диспетчер: всем обработчикам с сигнатурой (ctx, ...) передаётся
 #     "ctx": ctx — в full-ветке и в dispatch-таблице (run #74/#75: TypeError).
 # [10.0.0 FIX §18.1] cmd_redis НЕ вызывает run_initialization: по поверхности
@@ -1090,7 +1090,8 @@ def _extract_score(rec):
 
 
 def cmd_history_sample(ctx, limit=DEFAULT_LIMIT, sample_league=None):
-    """[10.0.3] history-sample: read-only разбор живых записей history:match:*.
+    """[10.0.4] history-sample: read-only разбор живых записей history:match:*.
+    [10.0.4 FIX] Формула консистентности учитывает плоский skipped (ловушка #83).
     Сверка мета — внутренняя консистентность (§13): written+deduped+skipped == total_events.
     stored_matches печатается как информация: счётчик поргонный (прогон #23: 359 при
     2239 записей в базе), жёсткое сравнение давало бы ложный failure на инкрементах.
@@ -1112,9 +1113,20 @@ def cmd_history_sample(ctx, limit=DEFAULT_LIMIT, sample_league=None):
 
     written = meta.get("written") or 0
     deduped = meta.get("deduped") or 0
-    skipped = (meta.get("skipped_past") or 0) + (meta.get("skipped_future") or 0)
+    # [10.0.4 FIX] Плоский skipped в формуле: мета v8.15 пишет поле skipped
+    # (строки CSV без FTR), в #24 его не было в мете и в проверке — отсюда
+    # ложный exit 1 #83 (1790+380+skipped(1)=2171). Отсутствующие поля не считаем.
+    skipped_flat = meta.get("skipped") or 0
+    skipped = skipped_flat + (meta.get("skipped_past") or 0) + (meta.get("skipped_future") or 0)
     total_events = meta.get("total_events")
     s_sum = written + deduped + skipped
+    pending = meta.get("pending_files") or []
+    if skipped_flat:
+        print(f"   skipped (без FTR/битые): {skipped_flat}")
+    if pending:
+        print(f"   pending_files (не долиты): {pending}")
+        if meta.get("status") == "degraded":
+            print("   ⚠ status: degraded — предыдущий прогон прерван, требуется дозагрузка")
     last_run = meta.get("last_run", "неизвестно")
     stale = _check_stale(last_run)
     print(f"   last_run: {last_run} | stale: {'да' if stale else 'нет'}")

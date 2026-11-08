@@ -5,6 +5,19 @@ Football-Data Collector v8.14-dedup-mget (CSV) — ALL columns, GatekeeperAI v71
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
 
+v8.15-stopfix (фикс дефекта #24 + настраиваемый лимит):
+  - FIX #24: process_csv возвращает (count, completed); при прерывании пасса 2
+    (стоп-лосс/shutdown/limit) файл НЕ помечается в processed_files — уходит в
+    pending_files, мета получает status: degraded. Перманентные дыры исключены.
+  - Эшелон прерывается на первом незавершённом файле (обе точки цикла:
+    collect_and_process и main) — не тратим префетч MGET на непишущиеся файлы.
+  - COMMAND_SOFT_LIMIT настраиваемый: env GATEKEEPER_COMMAND_SOFT_LIMIT,
+    0 = отключён (восстановительные прогоны). Дефолт 9000 сохранён.
+  - Поле skipped добавлено в мету (корень расхождения written+deduped vs
+    total_events в #24/#83: skipped(1) не печатался и не читался диагностом).
+  - pending_files мержатся в _flush_meta (объединение минус завершённые),
+    дозагрузка снимает пометку.
+
 v8.14-dedup-mget (дедуп через MGET-чанки, §13.4):
   - process_csv трёхфазный: пасс 1 — парсинг без Redis; пасс 1.5 — MGET-префетч
     дедупа чанками по 50 ключей (1 команда на чанк вместо 50 GET на матч);
@@ -101,8 +114,8 @@ except ImportError:
 # CONFIG
 # ============================================================================
 
-VERSION = "8.14-dedup-mget"
-__version__ = "8.14-dedup-mget"
+VERSION = "8.15-stopfix"
+__version__ = "8.15-stopfix"
 
 # FIX-3: Убран logging.basicConfig
 logger = logging.getLogger(__name__)
@@ -157,8 +170,12 @@ AH_CLOSING_CASCADE = [
     ("BFECAHH",  "BFECAHA",  "betfair_exchange"),
 ]
 
-# §13.4: стоп-лосс — 90% суточного бюджета команд Upstash (10 000/день)
-COMMAND_SOFT_LIMIT = 9000
+# §13.4: стоп-лосс — дисциплина 90% суточного бюджета команд Upstash.
+# [8.15] Лимит настраиваемый: env GATEKEEPER_COMMAND_SOFT_LIMIT, 0 = отключён
+# (восстановительные прогоны; свободный план Upstash жёсткую квоту не режет).
+# Дефолт 9000 сохранён для рутинных прогонов.
+_SOFT_LIMIT_ENV = int(os.getenv("GATEKEEPER_COMMAND_SOFT_LIMIT", "9000"))
+COMMAND_SOFT_LIMIT = _SOFT_LIMIT_ENV if _SOFT_LIMIT_ENV > 0 else None
 
 # v8.14: дедуп через MGET-чанки (пасс 1.5) — 1 команда на 50 матчей вместо 50 GET
 MGET_CHUNK_SIZE = 50
@@ -819,6 +836,7 @@ class FootballDataCollector:
         self._batch = PipelineBatch(dry_run=dry_run, max_batch=50, batch_delay=0.15)
         self._meta_fields = {}
         self.processed_files = self._load_processed_files()
+        self.pending_files = []  # [8.15] файлы, не долитые до конца
 
     def _load_processed_files(self):
         """processed_files из football_data:meta (§13.4) — 1 GET на прогон."""
@@ -892,12 +910,14 @@ class FootballDataCollector:
         now = datetime.now(timezone.utc)
         file_key = f"{season}_{league_code}"
         file_done = file_key in set(self.processed_files)
+        completed = not file_done  # [8.15] файл из processed_files уже завершён
 
         # ── Пасс 1: парсинг всех строк без обращений к Redis ──
         prepared = []
         for row in reader:
             if is_shutdown_requested():
                 logger.info("    [SHUTDOWN] Graceful shutdown — прерываем CSV-обработку")
+                completed = False  # [8.15]
                 break
             try:
                 payload = build_payload(row, season, league_code, run_id=self.run_id)
@@ -955,11 +975,14 @@ class FootballDataCollector:
         for payload, match_dt in prepared:
             if is_shutdown_requested():
                 logger.info("    [SHUTDOWN] Graceful shutdown — прерываем запись")
+                completed = False  # [8.15]
                 break
             if limit and count >= limit:
+                completed = False  # [8.15] файл записан не целиком — не помечать
                 break
-            if not self.dry_run and self.commands_used >= COMMAND_SOFT_LIMIT:
+            if not self.dry_run and COMMAND_SOFT_LIMIT and self.commands_used >= COMMAND_SOFT_LIMIT:
                 logger.warning("[STOP-LOSS §13.4] 90% дневного бюджета команд — финализация прогона")
+                completed = False  # [8.15]
                 break
 
             cid = payload["canonical_id"]
@@ -1026,7 +1049,7 @@ class FootballDataCollector:
             if day:
                 self._batch.add("RPUSH", f"history:index:{day}", cid_key)
 
-        return count
+        return count, completed
 
     @staticmethod
     def _parse_existing(raw):
@@ -1041,8 +1064,10 @@ class FootballDataCollector:
             data = data["payload"]
         return data if isinstance(data, dict) else None
 
-    def save_meta(self, season, league_code, matches, errors):
-        """Плоская football_data:meta (12-10, §13.1) — flush после каждой лиги (crash-safe)."""
+    def save_meta(self, season, league_code, matches, errors, file_completed=True):
+        """Плоская football_data:meta (12-10, §13.1) — flush после каждой лиги (crash-safe).
+        [8.15] file_completed=False: файл не долит до конца (стоп-лосс/shutdown/limit) —
+        помечается в pending_files, а не в processed_files (фикс дефекта #24)."""
         ts = now_iso()
         self._meta_fields.update({
             "last_run": ts,
@@ -1054,6 +1079,7 @@ class FootballDataCollector:
             "total_events": self.matches_processed + self.deduped + self.skipped
                             + self.skipped_past + self.skipped_future,
             "stored_matches": self.matches_processed,
+            "skipped": self.skipped,
             "skipped_past": self.skipped_past,
             "skipped_future": self.skipped_future,
             "deduped": self.deduped,
@@ -1064,9 +1090,17 @@ class FootballDataCollector:
         })
         if season and league_code:
             file_key = f"{season}_{league_code}"
-            pf = self._meta_fields.setdefault("processed_files", [])
-            if file_key not in pf:
-                pf.append(file_key)
+            if file_completed:
+                pf = self._meta_fields.setdefault("processed_files", [])
+                if file_key not in pf:
+                    pf.append(file_key)
+                if file_key in self.pending_files:
+                    self.pending_files.remove(file_key)
+            else:
+                if file_key not in self.pending_files:
+                    self.pending_files.append(file_key)
+                self._meta_fields["status"] = "degraded"
+            self._meta_fields["pending_files"] = self.pending_files
         # 13-G1: тихий пустой прогон фиксируется как degraded
         if (self.written == 0 and self.deduped == 0 and self.skipped == 0
                 and self.skipped_past == 0 and self.skipped_future == 0 and self.errors == 0):
@@ -1095,6 +1129,12 @@ class FootballDataCollector:
                 (existing.get("processed_files") or [])
                 + (self._meta_fields.get("processed_files") or [])
             ))
+            # [8.15] pending_files: объединение с прошлой метой минус завершённые
+            done = set(merged["processed_files"])
+            merged["pending_files"] = sorted(
+                (set(existing.get("pending_files") or [])
+                 | set(self._meta_fields.get("pending_files") or [])) - done
+            )
             res = redis_command(["SET", "football_data:meta", json.dumps(merged, ensure_ascii=False)])
             self._manual_commands += 1
             if res is None:
@@ -1142,6 +1182,7 @@ def collect_and_process(seasons: str = "", leagues: str = "",
 
     total_matches = 0
     total_errors = 0
+    degraded = False  # [8.15]
 
     for season in season_list:
         for league_code in league_list:
@@ -1154,13 +1195,19 @@ def collect_and_process(seasons: str = "", leagues: str = "",
                 continue
 
             collector.archive_csv(season, league_code, csv_content)
-            matches = collector.process_csv(
+            matches, file_completed = collector.process_csv(
                 csv_content, season, league_code,
                 limit=limit, history_days=history_days
             )
             total_matches += matches
             # v7.0: save_meta после каждой лиги (crash-safe)
-            collector.save_meta(season, league_code, matches, collector.errors)
+            collector.save_meta(season, league_code, matches, collector.errors,
+                                file_completed=file_completed)
+            # [8.15] файл не долит до конца — эшелон прерывается (фикс #24)
+            if not file_completed:
+                logger.info("    [STOP-LOSS] Файл не завершён — прерываем эшелон")
+                degraded = True
+                break
 
         if is_shutdown_requested():
             break
@@ -1179,6 +1226,9 @@ def collect_and_process(seasons: str = "", leagues: str = "",
         "collision_warnings": collector.collision_warnings,
         "commands_used": collector.commands_used,
         "processed_files": collector.processed_files,
+        "pending_files": collector.pending_files,
+        "skipped": collector.skipped,
+        "status": "degraded" if degraded else "completed",
         "dry_run": dry_run,
         "run_id": run_id,
     }
@@ -1203,6 +1253,7 @@ def main():
     logger.info(f"  Leagues: {args.leagues or 'all 22'}")
     logger.info(f"  Limit: {args.limit or 'none'}")
     logger.info(f"  History days: {args.history_days or 'all'}")
+    logger.info(f"  Soft limit: {COMMAND_SOFT_LIMIT if COMMAND_SOFT_LIMIT else 'disabled (0)'} commands")
     logger.info("  Hub: strict mode (13-G1) — запись только через gatekeeper_hub")
     logger.info(f"  Registry: {'available' if _REGISTRY_AVAILABLE else 'fallback (local TEAM_ALIASES)'}")
 
@@ -1253,7 +1304,7 @@ def main():
 
             collector.archive_csv(season, league_code, csv_content)
 
-            matches = collector.process_csv(
+            matches, file_completed = collector.process_csv(
                 csv_content, season, league_code,
                 limit=args.limit, history_days=args.history_days
             )
@@ -1261,7 +1312,12 @@ def main():
             logger.info(f"    Matches: {matches}")
 
             # v7.0: save_meta после каждой лиги (crash-safe)
-            collector.save_meta(season, league_code, matches, collector.errors)
+            collector.save_meta(season, league_code, matches, collector.errors,
+                                file_completed=file_completed)
+            # [8.15] файл не долит до конца — эшелон прерывается (фикс #24)
+            if not file_completed:
+                logger.info("    [STOP-LOSS] Файл не завершён — прерываем эшелон")
+                break
 
         if is_shutdown_requested():
             logger.info("\n  [SHUTDOWN] Graceful shutdown — прерываем")
@@ -1277,6 +1333,8 @@ def main():
     logger.info(f"  Written: {collector.written}, deduped: {collector.deduped}")
     logger.info(f"  Collision warnings: {collector.collision_warnings}")
     logger.info(f"  Commands used: {collector.commands_used}")
+    if collector.pending_files:
+        logger.warning(f"  Pending files (не долиты): {collector.pending_files}")
     if args.dry_run:
         logger.info(f"  (dry-run: nothing written to Redis)")
 
