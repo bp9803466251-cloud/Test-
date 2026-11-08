@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v8.16-echelon-fix (CSV) — ALL columns, GatekeeperAI v710
+Football-Data Collector v8.17-slim (CSV) — engine-manifest payload, GatekeeperAI v710
+
+v8.17-slim (манифест полей движка; §23/§29/§39 prompt №2):
+  - PAYLOAD SLIM: csv_raw (все колонки CSV) удалён из payload целиком, build_csv_raw
+    исключён. Движку нужны 4 блока: identity+score, stats (12 метрик + xG),
+    odds 1X2/OU/AH closing, odds_opening (CLV-entry). Остальное не потребляется
+    ни одной математической секцией Prompt №1.
+  - +odds_opening: плоский вектор {"1","X","2"} по OPENING_CASCADE (PPH → PSH →
+    B365H). CLV-entry (§28): opening = единственный легитимный источник признаков;
+    в v8.12..8.16 opening жил только в csv_raw (анти-leakage для live-контура;
+    в history-payload поля легальны как признак CLV).
+  - Сжатие снапшотов: CLOSING_CASCADE остаётся полным для выбора closing-вектора
+    (первый полный набор = наивысший приоритет), но snapshots пишутся только для
+    pinnacle и bet365 — DQS Odds Verification (§7: ≥2 независимые цены) сохранён.
+    OU/AH каскады обрезаны до pinnacle closing — 1 снапшот на рынок.
+  - source_map синхронизирован: soft_bookmakers=["bet365"], types=["closing","opening"].
+  - Вес payload: ~4.2 КБ/матч → ~1.3 КБ/матч. Потерю аудита csv_raw компенсирует
+    исходник CSV на football-data.co.uk.
+  - Guide-delta §6: изменение структуры history-payload фиксируется в гид-дельте цикла.
 
 v8.16-echelon-fix (фикс дефекта #26):
   - FIX #26: инверсия completed = not file_done в v8.15 роняла эшелон на первом
@@ -66,7 +84,7 @@ v8.12-patched (Шаг 13-B):
   - --history-days с env HISTORY_DAYS (12-11)
 
 Schema: v710 (Гейт 28)
-CSV:    120 колонок (opening + closing odds, O/U 2.5, Asian Handicap) — целиком в csv_raw
+CSV:    120 колонок читаются; в payload — только поля манифеста движка (v8.17-slim)
 Stats:  12 метрик + xG (optional) + _source + _updated_at
 Transport: только gatekeeper_hub.upsert_match(mode="history") — §23
 """
@@ -127,8 +145,8 @@ except ImportError:
 # CONFIG
 # ============================================================================
 
-VERSION = "8.16-echelon-fix"
-__version__ = "8.16-echelon-fix"
+VERSION = "8.17-slim"
+__version__ = "8.17-slim"
 
 # FIX-3: Убран logging.basicConfig
 logger = logging.getLogger(__name__)
@@ -163,24 +181,29 @@ CLOSING_CASCADE = [
     ("BFECH",  "BFECD",  "BFECA",  "betfair_exchange"),
 ]
 
+# v8.17-slim: opening-каскад для CLV-entry (§28 prompt №1). Opening-колонки CSV
+# без суффикса C; PSH/PSD/PSA — legacy-имя Pinnacle. Первый полный набор = entry.
+OPENING_CASCADE = [
+    ("PPH",   "PSD",   "PSA",   "pinnacle"),
+    ("PSH",   "PSD",   "PSA",   "pinnacle"),
+    ("B365H", "B365D", "B365A", "bet365"),
+]
+
+# v8.17-slim: снапшоты odds_history пишутся только для независимых апстримов,
+# покрывающих DQS Odds Verification (§7: ≥2 независимые цены). Остальные записи
+# каскада нужны лишь для выбора closing-вектора (наивысший приоритет).
+SNAPSHOT_UPSTREAMS = {"pinnacle", "bet365"}
+
 # v8.13: closing-каскады O/U и AH. В CSV football-data линия O/U только 2.5;
 # 1.5/3.5 зарезервированы под живой сбор Prompt №2 (null в структуре, не 0).
 # Max/Avg — агрегаты агрегатора, в декларации независимости источниками не считаются.
 OU_CLOSING_CASCADE = [
-    ("PC>2.5",    "PC<2.5",    "pinnacle"),
-    ("MaxC>2.5",  "MaxC<2.5",  "market_max"),
-    ("B365C>2.5", "B365C<2.5", "bet365"),
-    ("AvgC>2.5",  "AvgC<2.5",  "market_avg"),
-    ("BFEC>2.5",  "BFEC<2.5",  "betfair_exchange"),
+    ("PC>2.5",    "PC<2.5",    "pinnacle"),   # v8.17-slim: closing-only, 1 снапшот
 ]
 OU_LINES = {"1.5": None, "2.5": OU_CLOSING_CASCADE, "3.5": None}
 
 AH_CLOSING_CASCADE = [
-    ("PCAHH",    "PCAHA",    "pinnacle"),
-    ("MaxCAHH",  "MaxCAHA",  "market_max"),
-    ("B365CAHH", "B365CAHA", "bet365"),
-    ("AvgCAHH",  "AvgCAHA",  "market_avg"),
-    ("BFECAHH",  "BFECAHA",  "betfair_exchange"),
+    ("PCAHH",    "PCAHA",    "pinnacle"),   # v8.17-slim: closing-only, 1 снапшот
 ]
 
 # §13.4: стоп-лосс — дисциплина 90% суточного бюджета команд Upstash.
@@ -628,7 +651,7 @@ def build_stats(row, ts):
 def build_source_map(ts):
     """§12.8: source_map загрузчика. Заголовочный upstream — multi_bookmaker;
     upstream по источнику колонки даёт каскад CLOSING_CASCADE.
-    Opening-колонки в структуру не идут — только csv_raw (анти-leakage)."""
+    v8.17-slim: opening идёт в поле odds_opening (CLV-entry §28), не в снапшоты."""
     return {
         "odds": {
             "source": SOURCE_NAME,
@@ -649,24 +672,12 @@ def build_source_map(ts):
             "timestamp": ts,
             "independent": True,
         },
-        "types": ["closing"],
+        "types": ["closing", "opening"],
         "sharp_benchmark": "pinnacle",
-        "soft_bookmakers": ["bet365", "bwin", "1xbet",
-                            "betfair_sportsbook", "betfair_exchange"],
+        "soft_bookmakers": ["bet365"],  # v8.17-slim: синхронизировано со снапшот-каскадом
     }
 
 
-def build_csv_raw(row):
-    """Store ALL CSV columns as raw values — nothing is lost."""
-    raw = {}
-    for key, val in row.items():
-        if key is None:
-            continue
-        k = key.strip()
-        if not k:
-            continue
-        raw[k] = safe_str(val)
-    return raw
 def build_odds_flat(row, ts):
     """§12.8: плоский odds_1x2 по closing-каскаду + снапшоты odds_history.
     Возвращает (odds_1x2, snapshots). Дедупликация снапшотов по {upstream, type} (12-7)."""
@@ -681,6 +692,8 @@ def build_odds_flat(row, ts):
             odds_1x2 = price  # первый полный набор каскада = наивысший приоритет
         if upstream in seen_upstream:
             continue
+        if upstream not in SNAPSHOT_UPSTREAMS:
+            continue  # v8.17-slim: снапшот только pinnacle/bet365 (DQS §7)
         snapshots.append({
             "source": SOURCE_NAME,
             "upstream": upstream,
@@ -690,6 +703,18 @@ def build_odds_flat(row, ts):
         })
         seen_upstream.add(upstream)
     return odds_1x2, snapshots
+
+
+
+def build_odds_opening(row):
+    """v8.17-slim: плоский opening-вектор {"1","X","2"} по OPENING_CASCADE.
+    CLV-entry (§28 prompt №1): entry-цена против closing. {} если полного набора
+    нет — поле опускается, never invent data."""
+    for h_key, d_key, a_key, _upstream in OPENING_CASCADE:
+        price = _price_1x2(row, h_key, d_key, a_key)
+        if price:
+            return price
+    return {}
 
 
 def build_odds_over_under(row, ts):
@@ -723,7 +748,7 @@ def build_odds_over_under(row, ts):
 def build_odds_asian_handicap(row, ts):
     """v8.13: closing-каскад AH. Линия AHCh (float) + пары home/away квот.
     Возвращает (ah_block, snapshots); ah_block=None если линии или квот нет
-    (линия остаётся в csv_raw). ВАЖНО: AHCh=0 (равная фора) — валидная линия,
+    (линия остаётся только в CSV-источнике). ВАЖНО: AHCh=0 (равная фора) — валидная линия,
     проверка на is not None, не на truthiness (кейс легаси-записи #5)."""
     line = safe_float(row.get("AHCh", ""))
     if line is None:
@@ -753,8 +778,8 @@ def build_odds_asian_handicap(row, ts):
 
 
 def build_payload(row, season, league_code, run_id=None):
-    """Build full match payload — ALL CSV columns + structured data.
-    v7.0: +source, +sources, +run_id для хаба."""
+    """Build slim match payload — только поля манифеста движка (v8.17-slim):
+    identity+score, stats, odds (closing+opening), source_map. csv_raw исключён."""
     league_info = LEAGUES.get(league_code, {"name": league_code, "country": "Unknown", "division": 0})
 
     home_team = safe_str(row.get("HomeTeam", ""))
@@ -778,10 +803,10 @@ def build_payload(row, season, league_code, run_id=None):
 
     stats = build_stats(row, ts)
     odds_1x2, odds_snapshots = build_odds_flat(row, ts)
+    odds_opening = build_odds_opening(row)
     odds_over_under, _ = build_odds_over_under(row, ts)
     odds_asian_handicap, _ = build_odds_asian_handicap(row, ts)
     source_map = build_source_map(ts)
-    csv_raw = build_csv_raw(row)
 
     home_clean = clean_team_name(home_team)
     away_clean = clean_team_name(away_team)
@@ -814,6 +839,7 @@ def build_payload(row, season, league_code, run_id=None):
         "sources": [SOURCE_NAME],
         "odds_1x2": odds_1x2,
         "odds_history": odds_snapshots,
+        "odds_opening": odds_opening,
         "odds_over_under": odds_over_under,
         "odds_asian_handicap": odds_asian_handicap,
         "source_ids": {"football_data": f"csv_{season}_{league_code}"},
@@ -821,7 +847,6 @@ def build_payload(row, season, league_code, run_id=None):
         "stats": stats,
         "source_map": source_map,
         "flags": flags,
-        "csv_raw": csv_raw,
         "created_at": ts,
         "updated_at": ts,
     }
