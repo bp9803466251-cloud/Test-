@@ -50,10 +50,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-__version__ = "10.0.5-memfix"  # Контрактная строка версии — сверить пин в test_contracts.py
-# [10.0.5 MEMFIX #85] cmd_memory: None-ответ INFO/DBSIZE -> NetworkError (fail-closed);
-#     used_memory обязателен; кросс-проверка used=0 при dbsize>0 — мёртвое чтение,
-#     честный exit 1 вместо зелёного precheck. В вывод добавлен dbsize.
+__version__ = "10.0.6-keyscan"  # memfix(#85) + keyscan(#91); пин в test_contracts.py сверить
 # [10.0.0 FIX #76] Диспетчер: всем обработчикам с сигнатурой (ctx, ...) передаётся
 #     "ctx": ctx — в full-ветке и в dispatch-таблице (run #74/#75: TypeError).
 # [10.0.0 FIX §18.1] cmd_redis НЕ вызывает run_initialization: по поверхности
@@ -873,6 +870,54 @@ def cmd_propline(ctx, limit=DEFAULT_LIMIT):
     return {"found": found, "skipped": skipped, "parse_errors": parse_errors}, True
 
 
+
+def _full_key_map(limit=10):
+    """[10.0.6-keyscan] Полная карта ключей: SCAN без MATCH — ключи вне SCAN_PATTERNS
+    невидимы ни аудиту, ни flush/purge (находка #91: dbsize 561 против нулей
+    по пяти паттернам). Read-only; агрегация по первому сегменту префикса."""
+    all_keys = []
+    cursor = "0"
+    while True:
+        raw = redis_command(["SCAN", cursor, "COUNT", SCAN_COUNT])
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            raise NetworkError(f"SCAN *: неожиданный формат ответа: {raw!r}")
+        cursor = str(raw[0])
+        batch = raw[1] if isinstance(raw[1], list) else []
+        for k in batch:
+            if isinstance(k, bytes):
+                k = k.decode("utf-8", errors="replace")
+            if isinstance(k, str):
+                all_keys.append(k)
+        if cursor in ("0", "", None):
+            break
+    buckets = {}
+    for k in all_keys:
+        prefix = k.split(":", 1)[0] if ":" in k else k
+        buckets.setdefault(prefix, []).append(k)
+    try:
+        dbsize = int(redis_command(["DBSIZE"]))
+    except (TypeError, ValueError):
+        dbsize = None
+    return {"total": len(all_keys), "dbsize": dbsize,
+            "buckets": buckets, "limit": limit}
+
+
+def _print_full_key_map(full_map):
+    print("\n=== ПОЛНАЯ КАРТА КЛЮЧЕЙ (SCAN * — вне SCAN_PATTERNS) ===")
+    total, dbsize = full_map["total"], full_map["dbsize"]
+    if dbsize is not None:
+        mark = "✅ сходится" if total == dbsize else f"⚠ РАСХОЖДЕНИЕ (SCAN {total} != DBSIZE {dbsize})"
+        print(f"   Всего ключей SCAN: {total} | DBSIZE: {dbsize} — {mark}")
+    else:
+        print(f"   Всего ключей SCAN: {total} | DBSIZE: нечитаем ⚠")
+    lim = full_map["limit"]
+    for prefix, keys in sorted(full_map["buckets"].items(), key=lambda kv: -len(kv[1])):
+        samples = ", ".join(keys[:3])
+        more = f" …(+{len(keys) - 3})" if len(keys) > 3 else ""
+        print(f"   {prefix}: {len(keys)} (примеры: {samples}{more})")
+
+
+
 def cmd_keys(ctx, limit=DEFAULT_LIMIT):
     """Режим keys (из check_redis v1.1 + таксономия redis_flush): аудит контракта
     истории и карта ключей. Вердикт v1.1 с честным exit 1."""
@@ -906,6 +951,14 @@ def cmd_keys(ctx, limit=DEFAULT_LIMIT):
             tail = f" (первые: {keys[:limit]})" if keys else ""
             print(f"   {cat}: {len(keys)}{tail}")
 
+    # [10.0.6-keyscan] Полная карта: ключи вне SCAN_PATTERNS невидимы flush/purge/аудиту
+    try:
+        full_map = _full_key_map(limit=limit)
+        _print_full_key_map(full_map)
+    except NetworkError as e:
+        full_map = None
+        logger.warning("Полная карта недоступна (на вердикт не влияет): %s", e)
+
     # Образец записи истории: сначала хэш, иначе standalone (v1.1)
     if hash_history:
         sample_key = hash_history[0]
@@ -936,7 +989,9 @@ def cmd_keys(ctx, limit=DEFAULT_LIMIT):
     return {"hash_history_fields": len(hash_history),
             "standalone_history": len(match_keys),
             "categories": {c: len(v) for c, v in cats.items()},
-            "verdict": verdict}, ok
+            "verdict": verdict,
+            "full_map": ({"total": full_map["total"], "dbsize": full_map["dbsize"]}
+                         if full_map else None)}, ok
 
 
 def _fail(failures, samples, name, detail):
@@ -1026,22 +1081,20 @@ def cmd_history_contracts(ctx):
     return {"checked": len(keys), "failures": dict(failures), "telemetry": telemetry}, ok
 
 
+
 def cmd_memory(min_free_mb=DEFAULT_MIN_FREE_MB):
     """Режим memory (§13.4): precheck свободной памяти для football_data_loader.
-    Exit 1 при free_mb < min_free_mb; maxmemory=0 (квота не задана) — exit 0 с пометкой."""
+    Exit 1 при free_mb < min_free_mb; maxmemory=0 (квота не задана) — exit 0 с пометкой.
+    [10.0.5-memfix] Fail-closed: INFO=None -> NetworkError (раньше return None от
+    транспорта не ловился except'ом и давал зелёный свет на мёртвом чтении, #85).
+    Кросс-проверка: used=0 при живых ключах — невозможное состояние, NetworkError."""
     print("\n=== MEMORY PRECHECK (§13.4) ===")
-    # [10.0.5 MEMFIX #85] redis_command при сбое транспорта возвращает None БЕЗ
-    # исключения — прежний код превращал это в str(None), парсинг не находил
-    # used/maxmemory, и ветка "квота не задана" давала зелёный exit 0 на
-    # мёртвом чтении (#85: used 0.0 MB при живых 3753 ключах). Fail-closed:
-    # нечитаемый INFO — честный NetworkError.
     try:
         info = redis_command(["INFO", "memory"])
     except Exception as e:
         raise NetworkError(f"INFO memory: {e}")
     if info is None:
-        raise NetworkError("INFO memory: транспорт вернул пустой ответ (None) — "
-                           "чтение недостоверно, precheck fail-closed (см. #85)")
+        raise NetworkError("INFO memory: транспорт вернул None — precheck fail-closed (10.0.5-memfix)")
     text = info.decode("utf-8") if isinstance(info, bytes) else str(info)
     used = maxmem = None
     for line in text.splitlines():
@@ -1049,46 +1102,32 @@ def cmd_memory(min_free_mb=DEFAULT_MIN_FREE_MB):
             used = int(line.split(":", 1)[1])
         elif line.startswith("maxmemory:"):
             maxmem = int(line.split(":", 1)[1])
-    # [10.0.5 MEMFIX #85] used_memory обязателен в любом живом INFO.
-    if used is None:
-        raise NetworkError("INFO memory: used_memory не разобран — чтение недостоверно")
-    # [10.0.5 MEMFIX #85] Кросс-проверка: used=0 при непустом keyspace —
-    # невозможное состояние, сигнатура мёртвого чтения. DBSIZE — одна read-команда.
-    dbsize_raw = redis_command(["DBSIZE"])
-    if dbsize_raw is None:
-        raise NetworkError("DBSIZE: транспорт вернул пустой ответ (None) — "
-                           "чтение недостоверно, precheck fail-closed")
     try:
-        dbsize = int(dbsize_raw)
-    except (ValueError, TypeError):
-        raise NetworkError(f"DBSIZE: нечисловой ответ {dbsize_raw!r}")
-    if used == 0 and dbsize > 0:
-        raise NetworkError(f"INFO memory: used_memory=0 при dbsize={dbsize} — "
-                           "мёртвое чтение, сигнатура #85; precheck fail-closed")
-    result = {"min_free_mb": min_free_mb, "used_memory": used, "maxmemory": maxmem,
-              "dbsize": dbsize}
+        dbsize = int(redis_command(["DBSIZE"]))
+    except (TypeError, ValueError) as e:
+        raise NetworkError(f"DBSIZE: нечитаемый ответ — precheck fail-closed: {e!r}")
+    result = {"min_free_mb": min_free_mb, "used_memory": used,
+              "maxmemory": maxmem, "dbsize": dbsize}
     if maxmem in (None, 0):
         print("   ℹ maxmemory не задан (0) — квоту сервер определить нельзя; "
               "контроль остаётся на стороне Upstash quota")
+        print(f"   dbsize: {dbsize} (ключей в базе)")
         result["free_mb"] = None
         return result, True
     if used is None:
         raise NetworkError("INFO memory: не удалось разобрать used_memory")
+    if used == 0 and dbsize > 0:
+        raise NetworkError(
+            f"FAKE-EMPTY DETECTED: used_memory=0 при dbsize={dbsize} — "
+            "чтение INFO недостоверно, precheck fail-closed (сигнатура #85)")
     free_mb = (maxmem - used) / 1048576
     result["free_mb"] = round(free_mb, 1)
     ok = free_mb >= min_free_mb
-    dbsize_out = f" | dbsize: {dbsize}" if dbsize is not None else ""
     print(f"   used: {used / 1048576:.1f} MB | max: {maxmem / 1048576:.1f} MB | "
-          f"free: {free_mb:.1f} MB | порог: {min_free_mb} MB{dbsize_out}")
+          f"free: {free_mb:.1f} MB | порог: {min_free_mb} MB | dbsize: {dbsize}")
     if not ok:
         print("   ❌ Недостаточно памяти — загрузчик должен быть приостановлен (§13.4)")
     return result, ok
-
-
-# ===========================================================================
-# Режим history-sample (read-only, 10.0.2/10.0.3)
-# ===========================================================================
-HISTORY_SAMPLE_MGET_CHUNK = 50   # MGET-чанк для гистограммы (§13.4: 1 команда на 50 записей)
 
 
 def _extract_score(rec):
