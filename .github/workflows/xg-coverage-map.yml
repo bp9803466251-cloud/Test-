@@ -1,0 +1,70 @@
+name: XG Coverage Map
+
+on:
+  workflow_dispatch:
+    inputs:
+      SEASONS_INPUT:
+        description: "Сезоны через запятую (пусто = 2324,2425,2526,2627)"
+        required: false
+        default: ""
+      LEAGUES_INPUT:
+        description: "Лиги через запятую (пусто = все 22)"
+        required: false
+        default: ""
+      NO_DOWNLOAD_INPUT:
+        description: "Только архив без HTTP-скачивания"
+        type: boolean
+        default: false
+      SELFTEST_ONLY_INPUT:
+        description: "Только selftest (без сети и карты)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  xg-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Selftest (без сети)
+        run: |
+          python -u xg_coverage_map.py --selftest
+
+      - name: XG Coverage Map
+        if: ${{ !inputs.SELFTEST_ONLY_INPUT }}
+        run: |
+          SEASONS="${{ inputs.SEASONS_INPUT }}"
+          LEAGUES="${{ inputs.LEAGUES_INPUT }}"
+          SEASONS_ARG=""
+          LEAGUES_ARG=""
+          NO_DL_ARG=""
+          if [ -n "${SEASONS}" ]; then
+            SEASONS_ARG="--seasons ${SEASONS}"
+          fi
+          if [ -n "${LEAGUES}" ]; then
+            LEAGUES_ARG="--leagues ${LEAGUES}"
+          fi
+          if [ "${{ inputs.NO_DOWNLOAD_INPUT }}" = "true" ]; then
+            NO_DL_ARG="--no-download"
+          fi
+          python -u xg_coverage_map.py ${SEASONS_ARG} ${LEAGUES_ARG} ${NO_DL_ARG}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== XG Coverage Map Summary ==="
+          echo "Seasons: ${{ inputs.SEASONS_INPUT || 'default (2324,2425,2526,2627)' }}"
+          echo "Leagues: ${{ inputs.LEAGUES_INPUT || 'all 22' }}"
+          echo "No download: ${{ inputs.NO_DOWNLOAD_INPUT }}"
+          echo "Selftest only: ${{ inputs.SELFTEST_ONLY_INPUT }}"
+          echo ""
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
