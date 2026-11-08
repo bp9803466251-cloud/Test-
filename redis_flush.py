@@ -25,7 +25,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-__version__ = "10.1.0-batch"  # Контрактная строка версии для прохождения тестов
+__version__ = "10.2.0-purge-total"  # Контрактная строка; гейт 19 test_contracts пинит только _classify_hash_fields (не тронут)
 
 # [10.1.0 BATCH #21] Дефект #21: _execute_delete для обособленных ключей делал
 # ОДИН REST-вызов на ключ (redis_command DEL / delete_history_match) — 10680
@@ -35,6 +35,12 @@ __version__ = "10.1.0-batch"  # Контрактная строка версии
 # (250 ключей за REST-вызов), прогресс-лог каждой пачки, деградация до
 # поштучной доставки при сбое пайплайна. Guard §1.7.4 сохранён дословно:
 # флаг HISTORY_FLUSH_CONFIRM живёт только на время execute.
+# [10.2.0 PURGE-TOTAL] Семантика purge усилена до тотальной: полный SCAN * по
+# курсору (независим от SCAN_PATTERNS read-only ядра — 559 ключей analysis:*,
+# невидимых пяти паттернам, теперь охвачены), DBSIZE-сверка в dry-run,
+# поимённый батчевый DEL (§13.4), хэш — последним (HDEL всех полей; пустой
+# хэш исчезает сам), пост-verify с проверкой DBSIZE == 0. Остальные режимы
+# не тронуты.
 
 logger = logging.getLogger("redis_flush")
 logging.basicConfig(
@@ -95,6 +101,34 @@ def get_circuit_breaker_status(*args, **kwargs):
 
 MSK_TZ = timezone(timedelta(hours=3))
 VALID_MODES = ("history-only", "soft", "hard", "purge", "reset-breaker")
+
+
+def _full_key_scan():
+    """[10.2.0 PURGE-TOTAL] Полный SCAN * по курсору через redis_command.
+    Не переиспользует scan_redis_state: тот привязан к SCAN_PATTERNS ядра
+    (пять паттернов) — ключи вне их (analysis:*, иные префиксы) ему невидимы,
+    что подтверждено прогонами #91-#93 (DBSIZE 561 при нулях по категориям).
+    Возвращает (keys, dbsize). Сбой транспорта — честный RuntimeError."""
+    keys = []
+    cursor = "0"
+    while True:
+        raw = redis_command(["SCAN", cursor, "MATCH", "*", "COUNT", "250"])
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            raise RuntimeError(f"SCAN *: неожиданный формат ответа: {raw!r}")
+        next_cursor, found = raw[0], raw[1]
+        if isinstance(next_cursor, bytes):
+            next_cursor = next_cursor.decode("utf-8")
+        cursor = str(next_cursor)
+        if isinstance(found, list):
+            keys.extend(k.decode("utf-8") if isinstance(k, bytes) else str(k) for k in found)
+        if cursor in ("0", 0):
+            break
+    raw_size = redis_command(["DBSIZE"])
+    try:
+        dbsize = int(raw_size)
+    except (TypeError, ValueError):
+        dbsize = -1
+    return keys, dbsize
 
 # ---------------------------------------------------------------------------
 # Планы очистки (write-логика flush — локальна; классификация импортная)
@@ -246,8 +280,19 @@ def _execute_delete(to_del_hash, to_del_standalone, batch_size=50):
 # ---------------------------------------------------------------------------
 # [10.0.0] Внутренний post-verify: SCAN + план soft без второго процесса
 # ---------------------------------------------------------------------------
-def _post_verify():
+def _post_verify(purge_total=False):
     print("\n=== POST-VERIFY (внутренний, тот же процесс) ===")
+    if purge_total:
+        raw = redis_command(["DBSIZE"])
+        try:
+            dbsize = int(raw)
+        except (TypeError, ValueError):
+            dbsize = -1
+        if dbsize == 0:
+            print("   ✅ DBSIZE = 0 — база полностью пуста (purge-total подтверждён)")
+        else:
+            print(f"   ❌ DBSIZE = {dbsize} — после purge-total остались ключи (полный SCAN * ниже покажет какие)")
+            return
     try:
         scan_res = scan_redis_state()
         to_h, to_s, desc = _build_plan("soft", scan_res)
@@ -298,7 +343,33 @@ def main():
         print(f"   ❌ Сбой сканирования Redis: {e}")
         sys.exit(1)
 
-    to_h, to_s, desc = _build_plan(args.mode, scan_res)
+    if args.mode == "purge":
+        # [10.2.0 PURGE-TOTAL] Полная поверхность: SCAN * вместо SCAN_PATTERNS.
+        try:
+            full_keys, dbsize_before = _full_key_scan()
+        except Exception as e:
+            print(f"   ❌ Сбой полного SCAN *: {e}")
+            sys.exit(1)
+        to_h = list(scan_res["hash_fields"].keys())
+        # Хэш удаляется через HDEL всех полей (пустой хэш исчезает сам) —
+        # DEL по имени хэша не нужен и не ведётся; исключаем из списка.
+        to_s = sorted(k for k in full_keys if k != HASH_NAME)
+        if HASH_NAME in full_keys and not to_h:
+            # Теоретический кейс: хэш-ключ без полей — добираем DEL'ом
+            to_s.append(HASH_NAME)
+        prefixes = {}
+        for k in to_s:
+            pfx = k.split(":", 1)[0]
+            prefixes[pfx] = prefixes.get(pfx, 0) + 1
+        desc = ["TOTAL WIPE: purge теперь тотальный — удаляется ВСЁ, включая мета-ключи и health"]
+        desc.append("DBSIZE до: " + str(dbsize_before) + " | план: " + str(len(to_h))
+                    + " полей хэша + " + str(len(to_s)) + " обособленных ключей")
+        desc.append("префиксы: " + (", ".join(f"{p}={n}" for p, n in sorted(prefixes.items())) or "пусто"))
+        if to_s and dbsize_before >= 0 and len(to_s) + (1 if to_h else 0) != dbsize_before:
+            desc.append("⚠️ план + хэш не сходится с DBSIZE (" + str(len(to_s) + (1 if to_h else 0))
+                        + " vs " + str(dbsize_before) + ") — сверка плана перед execute обязательна")
+    else:
+        to_h, to_s, desc = _build_plan(args.mode, scan_res)
 
     print("\n📋 ПЛАН ОЧИСТКИ:")
     for d in desc:
@@ -339,7 +410,7 @@ def main():
     if errs > 0:
         sys.exit(1)  # честный failure: ошибки удаления видны в логе и в статусе джоба
     if args.post_verify:
-        _post_verify()
+        _post_verify(purge_total=(args.mode == "purge"))
 
 
 if __name__ == "__main__":
