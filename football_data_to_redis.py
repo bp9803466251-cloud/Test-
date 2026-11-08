@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v8.14-dedup-mget (CSV) — ALL columns, GatekeeperAI v710
+Football-Data Collector v8.16-echelon-fix (CSV) — ALL columns, GatekeeperAI v710
+
+v8.16-echelon-fix (фикс дефекта #26):
+  - FIX #26: инверсия completed = not file_done в v8.15 роняла эшелон на первом
+    же файле из processed_files с полным дедуп-путём (все матчи — дубли):
+    completed=0, count=0 -> break после первой лиги. Прогон #26: смерть на E0.
+    Теперь completed=True по умолчанию; False ставят только три точки прерывания
+    (shutdown / limit / стоп-лосс).
+  - Guard пустого env: int(os.getenv(...) or "9000") — пустая переменная при
+    API-запуске без input больше не валит прогон int("").
+  - Статус меты всегда актуален: успешный прогон снимает carry-over degraded.
+  - Формат payload не тронут (совместимость с базой полная).
+
+v8.14-dedup-mget (CSV) — ALL columns, GatekeeperAI v710
 Источник: football-data.co.uk
 Сезоны: --seasons "2425,2526,2627"
 Лиги:   --leagues "E0,E1,SP1"
@@ -114,8 +127,8 @@ except ImportError:
 # CONFIG
 # ============================================================================
 
-VERSION = "8.15-stopfix"
-__version__ = "8.15-stopfix"
+VERSION = "8.16-echelon-fix"
+__version__ = "8.16-echelon-fix"
 
 # FIX-3: Убран logging.basicConfig
 logger = logging.getLogger(__name__)
@@ -174,7 +187,9 @@ AH_CLOSING_CASCADE = [
 # [8.15] Лимит настраиваемый: env GATEKEEPER_COMMAND_SOFT_LIMIT, 0 = отключён
 # (восстановительные прогоны; свободный план Upstash жёсткую квоту не режет).
 # Дефолт 9000 сохранён для рутинных прогонов.
-_SOFT_LIMIT_ENV = int(os.getenv("GATEKEEPER_COMMAND_SOFT_LIMIT", "9000"))
+# [8.16] Guard пустого env: при API-запуске без input переменная может быть ""
+# — int("") валит прогон. Пустое значение -> дефолт 9000.
+_SOFT_LIMIT_ENV = int(os.getenv("GATEKEEPER_COMMAND_SOFT_LIMIT") or "9000")
 COMMAND_SOFT_LIMIT = _SOFT_LIMIT_ENV if _SOFT_LIMIT_ENV > 0 else None
 
 # v8.14: дедуп через MGET-чанки (пасс 1.5) — 1 команда на 50 матчей вместо 50 GET
@@ -910,7 +925,11 @@ class FootballDataCollector:
         now = datetime.now(timezone.utc)
         file_key = f"{season}_{league_code}"
         file_done = file_key in set(self.processed_files)
-        completed = not file_done  # [8.15] файл из processed_files уже завершён
+        # [8.16 FIX #26] Файл из processed_files ЗАВЕРШЁН: completed=True.
+        # Инверсия v8.15 (completed = not file_done) роняла эшелон на первом же
+        # помеченном файле с полным дедуп-путём (прогон #26: смерть на E0).
+        # completed=False ставят ТОЛЬКО три точки прерывания ниже.
+        completed = True
 
         # ── Пасс 1: парсинг всех строк без обращений к Redis ──
         prepared = []
@@ -1105,6 +1124,11 @@ class FootballDataCollector:
         if (self.written == 0 and self.deduped == 0 and self.skipped == 0
                 and self.skipped_past == 0 and self.skipped_future == 0 and self.errors == 0):
             self._meta_fields["status"] = "degraded"
+        elif not self.pending_files:
+            # [8.16] Статус всегда актуален: успешный прогон снимает carry-over
+            # degraded из прошлой меты (иначе verify показал бы degraded и после
+            # успешного восстановительного прогона).
+            self._meta_fields["status"] = "completed"
         self._flush_meta()
 
     def _flush_meta(self):
