@@ -19,6 +19,10 @@ on:
         description: 'Лимит матчей на лигу (0 = все)'
         required: false
         default: '0'
+      soft_limit:
+        description: 'Стоп-лосс команд за прогон (0 = отключён; дефолт 9000, §13.4)'
+        required: false
+        default: '9000'
       dry_run:
         description: 'Dry-run (без записи в Redis)'
         type: boolean
@@ -52,6 +56,8 @@ jobs:
       LEAGUES_INPUT: ${{ github.event.inputs.leagues || '' }}
       HISTORY_DAYS_INPUT: ${{ github.event.inputs.history_days || '0' }}
       LIMIT_INPUT: ${{ github.event.inputs.limit || '0' }}
+      # [8.15] Настраиваемый стоп-лосс §13.4: 0 = отключён (восстановительные прогоны)
+      GATEKEEPER_COMMAND_SOFT_LIMIT: ${{ github.event.inputs.soft_limit || '9000' }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
       FLUSH_INPUT: ${{ github.event.inputs.flush || 'false' }}
       SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
@@ -78,9 +84,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # [10.0.1 FIX] Precheck переведён на ядро: redis_diagnostics.py удалён при
-      # консолидации 10.0.0 — прежний шаг всегда уходил в warning и пропускал
-      # проверку памяти (§13.4). Канонический порог 32 МБ (гид, guide-delta #79-#80).
+      # [10.0.1 FIX] Precheck переведён на ядро: канонический порог 32 МБ (§13.4)
       - name: Memory precheck (§13.4)
         run: |
           python -u source_diagnostics.py --mode memory --min-free-mb 32 || {
@@ -184,16 +188,16 @@ jobs:
               print('FATAL: Redis unavailable')
               sys.exit(1)
 
-          # football_data:meta — Root-ключ (R-1), читаем GET и печатаем телеметрию 12-10
+          # football_data:meta — Root-ключ (R-1), читаем GET и печатаем телеметрию
           raw = cmd('GET', 'football_data:meta')
           if raw:
               try:
                   meta = json.loads(raw) if isinstance(raw, str) else {}
                   print('--- football_data:meta ---')
-                  for k in ('last_run', 'status', 'written', 'deduped', 'skipped_past',
-                            'skipped_future', 'collision_warnings', 'alias_misses',
-                            'commands_used', 'stored_matches', 'total_events',
-                            'processed_files'):
+                  for k in ('last_run', 'status', 'written', 'deduped', 'skipped',
+                            'skipped_past', 'skipped_future', 'collision_warnings',
+                            'alias_misses', 'commands_used', 'stored_matches',
+                            'total_events', 'pending_files', 'processed_files'):
                       if k in meta:
                           print(f'  {k}: {meta[k]}')
               except (json.JSONDecodeError, TypeError):
@@ -212,6 +216,7 @@ jobs:
           echo "Leagues: ${LEAGUES_INPUT:-all 22}"
           echo "History days: ${HISTORY_DAYS_INPUT}"
           echo "Limit: ${LIMIT_INPUT}"
+          echo "Soft limit: ${GATEKEEPER_COMMAND_SOFT_LIMIT:-9000} (0 = disabled)"
           echo "Dry run: ${DRY_RUN_INPUT}"
           echo "Flush: ${FLUSH_INPUT}"
           echo ""
