@@ -1,0 +1,198 @@
+name: Reep Registry Uploader
+
+# Заливка реестра registry:* из Reep-снапшота (памятка v1.9.3, §9 п.4, §14, §16).
+# Flush из воркфлоу запрещён (урок F1): только redis_flush.py при REGISTRY_FLUSH_CONFIRM=1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      parties:
+        description: 'Партии заселения через запятую: P0, P1:0, ... или ALL (§16)'
+        required: false
+        default: 'P0'
+      dry_run:
+        description: 'Dry-run: разбор и оценка объёмов без записи (§8 вариант 2)'
+        type: boolean
+        required: false
+        default: true
+      resume:
+        description: 'Продолжить с чекпоинта после обрыва'
+        type: boolean
+        required: false
+        default: false
+      from_dir:
+        description: 'Каталог локальных CSV/gz вместо сети (пусто = качать с Reep)'
+        required: false
+        default: ''
+      soft_limit:
+        description: 'Стоп-лосс команд за прогон (0 = отключён; дефолт 10000, §13.4)'
+        required: false
+        default: '10000'
+
+env:
+  PYTHON_VERSION: '3.12'
+  PYTHONUNBUFFERED: "1"
+  # [8.16] Прямая мапа без фоллбека-выражения: в GH-выражениях строка "0"
+  # кастуется в число и считается falsy, поэтому прежний маппинг мог поглотить
+  # введённый ноль (отключение стоп-лосса для восстановительных прогонов).
+  # Пустое значение подстраховывает guard загрузчика (дефолт 10000).
+  GATEKEEPER_COMMAND_SOFT_LIMIT: ${{ github.event.inputs.soft_limit }}
+  # Флеш реестра через воркфлоу запрещён (урок F1, §7).
+  REGISTRY_FLUSH_CONFIRM: '0'
+  SHARED_UPSTASH_REDIS_REST_URL: ${{ secrets.SHARED_UPSTASH_REDIS_REST_URL || '' }}
+  SHARED_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.SHARED_UPSTASH_REDIS_REST_TOKEN || '' }}
+  SHARED_REDIS_REST_URL: ${{ secrets.SHARED_REDIS_REST_URL || '' }}
+  SHARED_REDIS_REST_TOKEN: ${{ secrets.SHARED_REDIS_REST_TOKEN || '' }}
+  UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL || '' }}
+  UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN || '' }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
+  TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID || '' }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatekeeper-pipeline
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # [10.0.1 FIX] §1.10: конвейеры 30-60 мин
+
+    env:
+      PARTIES_INPUT: ${{ github.event.inputs.parties || 'P0' }}
+      DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'true' }}
+      RESUME_INPUT: ${{ github.event.inputs.resume || 'false' }}
+      FROM_DIR_INPUT: ${{ github.event.inputs.from_dir || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # [10.0.1 FIX] §13.4: канонический порог 32 МБ
+      - name: Memory precheck (§13.4)
+        run: |
+          python -u source_diagnostics.py --mode memory --min-free-mb 32 || {
+            echo "::error::Free memory below 32 MB — abort before registry upload (§13.4)"
+            exit 1
+          }
+
+      # Гейт самотеста: поломка парсера не доходит до Redis
+      - name: Selftest gate
+        run: |
+          python -u reep_registry_uploader.py --selftest
+
+      - name: Run Reep Registry Uploader
+        run: |
+          ARGS=""
+          if [ "${DRY_RUN_INPUT}" = "true" ]; then
+            ARGS="${ARGS} --dry-run"
+          fi
+          if [ "${RESUME_INPUT}" = "true" ]; then
+            ARGS="${ARGS} --resume"
+          fi
+          if [ -n "${FROM_DIR_INPUT}" ]; then
+            ARGS="${ARGS} --from-dir ${FROM_DIR_INPUT}"
+          fi
+          python -u reep_registry_uploader.py \
+            --parties "${PARTIES_INPUT}" \
+            ${ARGS}
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reep-registry-${{ github.run_id }}
+          path: |
+            reep_cache/
+            report_v0_3.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Verify registry state
+        if: always()
+        timeout-minutes: 5
+        run: |
+          python -c "
+          import os, json, urllib.request, sys
+
+          URL = (os.environ.get('SHARED_UPSTASH_REDIS_REST_URL', '')
+                 or os.environ.get('SHARED_REDIS_REST_URL', '')
+                 or os.environ.get('UPSTASH_REDIS_REST_URL', ''))
+          URL = URL.rstrip('/')
+          TOKEN = (os.environ.get('SHARED_UPSTASH_REDIS_REST_TOKEN', '')
+                   or os.environ.get('SHARED_REDIS_REST_TOKEN', '')
+                   or os.environ.get('UPSTASH_REDIS_REST_TOKEN', ''))
+
+          if not URL or not TOKEN:
+              print('ERROR: Redis credentials not configured')
+              sys.exit(1)
+
+          def cmd(*args):
+              try:
+                  req = urllib.request.Request(
+                      URL,
+                      data=json.dumps(list(args)).encode(),
+                      headers={'Authorization': f'Bearer {TOKEN}',
+                               'Content-Type': 'application/json'}
+                  )
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return json.loads(r.read()).get('result')
+              except Exception as e:
+                  print(f'  [CMD ERROR] {args[0]}: {e}')
+                  return None
+
+          print('=== Registry Verify ===')
+          if os.environ.get('DRY_RUN_INPUT') == 'true':
+              print('INFO: dry-run не пишет в Redis — сверка по отчёту в артефактах')
+          dbsize = cmd('DBSIZE')
+          print(f'DBSIZE: {dbsize}')
+
+          for key in ('registry:system:health', 'registry:upload:checkpoint'):
+              raw = cmd('GET', key)
+              if raw:
+                  try:
+                      obj = json.loads(raw) if isinstance(raw, str) else {}
+                      print(f'--- {key} ---')
+                      for k, v in obj.items():
+                          print(f'  {k}: {v}')
+                  except (json.JSONDecodeError, TypeError):
+                      print(f'WARN: {key} damaged or not JSON')
+              else:
+                  print(f'INFO: {key} not found')
+          print('=== Verify Done ===')
+          "
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Reep Registry Uploader Summary ==="
+          echo "Parties: ${PARTIES_INPUT}"
+          echo "Dry run: ${DRY_RUN_INPUT}"
+          echo "Resume: ${RESUME_INPUT}"
+          echo "From dir: ${FROM_DIR_INPUT:-network (Reep)}"
+          echo "Soft limit: ${GATEKEEPER_COMMAND_SOFT_LIMIT:-10000} (0 = disabled)"
+          echo "Registry flush: DISABLED (REGISTRY_FLUSH_CONFIRM=0, только redis_flush.py)"
+          echo ""
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Telegram alert on failure
+        if: failure()
+        run: |
+          MSG="❌ Reep Registry Uploader FAILED%0A%0ARun: ${{ github.run_id }}%0A${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_GROUP_ID}" \
+            -d text="${MSG}"
