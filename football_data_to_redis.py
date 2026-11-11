@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v8.17-slim (CSV) — engine-manifest payload, GatekeeperAI v710
+Football-Data Collector v8.18-registry-strict (CSV) — engine-manifest payload, GatekeeperAI v710
+
+v8.18-registry-strict (Strict Degradation Protocol, §14.1):
+  - D1: OPENING_CASCADE без мёртвого кортежа PPH (колонка PPH в CSV 2425+ отсутствует,
+    факт сверки заголовка 2526 live-проверкой). Единственный Pinnacle-key: PSH/PSD/PSA.
+  - Fallback-словарь TEAM_ALIASES удалён целиком (вторая копия алиасов, §14.1);
+    при недоступности team_registry прогон честно падает с exit 1, а не пишет мимо реестра.
+  - clean_team_name / build_canonical_id — чистая делегация без глотания ошибок
+    (try/except с pass = тихий отказ, §6.4). payload-формат не тронут.
 
 v8.17-slim (манифест полей движка; §23/§29/§39 prompt №2):
   - PAYLOAD SLIM: csv_raw (все колонки CSV) удалён из payload целиком, build_csv_raw
     исключён. Движку нужны 4 блока: identity+score, stats (12 метрик + xG),
     odds 1X2/OU/AH closing, odds_opening (CLV-entry). Остальное не потребляется
     ни одной математической секцией Prompt №1.
-  - +odds_opening: плоский вектор {"1","X","2"} по OPENING_CASCADE (PPH → PSH →
-    B365H). CLV-entry (§28): opening = единственный легитимный источник признаков;
+  - +odds_opening: плоский вектор {"1","X","2"} по OPENING_CASCADE (PSH → B365H). CLV-entry (§28): opening = единственный легитимный источник признаков;
     в v8.12..8.16 opening жил только в csv_raw (анти-leakage для live-контура;
     в history-payload поля легальны как признак CLV).
   - Сжатие снапшотов: CLOSING_CASCADE остаётся полным для выбора closing-вектора
@@ -134,6 +141,10 @@ try:
     _REGISTRY_AVAILABLE = True
 except ImportError:
     _REGISTRY_AVAILABLE = False
+if not _REGISTRY_AVAILABLE:
+    print("[FATAL] team_registry недоступен — Strict Degradation Protocol (§14.1): "
+          "fallback-словарь TEAM_ALIASES исключён, запись мимо единого реестра запрещена.")
+    raise SystemExit(1)
 
 # Единое MSK-время
 try:
@@ -145,8 +156,8 @@ except ImportError:
 # CONFIG
 # ============================================================================
 
-VERSION = "8.17-slim"
-__version__ = "8.17-slim"
+VERSION = "8.18-registry-strict"
+__version__ = "8.18-registry-strict"
 
 # FIX-3: Убран logging.basicConfig
 logger = logging.getLogger(__name__)
@@ -181,10 +192,11 @@ CLOSING_CASCADE = [
     ("BFECH",  "BFECD",  "BFECA",  "betfair_exchange"),
 ]
 
-# v8.17-slim: opening-каскад для CLV-entry (§28 prompt №1). Opening-колонки CSV
-# без суффикса C; PSH/PSD/PSA — legacy-имя Pinnacle. Первый полный набор = entry.
+# v8.18: opening-каскад для CLV-entry (§28 prompt №1). Opening-колонки CSV
+# без суффикса C. Факт D1: колонки PPH/PPD/PPA в CSV 2425+ отсутствуют (rebranded),
+# сверено по живому заголовку 2526 — PSH/PSD/PSA единственный Pinnacle-key.
+# Первый полный набор = entry.
 OPENING_CASCADE = [
-    ("PPH",   "PSD",   "PSA",   "pinnacle"),
     ("PSH",   "PSD",   "PSA",   "pinnacle"),
     ("B365H", "B365D", "B365A", "bet365"),
 ]
@@ -243,242 +255,9 @@ LEAGUES = {
     "T1":  {"name": "Süper Lig",             "country": "Turkey",     "division": 1},
     "G1":  {"name": "Super League",          "country": "Greece",     "division": 1},
 }
-# Bookmaker prefixes for 1X2 odds (IW, VC, WH removed — dead in CSV 2425+)
-# PS → PP (Pinnacle rebranded prefix), BF → BFD (Betfair 3-letter prefix)
-TEAM_ALIASES = {
-    # Premier League
-    "manchester united": "manchester united",
-    "man united": "manchester united",
-    "man utd": "manchester united",
-    "manchester city": "manchester city",
-    "man city": "manchester city",
-    "tottenham hotspur": "tottenham hotspur",
-    "tottenham": "tottenham hotspur",
-    "spurs": "tottenham hotspur",
-    "wolverhampton": "wolverhampton wanderers",
-    "wolverhampton wanderers": "wolverhampton wanderers",
-    "wolves": "wolverhampton wanderers",
-    "newcastle united": "newcastle united",
-    "newcastle": "newcastle united",
-    "west ham united": "west ham united",
-    "west ham": "west ham united",
-    "nottm forest": "nottingham forest",
-    "nottingham forest": "nottingham forest",
-    "nott'm forest": "nottingham forest",
-    "nottingham": "nottingham forest",
-    "brighton hove albion": "brighton hove albion",
-    "brighton": "brighton hove albion",
-    "brighton & hove albion": "brighton hove albion",
-    "aston villa": "aston villa",
-    "crystal palace": "crystal palace",
-    "brentford": "brentford",
-    "fulham": "fulham",
-    "everton": "everton",
-    "liverpool": "liverpool",
-    "chelsea": "chelsea",
-    "arsenal": "arsenal",
-    "leicester city": "leicester city",
-    "leicester": "leicester city",
-    "leeds united": "leeds united",
-    "leeds": "leeds united",
-    "southampton": "southampton",
-    "bournemouth": "bournemouth",
-    "burnley": "burnley",
-    "luton town": "luton town",
-    "luton": "luton town",
-    "sheffield united": "sheffield united",
-    "sheffield utd": "sheffield united",
-    # Championship
-    "norwich city": "norwich city",
-    "norwich": "norwich city",
-    "watford": "watford",
-    "middlesbrough": "middlesbrough",
-    "birmingham city": "birmingham city",
-    "birmingham": "birmingham city",
-    "hull city": "hull city",
-    "hull": "hull city",
-    "stoke city": "stoke city",
-    "stoke": "stoke city",
-    "swansea city": "swansea city",
-    "swansea": "swansea city",
-    "cardiff city": "cardiff city",
-    "cardiff": "cardiff city",
-    "derby county": "derby county",
-    "derby": "derby county",
-    "preston north end": "preston north end",
-    "preston": "preston north end",
-    "queens park rangers": "queens park rangers",
-    "qpr": "queens park rangers",
-    "blackburn rovers": "blackburn rovers",
-    "blackburn": "blackburn rovers",
-    "bristol city": "bristol city",
-    "coventry city": "coventry city",
-    "coventry": "coventry city",
-    "huddersfield town": "huddersfield town",
-    "huddersfield": "huddersfield town",
-    "millwall": "millwall",
-    "rotherham united": "rotherham united",
-    "rotherham": "rotherham united",
-    "plymouth argyle": "plymouth argyle",
-    "plymouth": "plymouth argyle",
-    "ipswich town": "ipswich town",
-    "ipswich": "ipswich town",
-    "sunderland": "sunderland",
-    "west bromwich albion": "west bromwich albion",
-    "west brom": "west bromwich albion",
-    "wba": "west bromwich albion",
-    # Bundesliga
-    "bayern munich": "bayern munich",
-    "bayern munchen": "bayern munich",
-    "borussia dortmund": "borussia dortmund",
-    "dortmund": "borussia dortmund",
-    "bayer leverkusen": "bayer leverkusen",
-    "leverkusen": "bayer leverkusen",
-    "rb leipzig": "rb leipzig",
-    "eintracht frankfurt": "eintracht frankfurt",
-    "frankfurt": "eintracht frankfurt",
-    "vfb stuttgart": "vfb stuttgart",
-    "stuttgart": "vfb stuttgart",
-    "vfl wolfsburg": "vfl wolfsburg",
-    "wolfsburg": "vfl wolfsburg",
-    "borussia monchengladbach": "borussia monchengladbach",
-    "monchengladbach": "borussia monchengladbach",
-    "gladbach": "borussia monchengladbach",
-    "sc freiburg": "sc freiburg",
-    "freiburg": "sc freiburg",
-    "fc augsburg": "fc augsburg",
-    "augsburg": "fc augsburg",
-    "hoffenheim": "tsg hoffenheim",
-    "tsg hoffenheim": "tsg hoffenheim",
-    "union berlin": "union berlin",
-    "werder bremen": "werder bremen",
-    "bremen": "werder bremen",
-    "vfl bochum": "vfl bochum",
-    "bochum": "vfl bochum",
-    "mainz": "mainz 05",
-    "mainz 05": "mainz 05",
-    "darmstadt": "sv darmstadt 98",
-    "sv darmstadt 98": "sv darmstadt 98",
-    # Serie A
-    "juventus": "juventus",
-    "inter milan": "inter milan",
-    "inter": "inter milan",
-    "internazionale": "inter milan",
-    "ac milan": "ac milan",
-    "milan": "ac milan",
-    "napoli": "napoli",
-    "ssc napoli": "napoli",
-    "roma": "roma",
-    "as roma": "roma",
-    "lazio": "lazio",
-    "ss lazio": "lazio",
-    "atalanta": "atalanta",
-    "fiorentina": "fiorentina",
-    "bologna": "bologna",
-    "torino": "torino",
-    "udinese": "udinese",
-    "sassuolo": "sassuolo",
-    "monza": "monza",
-    "hellas verona": "hellas verona",
-    "verona": "hellas verona",
-    "cagliari": "cagliari",
-    "lecce": "lecce",
-    "salernitana": "salernitana",
-    "frosinone": "frosinone",
-    "genoa": "genoa",
-    "empoli": "empoli",
-    "como": "como",
-    "parma": "parma",
-    "venezia": "venezia",
-    # La Liga
-    "real madrid": "real madrid",
-    "barcelona": "barcelona",
-    "fc barcelona": "barcelona",
-    "atletico madrid": "atletico madrid",
-    "athletic bilbao": "athletic bilbao",
-    "athletic club": "athletic bilbao",
-    "real sociedad": "real sociedad",
-    "real betis": "real betis",
-    "betis": "real betis",
-    "villarreal": "villarreal",
-    "valencia": "valencia",
-    "sevilla": "sevilla",
-    "celta vigo": "celta vigo",
-    "celta": "celta vigo",
-    "getafe": "getafe",
-    "osasuna": "osasuna",
-    "rayo vallecano": "rayo vallecano",
-    "rayo": "rayo vallecano",
-    "mallorca": "mallorca",
-    "almeria": "almeria",
-    "cadiz": "cadiz",
-    "granada": "granada",
-    "las palmas": "las palmas",
-    "girona": "girona",
-    "alaves": "alaves",
-    "deportivo alaves": "alaves",
-    "espanyol": "espanyol",
-    "leganes": "leganes",
-    "valladolid": "valladolid",
-    # Ligue 1
-    "paris saint germain": "paris saint germain",
-    "psg": "paris saint germain",
-    "paris saint-germain": "paris saint germain",
-    "marseille": "marseille",
-    "olympique marseille": "marseille",
-    "monaco": "monaco",
-    "as monaco": "monaco",
-    "lyon": "lyon",
-    "olympique lyonnais": "lyon",
-    "lille": "lille",
-    "nice": "nice",
-    "rennes": "rennes",
-    "lens": "lens",
-    "nantes": "nantes",
-    "strasbourg": "strasbourg",
-    "montpellier": "montpellier",
-    "toulouse": "toulouse",
-    "brest": "brest",
-    "le havre": "le havre",
-    "reims": "reims",
-    "auxerre": "auxerre",
-    "angers": "angers",
-    "lorient": "lorient",
-    "metz": "metz",
-    "clermont": "clermont",
-    # Eredivisie
-    "ajax": "ajax",
-    "psv eindhoven": "psv eindhoven",
-    "psv": "psv eindhoven",
-    "feyenoord": "feyenoord",
-    "az alkmaar": "az alkmaar",
-    "az": "az alkmaar",
-    "twente": "twente",
-    "fc twente": "twente",
-    "utrecht": "utrecht",
-    "fc utrecht": "utrecht",
-    "vitesse": "vitesse",
-    "heerenveen": "heerenveen",
-    "sc heerenveen": "heerenveen",
-    "groningen": "groningen",
-    "fc groningen": "groningen",
-    "sparta rotterdam": "sparta rotterdam",
-    "sparta": "sparta rotterdam",
-    "fortuna sittard": "fortuna sittard",
-    "nec nijmegen": "nec nijmegen",
-    "nec": "nec nijmegen",
-    "pec zwolle": "pec zwolle",
-    "zwolle": "pec zwolle",
-    "willem ii": "willem ii",
-    "willem ii tilburg": "willem ii",
-    "almere city": "almere city",
-    "rkc waalwijk": "rkc waalwijk",
-    "rkc": "rkc waalwijk",
-    "go ahead eagles": "go ahead eagles",
-    "go-ahead eagles": "go ahead eagles",
-    "heracles": "heracles",
-    "heracles almelo": "heracles",
-}
+# [v8.18] Локальный словарь TEAM_ALIASES удалён (§14.1): единственный источник
+# алиасов — Reep-снапшот через team_registry. Старый словарь не мигрируется
+# (§1.5: «второго источника не будет»). Резолюция имён — только через реестр.
 # ============================================================================
 # HELPERS
 # ============================================================================
@@ -501,35 +280,23 @@ def now_iso():
 
 
 def clean_team_name(name):
-    """Делегирует в team_registry.clean_team_name() — единый реестр (257+ алиасов).
-    Fallback: локальные TEAM_ALIASES (130 алиасов)."""
+    """Делегирует в team_registry.clean_team_name() — единый реестр (§14.1).
+
+    Без обёртки try/except: ошибка реестра честно роняет прогон (§6.4),
+    а не подменяется локальным fallback'ом — второй копии алиасов больше нет.
+    """
     if not name:
         return ""
-    # Приоритет — team_registry (единый реестр)
-    if _REGISTRY_AVAILABLE:
-        try:
-            result = _registry_normalize(name)
-            if result:
-                return result
-        except Exception:
-            pass
-    # Fallback — локальные TEAM_ALIASES
-    n = name.strip().lower()
-    return TEAM_ALIASES.get(n, n)
+    return _registry_normalize(name)
 
 
 def build_canonical_id(home_team, away_team, date_utc):
-    """Единый canonical_id. Приоритет — team_registry, fallback — локальный."""
-    if _REGISTRY_AVAILABLE:
-        try:
-            return _registry_build_cid(home_team, away_team, date_utc)
-        except Exception:
-            pass
-    # Fallback — локальная реализация (совместима с хабом)
-    home_clean = clean_team_name(home_team).replace(" ", "_")
-    away_clean = clean_team_name(away_team).replace(" ", "_")
-    date_short = date_utc[:10].replace("-", "")
-    return f"{home_clean}__{away_clean}__{date_short}"
+    """Единый canonical_id — только team_registry (§14.1, сборщик один).
+
+    Без локальной fallback-реализации: при недоступности реестра прогон
+    не стартует (строгий отказ в блоке импорта).
+    """
+    return _registry_build_cid(home_team, away_team, date_utc)
 
 
 def parse_date(raw):
@@ -1304,7 +1071,7 @@ def main():
     logger.info(f"  History days: {args.history_days or 'all'}")
     logger.info(f"  Soft limit: {COMMAND_SOFT_LIMIT if COMMAND_SOFT_LIMIT else 'disabled (0)'} commands")
     logger.info("  Hub: strict mode (13-G1) — запись только через gatekeeper_hub")
-    logger.info(f"  Registry: {'available' if _REGISTRY_AVAILABLE else 'fallback (local TEAM_ALIASES)'}")
+    logger.info("  Registry: unified (team_registry, Strict Degradation §14.1)")
 
     # Инициализация хаба
     init_metrics = run_initialization()
