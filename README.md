@@ -2,7 +2,7 @@
 
 Распределённая экосистема для сбора, нормализации, склейки, анализа и стресс-тестирования футбольных данных в режиме реального времени.
 
-### 📊 CI/CD Status: Консолидация 10.0.0-merged — канон 3.12, решения по дашборду и дублирующим входам (2026-11-06)
+### 📊 CI/CD Status: Консолидация 10.0.0-merged — патч-цикл #79–#80 исполнен: purge Redis выполнен (2026-11-07)
 ![CI/CD](https://img.shields.io/badge/CI%2FCD-STRESS%20TEST%20GREEN-brightgreen?style=flat-square)
 ![Audit](https://img.shields.io/badge/Patch%20Cycle%209.6.8-6%2F6%20Workflows%20Audited-orange?style=flat-square)
 ![Architecture](https://img.shields.io/badge/Pattern-Zero--Folder%20Architecture-blue?style=flat-square)
@@ -19,6 +19,18 @@
 > Первый валидированный зелёный прогон: stress test #3 (2026-11-04), processed 550, safeguards 37, value_bets 14, throughput 114.4/сек ≥ порога 50
 ---
 
+## 📐 Сверка 2026-11-12 (памятка v1.10.0): синхронизация реестра и версий
+
+| Пункт | СТАРО | НОВО |
+|---|---|---|
+| football_data_to_redis.py | v8.11-patched | **v8.18-registry-strict** (каскад без мёртвого PPH; строгий импорт team_registry; guard MISS-cid) |
+| team_registry.py | «Реестр алиасов (257+ записей)» | **Единый движок v10.0.1-redis-runtime**; данные — реестр `registry:*` в Redis (директива 12.11), источник — Reep-снапшот |
+| Реестр воркфлоу | «15» (заявка «12 → 18») | **16 по факту листинга**; после вливания reep_registry_uploader.yml — 17 |
+| ci_tests.yml | — | отсутствует в репо; жив test_gluing_ci.yml (гид §14/§37.2 правится дельтой) |
+
+> Примечание: строка v8.18-registry-strict отражает подготовленный пакет —
+> вливать README одновременно с загрузчиком (§12 Части II: атомарность).
+
 ## 🩹 Патч-цикл 9.6.8 (аудит 2026-11-03): закрыто 6/6 воркфлоу + 3 скрипта
 
 | # | Файл | Ключевые исправления |
@@ -26,7 +38,7 @@
 | 1 | `football_data_loader.yml` | Снят `|| true` в алерте; таймаут 180→60; concurrency → `gatekeeper-pipeline`; fallback `|| ''` для всех секретов |
 | 2 | `backtest.yml` | Исправлен битый Telegram-URL (`api.telegram.org/bot`); сняты `|| true` и тихий `except: pass`; concurrency → pipeline; дубль `GATEKEEPER_CONFIG_FILE` удалён |
 | 3 | `stress_test.yml` + `stress_test_runtime.py` | Снят CI-обход в `__main__` — стресс-конвейер реально запускается; фикстуры приведены к контракту v710 (`odds_1x2` с ключами "1"/"X"/"2", строковые `*_clean`, без `predictions` по §1.29); concurrency → `gatekeeper-diagnostics` |
-| 4 | `test_gluing_ci.yml` + `test_gluing.py` | Триггеры push/PR → `workflow_dispatch`; матрица 3.10/3.12 удалена (§1.10 — единый Python 3.11); добавлен честный `exit 1` при провале |
+| 4 | `test_gluing_ci.yml` + `test_gluing.py` | Триггеры push/PR → `workflow_dispatch`; матрица 3.10/3.12 удалена (§1.10 — единый Python 3.11; историческая запись — канон Python 3.12 закрыт 11.11, п.11); добавлен честный `exit 1` при провале |
 | 5 | `match_dump.yml` | Добавлена concurrency-группа; удалён дубль env-передачи конфига |
 | 6 | `match_linker.yml` + `match_linker.py` | **Удалён cron `0 */6 * * *`** (§1.2); исправлен NameError в обработчике исключений цикла; введены честные exit-коды; снят легаси-фолбэк прямого чтения Redis (§1.4) |
 
@@ -51,8 +63,9 @@
    (сохранение поля `home_team`, построение плоского паспорта).
 2. Унифицировать имя конфиг-переменной по репозиторию: `GK_CONFIG_FILE` vs
    `GATEKEEPER_CONFIG_FILE` — отдельным коммитом.
-3. Обновить реестр README (выполнено данным коммитом: 12 → 18 воркфлоу) и получить
-   реальный зелёный прогон после патчей.
+3. [аннотация 12.11: заявка «12 → 18» не сверялась; фактический состав — 16
+   воркфлоу, после вливания reep_registry_uploader.yml — 17] Обновить реестр
+   README и получить реальный зелёный прогон после патчей.
 
 ---
 
@@ -81,16 +94,36 @@
 - Дублирование дашборда [DECISION 10.0.0]: отправка — только за пайплайном (`main.py`); standalone `match_linker.yml` запускается с `--no-dashboard`; сигнатура `send_dashboard=True` сохранена, `main.py` не затронут.
 - `match_dump.yml` и `diagnostic_matches.py` [DECISION 10.0.0]: удалены из репозитория владельцем — решение реализует план слияния (строка «удаляются при слиянии» выше); режим `matches` доступен через единый диагностический YML (`--mode matches`).
 
+
+### 🔁 Итерация 10.0.0-merged — патч-цикл #79–#80 (2026-11-07): пайплайн диагностики выведен на exit 0
+
+| Файл | Ключевые исправления |
+|---|---|
+| `source_diagnostics.py` | HSCAN-пагинация полного легаси-хэша (9925 полей, 40 страниц, сверка полноты по HLEN — анти-fake-empty); структура источников 4+1: `COLLECTORS` = 4 коллектора (main как виртуальный источник удалён), `LOADERS = ["football_data"]`, раздельная печать секций; `_KEY_ENV` без `FOOTBALL_DATA_API_KEY` (football-data.co.uk — открытые CSV, ключ не требуется); `DEFAULT_MIN_FREE_MB = 32` (порог §13.4 для инстанса 64 МБ, прежде 100 — вечная блокировка) |
+| `source_diagnostics.yml` | Мапа 4 ключей в job-env (1:1 с именами секретов, fallback `\|\| ''`); таймаут транспорта 15 с (#76/#77); порог 32 в inputs и в fallback |
+| `redis_flush.py` | Честный purge: ВСЕ поля хэша + все standalone-категории (прежде освобождал ~4% вместо 43 МБ); guard `HISTORY_FLUSH_CONFIRM` для истории (только через `delete_history_match`); `--post-verify` в том же процессе |
+| `redis_flush.yml` | Отдельная concurrency-группа `redis-flush` (§16.4); таймаут 15 с |
+
+**Исполнение (логи прогонов):**
+- Source Diagnostics #80 (full): все патчи подтверждены в проде — секция источников 4+1, «порог: 32 MB», HSCAN 9925 полей без таймаутов. Вердикты честные, но пока fail: контрактный разрыв (9033 поля `history:*` в хэше) и memory precheck (used 43.1 MB) — обе цели purge;
+- Redis Flush #19 (dry-run): план purge — 9925 полей хэша + 3 standalone-ключа; исполнение честно не началось (`dry_run_only=true`);
+- Redis Flush #20 (execute): HDEL 9925, DEL 3, ошибок 0; post-verify — soft-остатков нет. Хэш `GatekeeperAI` обнулён, легаси-история вычищена.
+
+**Разрешён конфликт близнецов:** `FOOTBALL_DATA_API_KEY` (сервис football-data.org — API-ключ; в контуре не используется, в Secrets не заводить) ≠ `football_data` (загрузчик football_data_to_redis.py — открытые CSV football-data.co.uk, ключ не требуется по природе источника). Прежняя путаница имён регулярно воспроизводила ложный статус «ключ ❌».
+
+**Открытые пункты:** заселение истории загрузчиком (`football_data_loader.yml`) на чистый контур; контрольный прогон Source Diagnostics → full (ожидаю: standalone-история > 0, `history:*` в хэше = 0, used ≈ 0–1 MB, precheck ✅, exit 0); сверка `last_run` четырёх коллекторов после их первых прогонов.
+
 ---
 
 ## 🧭 Архитектура и ИБ-контур
 
-Модуль (network_harvest_runtime.py, chaos_monkey_runtime.py, ...) | +-- gatekeeper_hub.py <- Единый шлюз для матчей, odds, stats | | | +-- redis_hub.py <- Транспорт (urllib.request / curl_cffi → Upstash REST API) | +-- Circuit Breaker (Гейт 28: 10 ошибок или плоский сбой → авто-блокировка) | +-- schema_validator.py <- Валидатор Схемы v710 +-- value_engine.py <- Расчет ценности линий (Value Bets) +-- team_registry.py <- Алиасы команд (257+ записей)
+Модуль (network_harvest_runtime.py, chaos_monkey_runtime.py, ...) | +-- gatekeeper_hub.py <- Единый шлюз для матчей, odds, stats | | | +-- redis_hub.py <- Транспорт (urllib.request / curl_cffi → Upstash REST API) | +-- Circuit Breaker (Гейт 28: 10 ошибок или плоский сбой → авто-блокировка) | +-- schema_validator.py <- Валидатор Схемы v710 +-- value_engine.py <- Расчет ценности линий (Value Bets) +-- team_registry.py <- Единый движок нормализации (v10.0.1-redis-runtime)
 
 
 *   **Zero-Folder Architecture (Root Execution / Правило 1.1):** Все исполняемые `.py` компоненты, движки, тесты и конфигурации располагаются строго на верхнем (плоском) уровне репозитория. Создание вложенных директорий для исходного кода запрещено. Единственным исключением являются конфигурации CI/CD пайплайнов `.github/workflows/`.
 *   **ИБ-регламент §1.3 (Сетевой изолятор):** Использование библиотеки `requests` **категорически запрещено**. Сетевой I/O разрешен исключительно через низкоуровневый `urllib.request` и импортозамещенный `curl_cffi` для обхода TLS-фингерпринтов.
 *   **Ручной запуск (§1.2):** Все воркфлоу экосистемы активируются строго через `workflow_dispatch`. Cron-расписания и push/pull_request-триггеры запрещены; периодичность обеспечивает `sports_pipeline.yml`.
+*   **Близнецы football-data (примечание цикла #79–#80):** `FOOTBALL_DATA_API_KEY` — секрет сервиса football-data.org, в контуре НЕ используется и в Secrets не заводится; `football_data` — загрузчик истории (открытые CSV football-data.co.uk, ключ не требуется). Не путать: схожие имена — разные сущности.
 
 ---
 
@@ -143,7 +176,7 @@
 *   `chaos_monkey_runtime.py` — Среда симуляции случайных сбоев (Chaos Engineering) для тестирования отказоустойчивости контура в реальном времени.
 *   `reconciliation_ledger_runtime.py` — Рантайм сверки данных и ведения лога согласования (Ledger) между различными источниками.
 *   `stress_test_runtime.py` — Нагрузочный стресс-тест ядра: 550 паспортов v710 через value_engine, критерий throughput ≥ 500/сек. Патчен в цикле 9.6.8 (снят CI-обход, фикстуры → контракт v710).
-*   `football_data_to_redis.py` — Коллектор исторической базы football-data.co.uk (CSV, 120 колонок). Записывает историю через хаб (`upsert_history_match`), идемпотентен по `idempotency_key`. Версия v8.11-patched, чист по §1.3.
+*   `football_data_to_redis.py` — Коллектор исторической базы football-data.co.uk (CSV, 120 колонок). Записывает историю через хаб (`upsert_history_match`), идемпотентен по `idempotency_key`. Версия v8.18-registry-strict, чист по §1.3.
 *   `telegram_transport.py` — Транспорт отправки дашбордов и алертов в Telegram. Сетевой I/O изолирован через `asyncio.Queue` от транзакций Redis `MULTI`/`EXEC`. Канонический маршрут: `api.telegram.org/bot`. Автономен по замыслу (не импортирует хабы, §1.3); классификация из `signal_contract` (10.0.0-merged).
 *   `web_dashboard.py` — Панель управления и веб-интерфейс для мониторинга метрик и визуализации статуса экосистемы.
 
@@ -153,7 +186,7 @@
 *   `match_linker.py` — Модуль связывания актуальных матчей с историей Redis и отправки сводных дашбордов в Telegram. Патчен в циклах 9.6.8 и 10.0.0-merged (см. раздел выше).
 *   `backtest_runner.py` — Модуль исторического тестирования стратегий (бэктестинг) на `history:match:*` с temporal cutoff и скользящим окном дрифта PAVA. Чист по §1.3/§1.4.
 *   `search_module.py` — Движок нормализации названий команд и текстового поиска совпадений.
-*   `team_registry.py` — Реестр алиасов футбольных клубов (257+ системных записей, функция `clean_team_name`).
+*   `team_registry.py` — Единый движок нормализации (v10.0.1-redis-runtime): лестница резолюции §4, `normalize()`, cid, телеметрия MISS; данные — реестр `registry:*` в Redis (директива 12.11: карты стран и лиг не вшиваются в модуль), функция `clean_team_name` сохранена.
 *   `country_code_map.py` — Таблица маппинга кодов стран, названий национальных лиг и чемпионатов.
 
 ### 🔋 Конфигурации, Схемы и Валидация
@@ -187,7 +220,7 @@
 
 ## 🛠️ Спецификация Пайплайнов (`.github/workflows/`)
 
-Полный реестр: **15 воркфлоу** (сокращён в цикле 10.0.0-merged: 18 → 15 — три диагностических YML слиты в один; ранее в README значилось 12).
+Полный реестр: **16 воркфлоу** (факт сверки 12.11 по листингу .github/workflows/; в цикле 10.0.0-merged счётчик «18 → 15» был неточен, ранее в README значилось 12; после вливания reep_registry_uploader.yml — 17).
 Все — строго `workflow_dispatch` (§1.2), с каноническими concurrency-группами (§16.4)
 и таймаутами (§1.10).
 
