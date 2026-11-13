@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-Football-Data Collector v8.18-registry-strict (CSV) — engine-manifest payload, GatekeeperAI v710
+Football-Data Collector v8.17-slim (CSV) — engine-manifest payload, GatekeeperAI v710
 
-v8.18-registry-strict (Strict Degradation Protocol, §14.1):
-  - D1: OPENING_CASCADE без мёртвого кортежа PPH (колонка PPH в CSV 2425+ отсутствует,
-    факт сверки заголовка 2526 live-проверкой). Единственный Pinnacle-key: PSH/PSD/PSA.
-  - Fallback-словарь TEAM_ALIASES удалён целиком (вторая копия алиасов, §14.1);
-    при недоступности team_registry прогон честно падает с exit 1, а не пишет мимо реестра.
-  - clean_team_name / build_canonical_id — чистая делегация без глотания ошибок
-    (try/except с pass = тихий отказ, §6.4). payload-формат не тронут.
+v8.18-registry-strict (Шаг 14.1 / D1-fix, памятка v1.10.0):
+  - D1-fix: мёртвый кортеж PPH удалён из OPENING_CASCADE (колонки PPH в CSV
+    2425+ нет, PS* живёт). Каскад: PSH → B365H.
+  - Strict Degradation Protocol (§14.1): fallback-словарь TEAM_ALIASES удалён
+    целиком (130 алиасов — не источник); clean_team_name / build_canonical_id —
+    чистая делегация в team_registry без try/except pass (§6.4); импорт без
+    реестра — FATAL + SystemExit(1).
+  - Guard MISS-cid (§4.5): матч с пустым canonical_id (MISS-резолв до партии
+    P0) пропускается со счётчиком _REGISTRY_MISS_COUNT, не пишется.
 
 v8.17-slim (манифест полей движка; §23/§29/§39 prompt №2):
   - PAYLOAD SLIM: csv_raw (все колонки CSV) удалён из payload целиком, build_csv_raw
     исключён. Движку нужны 4 блока: identity+score, stats (12 метрик + xG),
     odds 1X2/OU/AH closing, odds_opening (CLV-entry). Остальное не потребляется
     ни одной математической секцией Prompt №1.
-  - +odds_opening: плоский вектор {"1","X","2"} по OPENING_CASCADE (PSH → B365H). CLV-entry (§28): opening = единственный легитимный источник признаков;
+  - +odds_opening: плоский вектор {"1","X","2"} по OPENING_CASCADE (PSH →
+    B365H). D1-fix v8.18: мёртвый кортеж PPH удалён (колонки PPH в CSV 2425+ нет). CLV-entry (§28): opening = единственный легитимный источник признаков;
     в v8.12..8.16 opening жил только в csv_raw (анти-leakage для live-контура;
     в history-payload поля легальны как признак CLV).
   - Сжатие снапшотов: CLOSING_CASCADE остаётся полным для выбора closing-вектора
@@ -134,17 +137,18 @@ except ImportError:
 
 from redis_hub import PipelineBatch, is_redis_available
 
-# Единый реестр команд
+# Единый реестр команд — Strict Degradation Protocol (§14.1): fallback-словарь
+# TEAM_ALIASES исключён из всех путей; запись мимо единого реестра запрещена.
 try:
     from team_registry import clean_team_name as _registry_normalize
     from team_registry import build_canonical_id as _registry_build_cid
-    _REGISTRY_AVAILABLE = True
-except ImportError:
-    _REGISTRY_AVAILABLE = False
-if not _REGISTRY_AVAILABLE:
-    print("[FATAL] team_registry недоступен — Strict Degradation Protocol (§14.1): "
-          "fallback-словарь TEAM_ALIASES исключён, запись мимо единого реестра запрещена.")
+except ImportError as _reg_err:
+    print(f"[FATAL] team_registry недоступен ({_reg_err}) — Strict Degradation Protocol "
+          "(§14.1): fallback-словарь TEAM_ALIASES исключён, запись мимо единого "
+          "реестра запрещена.")
     raise SystemExit(1)
+_REGISTRY_AVAILABLE = True
+_REGISTRY_MISS_COUNT = 0
 
 # Единое MSK-время
 try:
@@ -192,12 +196,10 @@ CLOSING_CASCADE = [
     ("BFECH",  "BFECD",  "BFECA",  "betfair_exchange"),
 ]
 
-# v8.18: opening-каскад для CLV-entry (§28 prompt №1). Opening-колонки CSV
-# без суффикса C. Факт D1: колонки PPH/PPD/PPA в CSV 2425+ отсутствуют (rebranded),
-# сверено по живому заголовку 2526 — PSH/PSD/PSA единственный Pinnacle-key.
-# Первый полный набор = entry.
+# v8.17-slim: opening-каскад для CLV-entry (§28 prompt №1). Opening-колонки CSV
+# без суффикса C; PSH/PSD/PSA — legacy-имя Pinnacle. Первый полный набор = entry.
 OPENING_CASCADE = [
-    ("PSH",   "PSD",   "PSA",   "pinnacle"),
+    ("PSH",   "PSD",   "PSA",   "pinnacle"),   # D1-fix v8.18: PPH удалён (нет в CSV 2425+)
     ("B365H", "B365D", "B365A", "bet365"),
 ]
 
@@ -255,9 +257,11 @@ LEAGUES = {
     "T1":  {"name": "Süper Lig",             "country": "Turkey",     "division": 1},
     "G1":  {"name": "Super League",          "country": "Greece",     "division": 1},
 }
-# [v8.18] Локальный словарь TEAM_ALIASES удалён (§14.1): единственный источник
-# алиасов — Reep-снапшот через team_registry. Старый словарь не мигрируется
-# (§1.5: «второго источника не будет»). Резолюция имён — только через реестр.
+# Bookmaker prefixes for 1X2 odds (IW, VC, WH removed — dead in CSV 2425+)
+# PS → PP (Pinnacle rebranded prefix), BF → BFD (Betfair 3-letter prefix)
+# TEAM_ALIASES (130 алиасов fallback) УДАЛЁН по §14.1 (v8.18-registry-strict):
+# словарь — не источник алиасов; единственный источник — Reep-снапшот
+# через team_registry (§14, §15 памятки v1.10.0).
 # ============================================================================
 # HELPERS
 # ============================================================================
@@ -280,11 +284,8 @@ def now_iso():
 
 
 def clean_team_name(name):
-    """Делегирует в team_registry.clean_team_name() — единый реестр (§14.1).
-
-    Без обёртки try/except: ошибка реестра честно роняет прогон (§6.4),
-    а не подменяется локальным fallback'ом — второй копии алиасов больше нет.
-    """
+    """Делегация в team_registry.clean_team_name() — единый реестр (§14.1).
+    Ошибка реестра не глотается (§6.4): тихий отказ запрещён."""
     if not name:
         return ""
     return _registry_normalize(name)
@@ -292,10 +293,7 @@ def clean_team_name(name):
 
 def build_canonical_id(home_team, away_team, date_utc):
     """Единый canonical_id — только team_registry (§14.1, сборщик один).
-
-    Без локальной fallback-реализации: при недоступности реестра прогон
-    не стартует (строгий отказ в блоке импорта).
-    """
+    MISS-резолв даёт "" (легаси-семантика загрузчика) — guard в build_payload."""
     return _registry_build_cid(home_team, away_team, date_utc)
 
 
@@ -578,6 +576,11 @@ def build_payload(row, season, league_code, run_id=None):
     home_clean = clean_team_name(home_team)
     away_clean = clean_team_name(away_team)
     canonical_id = build_canonical_id(home_team, away_team, date_utc)
+    # Guard MISS (§4.5, v8.18): матч с пустым cid не пишется — коллизия ключей
+    if not canonical_id:
+        global _REGISTRY_MISS_COUNT
+        _REGISTRY_MISS_COUNT += 1
+        return None
 
     flags = detect_flags(stats, {"home": home_score, "away": away_score})
 
@@ -1071,7 +1074,7 @@ def main():
     logger.info(f"  History days: {args.history_days or 'all'}")
     logger.info(f"  Soft limit: {COMMAND_SOFT_LIMIT if COMMAND_SOFT_LIMIT else 'disabled (0)'} commands")
     logger.info("  Hub: strict mode (13-G1) — запись только через gatekeeper_hub")
-    logger.info("  Registry: unified (team_registry, Strict Degradation §14.1)")
+    logger.info("  Registry: unified (team_registry, §14.1)")
 
     # Инициализация хаба
     init_metrics = run_initialization()
