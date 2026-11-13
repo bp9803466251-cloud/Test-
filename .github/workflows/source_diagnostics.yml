@@ -114,6 +114,58 @@ jobs:
             python -u source_diagnostics.py --mode "$DIAG_MODE"
           fi
 
+      # [10.0.6-keyscan FIX] Registry field audit: full-режим не разбирает поля
+      # registry:* в легаси-хэше (классифицирует только match:*), а диагноз
+      # заселения P0 требует точечных HGET. Шаг с if: always() — аудит обязан
+      # отработать и на красной диагностике (контрактный аудит истории даёт
+      # exit 1 на пустом контуре — это не сбой). Read-only, записи не делает.
+      - name: Registry Field Audit
+        if: always()
+        run: |
+          python -c "
+          import json
+          import redis_hub as rh
+
+          H = 'GatekeeperAI'
+          fields = rh.get_all_fields(H)
+          if not isinstance(fields, dict):
+              fields = {f: rh.get_from_cache(f) for f in (fields or [])}
+
+          reg = [f for f in fields if f.startswith('registry:')]
+          league = [f for f in reg if f.startswith('registry:league:')]
+          print('=== REGISTRY FIELD AUDIT ===')
+          print('total fields in hash:', len(fields))
+          print('registry:* fields  :', len(reg))
+          print('registry:league:*  :', len(league))
+          if reg:
+              print('first 10 registry fields:', sorted(reg)[:10])
+
+          for probe in ('registry:map:country_code', 'registry:system:health', 'telemetry'):
+              raw = fields.get(probe)
+              if not raw:
+                  print(probe, '-> NOT FOUND in hash')
+                  continue
+              try:
+                  d = json.loads(raw)
+                  if isinstance(d, dict):
+                      print(probe, '-> JSON dict,', len(d), 'keys')
+                      for k in ('TUR', 'KOR', 'CHI', 'CHN', 'CAM', 'MON', 'SOU', 'MD', 'ZA'):
+                          if k in d:
+                              print('   ', k, '->', d[k])
+                  else:
+                      print(probe, '-> JSON', type(d).__name__)
+              except Exception:
+                  print(probe, '-> raw,', len(raw), 'bytes:', str(raw)[:120])
+
+          # верхний уровень: обособленные registry-ключи (ожидание после фикса хаба)
+          try:
+              keys = rh.scan_keys('registry:*')
+              print('top-level registry:* keys:', sorted(keys)[:20], '| total:', len(keys))
+          except Exception as e:
+              print('scan_keys registry:* failed:', e)
+          print('=== AUDIT DONE ===')
+          "
+
       - name: Telegram alert on failure
         if: failure()
         env:
@@ -126,3 +178,4 @@ jobs:
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" \
             -d parse_mode="HTML"
+            
