@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # gatekeeper_hub.py
 """
-Единый хаб Gatekeeper-AI v9.6.8-patched (Схема v710 / Гейт 28).
+Единый хаб Gatekeeper-AI v9.6.9-registry (Схема v710 / Гейт 28).
 Все операции с данными матчей проходят только через этот модуль.
 
 Обновления v9.6.8-patched:
@@ -18,6 +18,23 @@
   - cleanup_expired(auto_migrate=True): Cross-Namespace Reconciliation (§27.5)
   - Конверт поиска v700-prod; schema_version: "v710"; version >= 1
   - Импорт clean_team_name напрямую из team_registry.py (fallback search_module с WARN)
+
+Обновления v9.6.9-registry (памятка v1.10.0, §7/§14.1):
+  - Строгий импорт реестра: fallback на search_module и лямбда-заглушка удалены,
+    ImportError -> FATAL + SystemExit(1) (Strict Degradation Protocol §14.1)
+  - _make_canonical_id -> делегация единому сборщику team_registry с легаси-
+    семантикой missing="unknown"; A4-адаптер при отсутствии параметра
+  - upsert_registry(entity_type, records, source): пять форм записей (A1),
+    add-only §6.1, конфликты и сироты — счётчиками, HSETNX батчами §13.4
+  - resolve_registry(name, country, entity_type, section): делегация лестницы §4,
+    MISS -> "" без самоканонизации (§6.4), телеметрия registry:system:health
+  - Flush реестра отсюда недоступен — только redis_flush.py (урок F1)
+
+Обновления v9.6.9.1-registry (companion uploader v0.4):
+  - upsert_registry: шестая форма country_code (§14.4) — seed-карта стран;
+    одиночный JSON-ключ registry:map:country_code (КОД upper -> канон),
+    формат читателя Registry._ensure (team_registry v10.0.1); один SET
+    на партию (§13.4), add-only §6.1: конфликт — старое удержано + счётчик
 
 Обновления v9.6.9-history (Шаг 13-H):
   - upsert_match(force=..., batch=...): force-семантика §12.6.1 и пакетный режим 13-G2
@@ -54,17 +71,20 @@ from redis_hub import (
     PipelineBatch,
 )
 
-# ─── Импорт реестра имён (§26): прямой импорт из team_registry ───
+# ─── Импорт реестра имён (§14.1): Strict Degradation Protocol ───
+# Fallback на search_module и лямбда-заглушка УДАЛЕНЫ (v9.6.9-registry):
+# запись/резолв мимо единого реестра запрещены, отсутствие модуля — FATAL.
 try:
     from team_registry import clean_team_name
-except ImportError:  # pragma: no cover — fallback с громким WARN
-    try:
-        from search_module import clean_team_name  # type: ignore
-        print("[HUB WARN] team_registry.py не найден — fallback на search_module.clean_team_name "
-              "(нарушение §26; задеплойте team_registry.py в корень репозитория)")
-    except ImportError:
-        def clean_team_name(name: str) -> str:  # type: ignore[misc]
-            return str(name or "").strip().lower()
+    from team_registry import build_canonical_id as _registry_build_cid
+except ImportError as _reg_err:
+    print(f"[FATAL] team_registry недоступен ({_reg_err}) — Strict Degradation "
+          "Protocol (§14.1): запись мимо единого реестра запрещена.")
+    raise SystemExit(1)
+try:
+    from team_registry import resolve_slug as _registry_resolve
+except ImportError:
+    _registry_resolve = None  # v9.6.1 без лестницы: resolve_registry даёт честный MISS + одноразовый WARN (A4)
 
 try:
     import yaml  # type: ignore
@@ -128,6 +148,212 @@ _provider_priority_order = ["pinnacle", "opta", "odds_api", "betradar", "bzzoiro
 
 # Отложенные метрики (записываются один раз в конце)
 _pending_metrics: Dict[str, Any] = {}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# РЕЕСТР registry:* (памятка v1.10.0: §3 топология, §6.1 add-only, §12.3)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_REGISTRY_HEALTH_KEY = "registry:system:health"
+_REGISTRY_COUNTRY_MAP_KEY = "registry:map:country_code"  # v9.6.9.1 (§14.4)
+_REGISTRY_ENTITY_TYPES = ("team", "competition", "reep_bridge", "team_alias", "ext_bridge", "country_code")
+
+
+def _registry_health_update(section: str, field: str, delta: int = 1) -> None:
+    """Накопитель телеметрии реестра по разделам (§3). Flush в конце вызова."""
+    try:
+        health = get_from_cache(_REGISTRY_HEALTH_KEY) or {}
+        if not isinstance(health, dict):
+            health = {}
+        node = health.setdefault(section, {})
+        if not isinstance(node, dict):
+            node = health[section] = {}
+        node[field] = int(node.get(field, 0)) + delta
+        save_to_cache(_REGISTRY_HEALTH_KEY, health)
+    except Exception as exc:
+        print(f"[HUB WARN] registry telemetry: {exc}")
+
+
+def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> Dict[str, Any]:
+    """Единая дверь записи реестра registry:* (§1, §6.1 add-only, §12.3).
+
+    Формы записей (контракт A1, подтверждён кодом uploader v0.3):
+      team        : {slug, canonical_name, reep_id?, country_slug?}
+      competition : {slug, canonical_name, country_slug?}
+      reep_bridge : {reep_id, slug}                (old_id -> canonical)
+      team_alias  : {alias, slug, country_slug?}   (scoped при country_slug)
+      ext_bridge  : {provider, external_id, slug}
+      country_code: {code, canonical}             (v9.6.9.1, §14.4; SET-форма)
+
+    Add-only (§6.1): существующее значение не перезаписывается молча —
+    расхождение считается конфликтом, старое значение удерживается.
+    Flush реестра отсюда недоступен — только redis_flush.py (урок F1).
+    """
+    if entity_type not in _REGISTRY_ENTITY_TYPES:
+        raise ValueError(f"upsert_registry: неизвестный entity_type={entity_type!r}")
+    if not isinstance(records, list):
+        records = [records] if records else []
+
+    tally: Dict[str, int] = {"written": 0, "skipped_exists": 0, "conflicts": 0,
+                             "orphans": 0, "invalid": 0, "commands": 0}
+
+    if entity_type == "country_code":
+        # v9.6.9.1 (§14.4): шестая форма — seed-карта стран. Читатель
+        # (team_registry v10.0.1, Registry._ensure) ждёт одиночный JSON-ключ
+        # registry:map:country_code — словарь КОД(upper) -> канон.
+        # Один SET на партию (§13.4); add-only §6.1: существующий код не
+        # перезаписывается — расхождение = конфликт, старое значение удержано.
+        merged: Dict[str, str] = {}
+        for rec in records:
+            if not isinstance(rec, dict):
+                tally["invalid"] += 1
+                continue
+            code = str(rec.get("code") or "").strip().upper()
+            canon = str(rec.get("canonical") or "").strip()
+            if not code or not canon:
+                tally["orphans"] += 1
+                continue
+            merged[code] = canon
+        existing_raw = get_from_cache(_REGISTRY_COUNTRY_MAP_KEY)
+        try:
+            existing = json.loads(existing_raw) if isinstance(existing_raw, str) else existing_raw
+        except (json.JSONDecodeError, TypeError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        tally["conflicts"] += sum(
+            1 for k, v in merged.items() if k in existing and existing.get(k) != v
+        )
+        updated = {**merged, **existing}  # существующее удержано (§6.1)
+        if updated != existing:
+            save_to_cache(_REGISTRY_COUNTRY_MAP_KEY, updated)
+            tally["written"] = len(updated) - len(existing)
+            tally["commands"] += 1
+        _registry_health_update("registry:upsert", "written", tally["written"])
+        _registry_health_update("registry:upsert", "conflicts", tally["conflicts"])
+        return tally
+
+    if entity_type in ("team", "competition"):
+        prefix = "registry:team:" if entity_type == "team" else "registry:league:"
+        for rec in records:
+            if not isinstance(rec, dict):
+                tally["invalid"] += 1
+                continue
+            slug = str(rec.get("slug") or "").strip()
+            if not slug:
+                tally["orphans"] += 1
+                continue
+            key = f"{prefix}{slug}"
+            existing = get_from_cache(key)
+            if existing:
+                body = existing if isinstance(existing, dict) else {}
+                if str(body.get("canonical_name") or "") != str(rec.get("canonical_name") or ""):
+                    tally["conflicts"] += 1
+                    continue
+                tally["skipped_exists"] += 1
+                continue
+            save_to_cache(key, dict(rec, ts=_now_msk()))
+            tally["written"] += 1
+            tally["commands"] += 1
+        section = "registry:upsert"
+        _registry_health_update(section, "written", tally["written"])
+        _registry_health_update(section, "conflicts", tally["conflicts"])
+        return tally
+
+    # Формы HASH: HGET-сверка батчем + атомарный HSETNX батчем (§13.4)
+    from redis_hub import redis_command as _rc
+    plan: List[Tuple[str, str, str, str]] = []  # (key, field, value, form)
+    for rec in records:
+        if not isinstance(rec, dict):
+            tally["invalid"] += 1
+            continue
+        slug = str(rec.get("slug") or "").strip()
+        if entity_type == "reep_bridge":
+            rid = str(rec.get("reep_id") or "").strip()
+            if not rid or not slug:
+                tally["orphans"] += 1
+                continue
+            plan.append(("registry:bridge:reep", rid, slug, "reep_bridge"))
+        elif entity_type == "ext_bridge":
+            provider = str(rec.get("provider") or "").strip()
+            ext_id = str(rec.get("external_id") or "").strip()
+            if not provider or not ext_id or not slug:
+                tally["orphans"] += 1
+                continue
+            plan.append((f"registry:bridge:{provider}", ext_id, slug, "ext_bridge"))
+        else:  # team_alias
+            alias = str(rec.get("alias") or "").strip().lower()
+            if not alias or not slug:
+                tally["orphans"] += 1
+                continue
+            country = str(rec.get("country_slug") or rec.get("country") or "").strip().lower()
+            if country:
+                key = f"registry:alias:team:{country}:{alias}"
+            else:
+                key = "registry:alias:team"
+            plan.append((key, alias, slug, "team_alias"))
+            # Глобальный двусмысленный алиас без гео — гашение §4-3
+            if not country:
+                _registry_health_update("registry:alias", "global_alias_no_geo", 1)
+
+    if plan:
+        batch = PipelineBatch(max_batch=100)
+        for key, field, _val, _form in plan:
+            batch.add("HGET", key, field)
+        existing_values = batch.flush() or []
+        if not isinstance(existing_values, list):
+            existing_values = [existing_values]
+        if len(existing_values) < len(plan):
+            existing_values += [None] * (len(plan) - len(existing_values))
+
+        writes = []
+        for (key, field, value, _form), old in zip(plan, existing_values):
+            if old is None or old == "" or (isinstance(old, str) and old == ""):
+                writes.append(("HSETNX", key, field, value))
+            elif str(old) == value:
+                tally["skipped_exists"] += 1
+            else:
+                tally["conflicts"] += 1  # старое значение удержано (§6.1)
+        if writes:
+            wbatch = PipelineBatch(max_batch=100)
+            for w in writes:
+                wbatch.add(*w)
+            wbatch.flush()
+            tally["commands"] += len(writes)
+            tally["written"] += len(writes)
+        tally["commands"] += len(plan)  # HGET-сверка
+
+    _registry_health_update("registry:upsert", "written", tally["written"])
+    _registry_health_update("registry:upsert", "conflicts", tally["conflicts"])
+    return tally
+
+
+def resolve_registry(name: str, country: Optional[str] = None,
+                     entity_type: str = "team", section: str = "unknown") -> str:
+    """Резолв названия через лестницу §4 в team_registry (§2, §6.4).
+    MISS возвращает "" — без самоканонизации. Телеметрия по разделам (§3).
+    Ошибка реестра не глотается — роняет вызов (§6.4)."""
+    if _registry_resolve is None:
+        global _A4_WARNED
+        if not _A4_WARNED:
+            print("[HUB WARN] team_registry без resolve_slug — resolve_registry даёт "
+                  "честный MISS (§6.4); обновите модуль до v10.0.1-redis-runtime")
+            _A4_WARNED = True
+        _registry_health_update(section, "misses", 1)
+        return ""
+    try:
+        try:
+            slug = _registry_resolve(name, country=country)
+        except TypeError:
+            slug = _registry_resolve(name)
+    except Exception:
+        # Ошибка реестра — не MISS, а дефект: пробрасываем (§6.4)
+        raise
+    if slug:
+        _registry_health_update(section, "hits", 1)
+    else:
+        _registry_health_update(section, "misses", 1)
+    return str(slug or "")
 
 
 # ---------------------------------------------------------------------------
@@ -208,15 +434,23 @@ def now_msk() -> str:
     return _now_msk()
 
 
+_A4_WARNED = False
+
+
 def _make_canonical_id(home_team: str, away_team: str, date_utc: str) -> str:
-    home_c = str(clean_team_name(home_team) or "").replace(" ", "_")
-    away_c = str(clean_team_name(away_team) or "").replace(" ", "_")
+    """Единый canonical_id — делегация в team_registry (§14.1, сборщик один).
+    Легаси-семантика хаба: MISS/нет даты -> "unknown" (missing="unknown")."""
+    global _A4_WARNED
     try:
-        dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
-        date_str = dt.strftime("%Y%m%d")
-    except Exception:
-        date_str = "unknown"
-    return f"{home_c}__{away_c}__{date_str}"
+        return _registry_build_cid(home_team, away_team, date_utc, missing="unknown")
+    except TypeError:
+        # A4-адаптер: сигнатура сборщика без missing — одноразовый WARN (§13.8),
+        # не fallback логики: результат пустой строки честно мапится в "unknown".
+        if not _A4_WARNED:
+            print("[HUB WARN] team_registry.build_canonical_id без missing — "
+                  "A4-адаптер активен, результат MISS мапится в 'unknown'")
+            _A4_WARNED = True
+        return _registry_build_cid(home_team, away_team, date_utc) or "unknown"
 
 
 def _make_field_name(canonical_id: str) -> str:

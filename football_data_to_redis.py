@@ -331,8 +331,6 @@ def safe_int(val):
         return int(float(val))
     except (ValueError, TypeError):
         return 0
-
-
 def parse_stat(val):
     """Статистика матча: пусто/NA/None -> None («данных нет»), отличимо от 0 (v8.13).
     Заменяет safe_int в build_stats: фальшивые нули искажали дисперсию для
@@ -622,6 +620,7 @@ def build_payload(row, season, league_code, run_id=None):
     }
 
     return payload
+
 # ============================================================================
 # COLLECTOR
 # ============================================================================

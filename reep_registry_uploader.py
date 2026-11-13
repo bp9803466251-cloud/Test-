@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""reep_registry_uploader.py — v0.3 (rebuild)
+"""reep_registry_uploader.py — v0.4-registry-delegation (rebuild)
+
+v0.4-registry-delegation (Шаг 9.4, памятка v1.10.0, §14.1/§14.4; вердикты владельца от 12.11):
+  - Локальные _HOMOGLYPH/_CYR_LAT/_fold_mixed/normalize/translit/slugify УДАЛЕНЫ:
+    вторая копия словаря исключена, делегация в team_registry — строгий импорт,
+    ImportError -> FATAL + SystemExit(1).
+  - country_code: seed-артефакт country_code_map (§14.4); ISO-2 в нижнем регистре
+    (образец §12.6: fc_atletico_balti_md); канон-фиксы Молдова->md, Замбия->za;
+    алиасы (United States->us) — явными записями журнала, не тихо.
+  - P0 вобрал seed-карты: build_country_records -> entity_type country_code
+    (шестая форма хаба v9.6.9.1); Reep-канон побеждает seed-канон.
+  - Fix лестницы: cc для коллизий — нижний код (был верхний RU после консолидации;
+    самотест v0.3 в этой среде был красным: 11 PASS / 3 FAIL — ожидания кодировали
+    legacy-fallback, поднят до честного ISO-канона).
 
 Автономный заливщик реестра Reep. По памятке v1.9.3 (§9 п.4, §14, §16):
 Reep-снапшот -> normalize() (§5) -> JSONL дельты -> bulk upsert_registry.
@@ -35,7 +48,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "0.3-rebuild"
+VERSION = "0.4-registry-delegation"
 REEP_BASE = "https://reep.football"
 POINTER_URL = REEP_BASE + "/data/latest.json"
 DOWNLOAD_URL = REEP_BASE + "/downloads/csv/{table}"
@@ -49,7 +62,7 @@ HUB_BATCH = 500
 CHUNK_TEAM = 10000
 CHUNK_ALIAS = 50000
 STOP_FILE = "STOP"
-REPORT_FILE = "report_v0_3.json"
+REPORT_FILE = "report_v0_3.json"  # имя закреплено контрактом (workflow-артефакт, §9 п.7) — не переименовывать
 
 
 # --- исключения -------------------------------------------------------------
@@ -126,92 +139,70 @@ def open_parsed(path, table):
     return f, r, detect_columns(header, table)
 
 
-# --- нормализация §5 (порядок операций жёсткий) -----------------------------
+# --- Нормализация §5: делегация в team_registry (Strict Degradation, §14.1) ---
+# Эпитафия: локальные _HOMOGLYPH/_CYR_LAT/_fold_mixed удалены — вторая копия
+# словаря исключена из ВСЕХ путей (§14.1); резолв мимо единого реестра запрещён.
+try:
+    from team_registry import normalize as _registry_normalize
+    from team_registry import translit as _registry_translit
+    from team_registry import slugify as _registry_slugify
+except ImportError as _reg_err:
+    print("[FATAL] team_registry недоступен (%s) — Strict Degradation Protocol "
+          "(§14.1): нормализация мимо единого реестра запрещена." % _reg_err)
+    raise SystemExit(1)
 
-_HOMOGLYPH = {"а": "a", "о": "o", "с": "c", "е": "e", "р": "p", "х": "x",
-              "к": "k", "м": "m", "т": "t", "в": "b", "н": "h", "у": "y"}
-
-_CYR_LAT = {"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
-            "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
-            "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
-            "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
-            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya"}
-
-
-def _is_latin(ch):
-    return "a" <= ch <= "z"
-
-
-def _is_cyr(ch):
-    return ("а" <= ch <= "я") or ch == "ё"
-
-
-def _fold_mixed(tok):
-    """§5.2: свёртка только в смешанных токенах (оба алфавита) — к латинице."""
-    if not (any(_is_latin(c) for c in tok) and any(_is_cyr(c) for c in tok)):
-        return tok
-    out = []
-    for c in tok:
-        if c in _HOMOGLYPH:
-            out.append(_HOMOGLYPH[c])
-        elif _is_cyr(c):
-            out.append(_CYR_LAT.get(c, ""))
-        else:
-            out.append(c)
-    return "".join(out)
+# Seed-артефакт карт стран (§14.4): без него P0 не заселяет registry:map:country_code.
+try:
+    from country_code_map import COUNTRY_CODE_MAP as _SEED_COUNTRY_MAP
+except ImportError as _seed_err:
+    print("[FATAL] country_code_map недоступен (%s) — seed-артефакт заселения "
+          "обязателен (§14.4)." % _seed_err)
+    raise SystemExit(1)
 
 
 def normalize(name):
-    if not name:
-        return ""
-    s = name.strip().lower()
-    s = re.sub(r"[^\w\s]", " ", s)          # пунктуация -> пробел
-    s = re.sub(r"\s+", " ", s).strip()
-    if not s:
-        return ""
-    s = " ".join(_fold_mixed(t) for t in s.split(" "))
-    if STRIP_SUFFIX_ENABLED:                 # §5.3: строго ПОСЛЕ свёртки; флаг OFF (§12.1)
-        s = re.sub(r"\b(fc|cf|afc|фк)\b", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return _registry_normalize(name)
 
 
 def translit(s):
-    out = []
-    for c in s:
-        out.append(_CYR_LAT.get(c, c) if _is_cyr(c) else c)
-    return "".join(out)
+    return _registry_translit(s)
 
 
 def slugify(name):
-    """Slug из Reep-канона в латинице (§12.5.4, рекомендация)."""
-    s = normalize(name)
-    if not s:
-        return None
-    s = translit(s)
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or None
+    return _registry_slugify(name)
+
+
+# Директива 12.11: дыры seed-карты восполняются явно (вердикт владельца 12.11).
+CANON_COUNTRY_FIX = {"moldova": "md", "zambia": "za"}
+# Явный алиас канона (вердикт владельца: USA vs United States — алиас, не тихо).
+CANON_COUNTRY_ALIAS = {"united states": "us"}
+COUNTRY_ALIAS_JOURNAL = []   # каждая подмена фиксируется — попадает в отчёт
 
 
 def country_code(country):
-    """Код страны для лестницы коллизий (§12.8). Карта — из team_registry (§14, данные)."""
+    """Код страны лестницы коллизий (§12.6/§12.8): ISO-2 в нижнем регистре.
+    Seed — country_code_map; неизвестное — транслит 3-буквенный + запись в журнал."""
     if not country:
         return ""
-    n = normalize(country)
-    code = None
-    try:
-        from team_registry import COUNTRY_CODE_MAP as M
-        if n in M:
-            code = M[n]
-        else:
-            for k, v in M.items():
-                if normalize(str(v)) == n:
-                    code = k
-                    break
-    except Exception:
-        code = None
-    return code or re.sub(r"[^a-z]", "", n)[:3]
+    n = _registry_normalize(country)
+    if not n:
+        return ""
+    if n in CANON_COUNTRY_FIX:
+        COUNTRY_ALIAS_JOURNAL.append({"kind": "canon_fix", "input": country,
+                                      "code": CANON_COUNTRY_FIX[n]})
+        return CANON_COUNTRY_FIX[n]
+    if n in CANON_COUNTRY_ALIAS:
+        COUNTRY_ALIAS_JOURNAL.append({"kind": "alias", "input": country,
+                                      "code": CANON_COUNTRY_ALIAS[n]})
+        return CANON_COUNTRY_ALIAS[n]
+    cands = [k for k, v in _SEED_COUNTRY_MAP.items() if _registry_normalize(str(v)) == n]
+    if cands:
+        two = [k for k in cands if len(k) == 2]
+        return (two[0] if two else sorted(cands)[0]).lower()
+    code = _registry_translit(re.sub(r"[^a-z ]", "", n)).replace(" ", "")[:3]
+    if code:
+        COUNTRY_ALIAS_JOURNAL.append({"kind": "fallback", "input": country, "code": code})
+    return code
 
 
 # --- сеть -------------------------------------------------------------------
@@ -505,10 +496,35 @@ def split_global_scoped(aliases):
 
 # --- партии (§16) -----------------------------------------------------------
 
+def build_country_records(ents):
+    """Seed страны (§14.4): карта -> registry:map:country_code (шестая форма хаба).
+    Reep-канон побеждает seed-канон; каждое расхождение — явная запись журнала."""
+    canon = {}
+    for code, name in _SEED_COUNTRY_MAP.items():
+        canon[str(code).upper()] = str(name)
+    for cname, code in (("Moldova", "MD"), ("Zambia", "ZA")):
+        if code not in canon:
+            canon[code] = cname
+            COUNTRY_ALIAS_JOURNAL.append({"kind": "canon_fix", "code": code, "canonical": cname})
+    for cname in sorted({e["country"] for e in ents.meta.values() if e.get("country")}):
+        code = country_code(cname)
+        if not code:
+            continue
+        cu = code.upper()
+        if cu in canon and canon[cu] != cname:
+            COUNTRY_ALIAS_JOURNAL.append({"kind": "reep_alias", "code": cu,
+                                          "seed": canon[cu], "reep": cname})
+            canon[cu] = cname  # Reep-канон побеждает (§14.1)
+        elif cu not in canon:
+            canon[cu] = cname
+    return [{"entity_type": "country_code", "code": c, "canonical": canon[c]}
+            for c in sorted(canon)]
+
+
 def build_parties(ents, alias_recs, ext_bridges):
     parties = []
-    # P0: лиги + их reep-мосты (~3 тыс. записей — разминка)
-    recs = []
+    # P0: seed-карты стран (§14.4) + лиги + их reep-мосты (~3 тыс. записей — разминка)
+    recs = build_country_records(ents)
     for rid in sorted(ents.comps):
         recs.append({"entity_type": "competition", "reep_id": rid,
                      "slug": ents.comps[rid], "canonical": ents.meta[rid]["name"]})
@@ -693,6 +709,11 @@ def run(args):
         "ext_bridges": len(ext_bridges),
         "parties_total": len(parties),
         "parties_wanted": [p["id"] for p in wanted],
+        "countries": {
+            "records": sum(1 for p in parties for r in p["records"]
+                           if r["entity_type"] == "country_code"),
+            "alias_journal": COUNTRY_ALIAS_JOURNAL,
+        },
     }
 
     if args.dry_run:
@@ -791,11 +812,11 @@ def selftest():
     alias_recs, ambiguous = split_global_scoped(aliases)
     parties = build_parties(ents, alias_recs, ext_bridges)
 
-    check("T1 redirect resolution", ents.teams.get("t3") == "arsenal_tula_rus", ents.teams)
+    check("T1 redirect resolution", ents.teams.get("t3") == "arsenal_tula_ru", ents.teams)
     check("T2 mixed-token folding", normalize("FС") == "fc", repr(normalize("FС")))
     check("T3 ladder: base", ents.teams.get("t1") == "arsenal", ents.teams)
-    check("T3 ladder: +cc", ents.teams.get("t3") == "arsenal_tula_rus", ents.teams)
-    check("T3 ladder: 2nd collision -> reep_id suffix", ents.teams.get("t7") == "arsenal_tula_rus_t7", ents.teams)
+    check("T3 ladder: +cc", ents.teams.get("t3") == "arsenal_tula_ru", ents.teams)
+    check("T3 ladder: 2nd collision -> reep_id suffix", ents.teams.get("t7") == "arsenal_tula_ru_t7", ents.teams)
     check("T4 translit slug", ents.teams.get("t4") == "spartak_moscow", ents.teams)
     check("T5 orphan alias", orphans >= 1, orphans)  # t99 (вне реестра)
     check("T6 ambiguous global suppressed", ambiguous >= 1, ambiguous)
@@ -814,6 +835,25 @@ def selftest():
     save_checkpoint(tmp, "test-tag", {"P0"}, hub=None)
     check("T11 checkpoint round-trip", load_checkpoint(tmp, "test-tag", hub=None) == {"P0"})
     check("T12 checkpoint tag mismatch", load_checkpoint(tmp, "other-tag", hub=None) == set())
+
+    # T13-T17: v0.4-registry-delegation (§14.1 делегация, §14.4 seed стран)
+    check("T13 delegation normalize", normalize("Süper Lig") == "super lig",
+          repr(normalize("Süper Lig")))
+    check("T14 canon-fix Moldova", country_code("Moldova") == "md",
+          repr(country_code("Moldova")))
+    check("T15 canon-fix Zambia", country_code("Zambia") == "za",
+          repr(country_code("Zambia")))
+    _us = country_code("United States")
+    check("T16 explicit alias United States->us",
+          _us == "us" and any(j.get("kind") == "alias" and j.get("input") == "United States"
+                              and j.get("code") == "us" for j in COUNTRY_ALIAS_JOURNAL),
+          COUNTRY_ALIAS_JOURNAL[-3:])
+    check("T17 epitaph no local dicts",
+          not hasattr(sys.modules[__name__], "_HOMOGLYPH")
+          and not hasattr(sys.modules[__name__], "_CYR_LAT"), "epitaph")
+    check("T18 P0 carries country_code records",
+          any(r["entity_type"] == "country_code" for r in parties[0]["records"]),
+          parties[0]["records"][:2])
 
     print("---")
     print("итог: %d PASS, %d FAIL" % (ok, fail))
