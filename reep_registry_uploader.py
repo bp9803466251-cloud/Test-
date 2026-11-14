@@ -2,6 +2,14 @@
 # -*- coding: utf-8 -*-
 """reep_registry_uploader.py — v0.4-registry-delegation (rebuild)
 
+v0.4.2-selftest-isolation (исправление загрязнения прода селфтестом, прогон #3):
+  - T11/T12 (checkpoint round-trip) исполнялись с реальным транспортом:
+    _checkpoint_redis тянет redis_command из redis_hub в момент вызова,
+    а в Actions с живыми секретами это прод — тестовый test-tag записывался
+    в Redis реальным SET. Изоляция: ин-мемори фейк-транспорт для T11/T12,
+    реальный восстанавливается в finally + проба T19 на восстановление.
+  - Проба T11a: фейк-хранилище реально использовано тестом.
+
 v0.4-registry-delegation (Шаг 9.4, памятка v1.10.0, §14.1/§14.4; вердикты владельца от 12.11):
   - Локальные _HOMOGLYPH/_CYR_LAT/_fold_mixed/normalize/translit/slugify УДАЛЕНЫ:
     вторая копия словаря исключена, делегация в team_registry — строгий импорт,
@@ -48,7 +56,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "0.4.1-registry-delegation"
+VERSION = "0.4.2-selftest-isolation"
 REEP_BASE = "https://reep.football"
 POINTER_URL = REEP_BASE + "/data/latest.json"
 DOWNLOAD_URL = REEP_BASE + "/downloads/csv/{table}"
@@ -842,10 +850,33 @@ def selftest():
     except SchemaError as exc:
         check("T10 schema exit", "не найдены обязательные" in str(exc) and "foo" in str(exc), exc)
 
-    # checkpoint round-trip (локальный файл, hub=None)
-    save_checkpoint(tmp, "test-tag", {"P0"}, hub=None)
-    check("T11 checkpoint round-trip", load_checkpoint(tmp, "test-tag", hub=None) == {"P0"})
-    check("T12 checkpoint tag mismatch", load_checkpoint(tmp, "other-tag", hub=None) == set())
+    # [v0.4.2 SELFTEST-ISOLATION] checkpoint round-trip: ин-мемори транспорт
+    # вместо прод-Redis. _checkpoint_redis импортирует redis_command из
+    # redis_hub в момент вызова — с живыми секретами Actions селфтест писал
+    # test-tag в прод (прогон #3, tag: test-tag после пуржа #28).
+    _real_ckpt = _checkpoint_redis
+    _fake_store = {}
+
+    def _fake_ckpt(cmd_parts):
+        op = cmd_parts[0] if cmd_parts else ""
+        if op == "SET":
+            _fake_store[cmd_parts[1]] = cmd_parts[2]
+            return "OK"
+        if op == "GET":
+            return _fake_store.get(cmd_parts[1])
+        return None
+
+    globals()["_checkpoint_redis"] = _fake_ckpt
+    try:
+        save_checkpoint(tmp, "test-tag", {"P0"}, hub=None)
+        check("T11 checkpoint round-trip", load_checkpoint(tmp, "test-tag", hub=None) == {"P0"})
+        check("T12 checkpoint tag mismatch", load_checkpoint(tmp, "other-tag", hub=None) == set())
+        check("T11a fake transport used", CHECKPOINT_KEY in _fake_store,
+              "фейк-хранилище пусто — тест пошёл мимо изоляции")
+    finally:
+        globals()["_checkpoint_redis"] = _real_ckpt
+    check("T19 transport restored", _checkpoint_redis is _real_ckpt,
+          "реальный транспорт не восстановлен после T11/T12")
 
     # T13-T17: v0.4-registry-delegation (§14.1 делегация, §14.4 seed стран)
     check("T13 delegation normalize", normalize("Süper Lig") == "super lig",
