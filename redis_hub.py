@@ -322,6 +322,62 @@ class PipelineBatch:
         return sent
 
 
+    def flush_with_results(self) -> List[Optional[Any]]:
+        """[10.0.2 FIX] Flush с возвратом РЕЗУЛЬТАТОВ каждой команды.
+
+        flush() возвращает число доставленных команд (sent: int) — этого
+        мало для HGET-сверки батчем в gatekeeper_hub.upsert_registry
+        (HASH-форма): код делал existing_values = batch.flush() или []
+        и получал [N] вместо N значений. Первый рекорд каждой партии
+        ловил фантомный конфликт, реальные существующие значения не
+        читались никогда. Возвращает список результатов в порядке команд;
+        упавший слот ({error}) или недоставленная команда — None.
+        Деградация транспорта — поштучное исполнение redis_command.
+        Счётчик commands_used ведётся как в flush()."""
+        results: List[Optional[Any]] = []
+        if not self._ops:
+            return results
+        ops, self._ops = self._ops, []
+        if self.dry_run:
+            return [None] * len(ops)
+        sent = 0
+        for i in range(0, len(ops), self.max_batch):
+            chunk = ops[i:i + self.max_batch]
+            res = _execute_upstash_pipeline(chunk)
+            if res is None:
+                for cmd in chunk:
+                    try:
+                        results.append(redis_command(cmd))
+                        sent += 1
+                    except Exception as exc:
+                        print(f"[REDIS PIPELINE ITEM ERROR] {cmd[0]}: {exc}")
+                        results.append(None)
+            elif isinstance(res, list) and len(res) == len(chunk):
+                for cmd, item in zip(chunk, res):
+                    if isinstance(item, dict) and "error" in item:
+                        print(f"[REDIS PIPELINE ITEM ERROR] {cmd[0]}: {item.get('error')}")
+                        results.append(None)
+                    else:
+                        results.append(item.get("result") if isinstance(item, dict) else item)
+                        sent += 1
+            else:
+                # Несоответствие длины ответа — деградация поштучно
+                if not (isinstance(res, list) and len(res) == len(chunk)):
+                    print(f"[REDIS PIPELINE WARNING] Ответ {len(res) if isinstance(res, list) else res} "
+                          f"элементов на {len(chunk)} команд — доставляем пачку поштучно")
+                for cmd in chunk:
+                    try:
+                        results.append(redis_command(cmd))
+                        sent += 1
+                    except Exception as exc:
+                        print(f"[REDIS PIPELINE ITEM ERROR] {cmd[0]}: {exc}")
+                        results.append(None)
+            if self.batch_delay > 0:
+                time.sleep(self.batch_delay)
+        self.commands_used += sent
+        return results
+
+
 # ---------------------------------------------------------------------------
 # Публичный API: точечные операции (live-хэш GatekeeperAI)
 # ---------------------------------------------------------------------------
@@ -382,12 +438,21 @@ def field_exists(field_id: str) -> bool:
 # Публичный API: массовые операции (live-хэш GatekeeperAI)
 # ---------------------------------------------------------------------------
 
-def get_all_fields() -> Dict[str, Any]:
+def get_all_fields(key: Optional[str] = None) -> Dict[str, Any]:
     """
-    Возвращает все поля хэш-кэша как dict {field_id: value}.
-    Используется для миграций и инициализации.
+    Возвращает все поля хэша как dict {field_id: value}.
+
+    [10.0.2-fix] Без аргумента — легаси-хэш GatekeeperAI (обратная
+    совместимость со всеми существующими вызовами). С аргументом —
+    HGETALL произвольного ключа: контракт duck-typing team_registry
+    v10.0.1 (Registry._ensure вызывает get_all_fields(key) для
+    bridge/alias-сканов). Без optional-параметра такие вызовы давали
+    TypeError, что молча убивало загрузку снимка реестра ([REGISTRY WARN]
+    снимок не загружен) — все резолвы уходили в честный MISS.
     """
-    res = _execute_upstash_cmd(["HGETALL", IMMUTABLE_ROOT_ADDRESS])
+    if key is None:
+        key = IMMUTABLE_ROOT_ADDRESS
+    res = _execute_upstash_cmd(["HGETALL", key])
     if res is None or not isinstance(res, list):
         return {}
 

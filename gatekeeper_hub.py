@@ -30,6 +30,16 @@
     MISS -> "" без самоканонизации (§6.4), телеметрия registry:system:health
   - Flush реестра отсюда недоступен — только redis_flush.py (урок F1)
 
+Обновления v9.6.9.2-registry (сверка контракта с team_registry v10.0.1):
+  - _registry_health_update: HINCRBY по обособленному ключу
+    registry:system:health (контракт читателя §14.4), вместо JSON-поля
+    легаси-хэша, которое затирало бы счётчики HINCRBY
+  - ветка competition: поддержана агрегированная карта registry:alias:league
+    ({slug: канон}), которую ждёт Registry._ensure; add-only §6.1 —
+    конфликтный slug удерживает старое значение
+  - ветка country_code НЕ тронута: читатель (Registry._ensure) читает карту
+    через get_from_cache — поле легаси-хэша является корректным хранилищем
+
 Обновления v9.6.9.1-registry (companion uploader v0.4):
   - upsert_registry: шестая форма country_code (§14.4) — seed-карта стран;
     одиночный JSON-ключ registry:map:country_code (КОД upper -> канон),
@@ -160,16 +170,19 @@ _REGISTRY_ENTITY_TYPES = ("team", "competition", "reep_bridge", "team_alias", "e
 
 
 def _registry_health_update(section: str, field: str, delta: int = 1) -> None:
-    """Накопитель телеметрии реестра по разделам (§3). Flush в конце вызова."""
+    """Накопитель телеметрии реестра (§3). Формат — контракту читателя.
+
+    [v9.6.9.2 FIX] team_registry читает health как ОБСОБЛЕННЫЙ ключ-хэш
+    (HINCRBY/HGET registry:system:health), а не JSON-поле легаси-хэша.
+    Прежняя запись через save_to_cache клала JSON в хэш GatekeeperAI и
+    конфликтовала с HINCRBY-семантикой читателя. Теперь — честный HINCRBY
+    по обособленному ключу; имя счётчика section_field. Add-only сохранён:
+    HINCRBY инкрементирует, ничего не затирая. Одна команда на событие
+    (§13.4): при батчах до 500 записей это +1 команда на батч — в лимите
+    soft-limit 10000/день Upstash запас остаётся."""
     try:
-        health = get_from_cache(_REGISTRY_HEALTH_KEY) or {}
-        if not isinstance(health, dict):
-            health = {}
-        node = health.setdefault(section, {})
-        if not isinstance(node, dict):
-            node = health[section] = {}
-        node[field] = int(node.get(field, 0)) + delta
-        save_to_cache(_REGISTRY_HEALTH_KEY, health)
+        redis_command(["HINCRBY", _REGISTRY_HEALTH_KEY,
+                       f"{section}_{field}", str(int(delta))])
     except Exception as exc:
         print(f"[HUB WARN] registry telemetry: {exc}")
 
@@ -235,6 +248,23 @@ def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> 
 
     if entity_type in ("team", "competition"):
         prefix = "registry:team:" if entity_type == "team" else "registry:league:"
+        # [v9.6.9.2 FIX] Читатель (team_registry v10.0.1, Registry._ensure)
+        # ждёт ЕДИНУЮ агрегированную карту registry:alias:league
+        # ({slug/код: канон}, поле легаси-хэша — замкнутый контур записи/чтения),
+        # а не отдельные поля registry:league:<slug>. Поддерживаем карту партией:
+        # одно чтение + одна запись на вызов (§13.4). Add-only §6.1: существующий
+        # slug с другим каноном = конфликт, старое удержано.
+        lmap_existing_raw = None
+        lmap_new: Dict[str, str] = {}
+        if entity_type == "competition":
+            lmap_existing_raw = get_from_cache("registry:alias:league")
+            if lmap_existing_raw is not None and not isinstance(lmap_existing_raw, dict):
+                try:
+                    lmap_existing_raw = json.loads(lmap_existing_raw)
+                except (json.JSONDecodeError, TypeError):
+                    lmap_existing_raw = {}
+            if not isinstance(lmap_existing_raw, dict):
+                lmap_existing_raw = {}
         for rec in records:
             if not isinstance(rec, dict):
                 tally["invalid"] += 1
@@ -243,6 +273,14 @@ def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> 
             if not slug:
                 tally["orphans"] += 1
                 continue
+            if entity_type == "competition":
+                canon = str(rec.get("canonical_name") or rec.get("name") or "").strip() or slug
+                if slug in lmap_existing_raw:
+                    if str(lmap_existing_raw.get(slug) or "") != canon:
+                        tally["conflicts"] += 1
+                    lmap_new[slug] = lmap_existing_raw[slug]  # старое удержано (§6.1)
+                else:
+                    lmap_new[slug] = canon
             key = f"{prefix}{slug}"
             existing = get_from_cache(key)
             if existing:
@@ -255,6 +293,12 @@ def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> 
             save_to_cache(key, dict(rec, ts=_now_msk()))
             tally["written"] += 1
             tally["commands"] += 1
+        if entity_type == "competition" and lmap_new:
+            # merge: конфликтные slugs удержали старое, новые — добавлены
+            merged_lmap = {**lmap_new, **{k: v for k, v in lmap_existing_raw.items()}}
+            if merged_lmap != lmap_existing_raw:
+                save_to_cache("registry:alias:league", merged_lmap)
+                tally["commands"] += 1
         section = "registry:upsert"
         _registry_health_update(section, "written", tally["written"])
         _registry_health_update(section, "conflicts", tally["conflicts"])
@@ -300,9 +344,11 @@ def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> 
         batch = PipelineBatch(max_batch=100)
         for key, field, _val, _form in plan:
             batch.add("HGET", key, field)
-        existing_values = batch.flush() or []
-        if not isinstance(existing_values, list):
-            existing_values = [existing_values]
+        # [v9.6.9.2 FIX] HGET-сверка батчем: flush() возвращает ЧИСЛО
+        # доставленных команд, а не результаты — previous код получал [N]
+        # вместо N значений (фантомный конфликт у первого рекорда партии).
+        # Честные результаты даёт flush_with_results().
+        existing_values = batch.flush_with_results()
         if len(existing_values) < len(plan):
             existing_values += [None] * (len(plan) - len(existing_values))
 

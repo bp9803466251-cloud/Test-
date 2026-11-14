@@ -48,7 +48,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "0.4-registry-delegation"
+VERSION = "0.4.1-registry-delegation"
 REEP_BASE = "https://reep.football"
 POINTER_URL = REEP_BASE + "/data/latest.json"
 DOWNLOAD_URL = REEP_BASE + "/downloads/csv/{table}"
@@ -606,29 +606,40 @@ def checkpoint_path(cache_dir, tag):
     return os.path.join(cache_dir, tag, "checkpoint.json")
 
 
+def _checkpoint_redis(cmd_parts):
+    """[v0.4.1 FIX] Прямая запись/чтение чекпоинта через Root-транспорт.
+
+    hub_client(hub) перебирал атрибуты client/redis/r/_redis у модуля
+    gatekeeper_hub и почти всегда возвращал None (клиент живёт под другим
+    именем) — чекпоинт в Redis молча не записывался никогда. Теперь —
+    redis_command из redis_hub (та же дверь, что у history и мостов).
+    Локальная копия остаётся источником истины при недоступном Redis."""
+    try:
+        from redis_hub import redis_command
+        return redis_command(cmd_parts)
+    except Exception as exc:
+        print("[warn] чекпоинт: Redis-транспорт недоступен: %s (локальная копия в силе)" % exc)
+        return None
+
+
 def save_checkpoint(cache_dir, tag, done, hub=None):
     data = json.dumps({"tag": tag, "done": sorted(done), "ts": time.time()})
     p = checkpoint_path(cache_dir, tag)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         f.write(data)
-    client = hub_client(hub)
-    if client is not None:
-        try:
-            client.set(CHECKPOINT_KEY, data)
-        except Exception as exc:
-            print("[warn] чекпоинт в Redis не записан: %s (продолжаем по локальному)" % exc)
+    _checkpoint_redis(["SET", CHECKPOINT_KEY, data])
 
 
 def load_checkpoint(cache_dir, tag, hub=None):
-    client = hub_client(hub)
-    if client is not None:
+    raw = _checkpoint_redis(["GET", CHECKPOINT_KEY])
+    if raw:
         try:
-            raw = client.get(CHECKPOINT_KEY)
-            if raw:
-                d = json.loads(raw)
-                if d.get("tag") == tag:
-                    return set(d.get("done") or [])
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            d = json.loads(raw)
+            if d.get("tag") == tag:
+                return set(d.get("done") or [])
         except Exception:
             pass
     p = checkpoint_path(cache_dir, tag)
