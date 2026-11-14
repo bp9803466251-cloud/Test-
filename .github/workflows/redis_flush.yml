@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Режим: history-only, soft, hard, purge (TOTAL WIPE — все ключи + все поля хэша), reset-breaker'
+        description: 'Режим: history-only, soft, hard, purge (TOTAL WIPE — все ключи + все поля хэша), reset-breaker, registry (точечная чистка реестра §14)'
         required: true
         type: choice
         options:
@@ -16,6 +16,7 @@ on:
           - hard
           - purge
           - reset-breaker
+          - registry
         default: history-only
       confirm:
         description: 'Подтверждение'
@@ -151,4 +152,3 @@ jobs:
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" \
             -d parse_mode="HTML"
-            
