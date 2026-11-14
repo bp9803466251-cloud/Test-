@@ -17,6 +17,15 @@ Gatekeeper-AI Ecosystem: Очистка и балансировка операт
            перевода тестов на контракт v710 (см. guide-delta пункты ревизии).
 Topology: Zero-Folder Architecture (Root Execution)
 Compliance: §1.3 — только urllib.request через redis_hub.py API.
+
+  [10.3.0 REGISTRY] Новый режим registry: точечная чистка реестра registry:*
+  (поля легаси-хэша registry:league:*/registry:map:country_code/
+  registry:alias:league + обособленные ключи registry:bridge:*,
+  registry:system:health, registry:upload:checkpoint). История и живой
+  контур сохраняются — сценарий «перезаливка P0 без полного wipe»:
+  после чистки загрузчик стартует без --resume. Поверхность ключей
+  верхнего уровня добирается полным SCAN * (SCAN_PATTERNS ядра их
+  не видят — подтверждено картой ключей #103/#104).
 """
 
 import os
@@ -25,7 +34,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-__version__ = "10.2.0-purge-total"  # Контрактная строка; гейт 19 test_contracts пинит только _classify_hash_fields (не тронут)
+__version__ = "10.3.0-registry"  # Гейт 19 не затронут: _classify_hash_fields не менялся
 
 # [10.1.0 BATCH #21] Дефект #21: _execute_delete для обособленных ключей делал
 # ОДИН REST-вызов на ключ (redis_command DEL / delete_history_match) — 10680
@@ -100,7 +109,8 @@ def get_circuit_breaker_status(*args, **kwargs):
     return {"status": "legacy_intercepted"}
 
 MSK_TZ = timezone(timedelta(hours=3))
-VALID_MODES = ("history-only", "soft", "hard", "purge", "reset-breaker")
+# [10.3.0 REGISTRY] Добавлен режим registry: точечная чистка реестра §14.
+VALID_MODES = ("history-only", "soft", "hard", "purge", "reset-breaker", "registry")
 
 
 def _full_key_scan():
@@ -179,6 +189,24 @@ def _build_plan(mode, scan_result):
         to_del_standalone.extend(scats["other"])
         desc_parts.append(f"ВЕСЬ РАСПРЕДЕЛЕННЫЙ КЭШ ХЭША — {len(fields)}")
         desc_parts.append(f"ВСЕ СТАНДАЛОН КЛЮЧИ — {len(standalone)}")
+    elif mode == "registry":
+        # [10.3.0 REGISTRY] Точечная чистка реестра registry:* (§14): поля
+        # легаси-хэша (registry:league:*, registry:map:country_code,
+        # registry:alias:league) + обособленные ключи (registry:bridge:*,
+        # registry:system:health, registry:upload:checkpoint). История
+        # (history:match:*) и живой контур (match:*) не затрагиваются.
+        # Фильтрация по префиксу, а не по категориям классификатора —
+        # намеренно: classify_standalone_keys не знает про новые ключи
+        # (registry:system:health, registry:upload:checkpoint) и разложит
+        # их по категориям непредсказуемо; прямой префикс надёжнее и не
+        # требует правки read-only ядра. Guard §1.7.4 не затрагивается:
+        # среди registry-ключей нет history:match:*.
+        reg_hash = [f for f in fields if f.startswith("registry:")]
+        reg_standalone = sorted(set(k for k in standalone if k.startswith("registry:")))
+        to_del_hash.extend(reg_hash)
+        to_del_standalone.extend(reg_standalone)
+        desc_parts.append(f"registry:* поля хэша — {len(reg_hash)} (лиги, карта стран, alias:league)")
+        desc_parts.append(f"registry:* обособленные ключи — {len(reg_standalone)} (bridge, health, checkpoint)")
     elif mode == "reset-breaker":
         for key in scats["system"]:
             if "circuit" in key.lower() or "health" in key.lower():
@@ -280,7 +308,7 @@ def _execute_delete(to_del_hash, to_del_standalone, batch_size=50):
 # ---------------------------------------------------------------------------
 # [10.0.0] Внутренний post-verify: SCAN + план soft без второго процесса
 # ---------------------------------------------------------------------------
-def _post_verify(purge_total=False):
+def _post_verify(purge_total=False, registry_mode=False):
     print("\n=== POST-VERIFY (внутренний, тот же процесс) ===")
     if purge_total:
         raw = redis_command(["DBSIZE"])
@@ -302,6 +330,21 @@ def _post_verify(purge_total=False):
             print("   ✅ Soft-остатков нет — flush чист")
         else:
             print("   ⚠ Остались объекты soft-категорий — повторите режим soft при необходимости")
+        if registry_mode:
+            # [10.3.0 REGISTRY] Проверка реестра: после чистого прогона
+            # registry:* не должно остаться ни на верхнем уровне, ни в хэше.
+            try:
+                keys, dbsize = _full_key_scan()
+                reg_left = sorted(k for k in keys if k.startswith("registry:"))
+                hash_left = sorted(f for f in scan_res["hash_fields"]
+                                   if f.startswith("registry:"))
+                if not reg_left and not hash_left:
+                    print("   ✅ Реестр чист: registry:* ключей и полей нет")
+                else:
+                    print(f"   ⚠ Остатки реестра: {len(reg_left)} ключей, "
+                          f"{len(hash_left)} полей хэша — повторите режим registry")
+            except Exception as e:
+                logger.warning("Registry post-verify: %s", e)
     except Exception as e:
         logger.warning("Post-verify завершился со сбоем (на результат execute не влияет): %s", e)
 
@@ -368,6 +411,26 @@ def main():
         if to_s and dbsize_before >= 0 and len(to_s) + (1 if to_h else 0) != dbsize_before:
             desc.append("⚠️ план + хэш не сходится с DBSIZE (" + str(len(to_s) + (1 if to_h else 0))
                         + " vs " + str(dbsize_before) + ") — сверка плана перед execute обязательна")
+    elif args.mode == "registry":
+        # [10.3.0 REGISTRY] Дополнение поверхности ключей: scan_redis_state
+        # привязан к SCAN_PATTERNS ядра и registry:* ключи верхнего уровня
+        # (bridge/health/checkpoint) в standalone-список не кладёт — это
+        # подтверждено картой ключей прогонов #103/#104 (SCAN * вне
+        # SCAN_PATTERNS видел registry:bridge:reep). Полный SCAN * — как в
+        # purge — добирает их; поля хэша полны и так (HGETALL целиком).
+        try:
+            full_keys, dbsize_before = _full_key_scan()
+        except Exception as e:
+            print(f"   ❌ Сбой полного SCAN *: {e}")
+            sys.exit(1)
+        reg_extra = sorted(k for k in full_keys
+                           if k.startswith("registry:")
+                           and k not in scan_res["standalone_keys"])
+        scan_res["standalone_keys"] = sorted(
+            set(scan_res["standalone_keys"]) | set(reg_extra))
+        print(f"   [REGISTRY] Полный SCAN *: {len(full_keys)} ключей всего | "
+              f"добрано registry:* ключей вне SCAN_PATTERNS: {len(reg_extra)}")
+        to_h, to_s, desc = _build_plan(args.mode, scan_res)
     else:
         to_h, to_s, desc = _build_plan(args.mode, scan_res)
 
@@ -410,7 +473,8 @@ def main():
     if errs > 0:
         sys.exit(1)  # честный failure: ошибки удаления видны в логе и в статусе джоба
     if args.post_verify:
-        _post_verify(purge_total=(args.mode == "purge"))
+        _post_verify(purge_total=(args.mode == "purge"),
+                     registry_mode=(args.mode == "registry"))
 
 
 if __name__ == "__main__":
