@@ -34,7 +34,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-__version__ = "10.3.0-registry"  # Гейт 19 не затронут: _classify_hash_fields не менялся
+__version__ = "10.3.1-league-flush"  # Гейт 19 не затронут: _classify_hash_fields не менялся
 
 # [10.1.0 BATCH #21] Дефект #21: _execute_delete для обособленных ключей делал
 # ОДИН REST-вызов на ключ (redis_command DEL / delete_history_match) — 10680
@@ -110,7 +110,7 @@ def get_circuit_breaker_status(*args, **kwargs):
 
 MSK_TZ = timezone(timedelta(hours=3))
 # [10.3.0 REGISTRY] Добавлен режим registry: точечная чистка реестра §14.
-VALID_MODES = ("history-only", "soft", "hard", "purge", "reset-breaker", "registry")
+VALID_MODES = ("history-only", "soft", "hard", "purge", "reset-breaker", "registry", "league-flush")
 
 
 def _full_key_scan():
@@ -207,6 +207,29 @@ def _build_plan(mode, scan_result):
         to_del_standalone.extend(reg_standalone)
         desc_parts.append(f"registry:* поля хэша — {len(reg_hash)} (лиги, карта стран, alias:league)")
         desc_parts.append(f"registry:* обособленные ключи — {len(reg_standalone)} (bridge, health, checkpoint)")
+    elif mode == "league-flush":
+        # [10.3.1 LEAGUE-FLUSH] Точечная чистка ТОЛЬКО лиг: поля хэша
+        # registry:league:* (тела лиг) + агрегированная карта
+        # registry:alias:league ({slug: канон}). Сценарий: перезаливка P0
+        # с честными canonical_name без потери заселённого P1/P2.
+        # ПОД ЗАЩИТОЙ (в план не попадают никогда): registry:team:*,
+        # registry:bridge:*, registry:alias:team*, registry:map:*,
+        # registry:system:health, registry:upload:checkpoint,
+        # match:*, history:match:* — фильтр только по префиксам лиг.
+        league_hash = [f for f in fields
+                       if f.startswith("registry:league:")
+                       or f == "registry:alias:league"]
+        # обособленные ключи лиг (теоретический кейс) — той же защитой
+        league_standalone = sorted(k for k in standalone
+                                   if k.startswith("registry:league:")
+                                   or k == "registry:alias:league")
+        to_del_hash.extend(league_hash)
+        to_del_standalone.extend(league_standalone)
+        kept_teams = sum(1 for f in fields if f.startswith("registry:team:"))
+        desc_parts.append(f"registry:league:* — {len(league_hash)} полей хэша (тела лиг + alias:league)")
+        if league_standalone:
+            desc_parts.append(f"registry:league:* — {len(league_standalone)} обособленных ключей")
+        desc_parts.append(f"СОХРАНЕНО: registry:team:* — {kept_teams} команд и весь прочий реестр")
     elif mode == "reset-breaker":
         for key in scats["system"]:
             if "circuit" in key.lower() or "health" in key.lower():
@@ -308,7 +331,7 @@ def _execute_delete(to_del_hash, to_del_standalone, batch_size=50):
 # ---------------------------------------------------------------------------
 # [10.0.0] Внутренний post-verify: SCAN + план soft без второго процесса
 # ---------------------------------------------------------------------------
-def _post_verify(purge_total=False, registry_mode=False):
+def _post_verify(purge_total=False, registry_mode=False, league_mode=False):
     print("\n=== POST-VERIFY (внутренний, тот же процесс) ===")
     if purge_total:
         raw = redis_command(["DBSIZE"])
@@ -345,6 +368,26 @@ def _post_verify(purge_total=False, registry_mode=False):
                           f"{len(hash_left)} полей хэша — повторите режим registry")
             except Exception as e:
                 logger.warning("Registry post-verify: %s", e)
+        if league_mode:
+            # [10.3.1 LEAGUE-FLUSH] Лиги должны быть чисты; команды — целы.
+            try:
+                keys, _dbsize = _full_key_scan()
+                lg_left = sorted(k for k in keys
+                                 if k.startswith("registry:league:")
+                                 or k == "registry:alias:league")
+                hash_left = sorted(f for f in scan_res["hash_fields"]
+                                   if f.startswith("registry:league:")
+                                   or f == "registry:alias:league")
+                teams_left = sum(1 for f in scan_res["hash_fields"]
+                                 if f.startswith("registry:team:"))
+                if not lg_left and not hash_left:
+                    print(f"   ✅ Лиги чисты: registry:league:* и registry:alias:league удалены")
+                    print(f"   ✅ Команд осталось: {teams_left} (registry:team:* не тронуты)")
+                else:
+                    print(f"   ⚠ Остатки лиг: {len(lg_left)} ключей, "
+                          f"{len(hash_left)} полей хэша — повторите режим league-flush")
+            except Exception as e:
+                logger.warning("League post-verify: %s", e)
     except Exception as e:
         logger.warning("Post-verify завершился со сбоем (на результат execute не влияет): %s", e)
 
@@ -411,6 +454,25 @@ def main():
         if to_s and dbsize_before >= 0 and len(to_s) + (1 if to_h else 0) != dbsize_before:
             desc.append("⚠️ план + хэш не сходится с DBSIZE (" + str(len(to_s) + (1 if to_h else 0))
                         + " vs " + str(dbsize_before) + ") — сверка плана перед execute обязательна")
+    elif args.mode == "league-flush":
+        # [10.3.1 LEAGUE-FLUSH] Поверхность добирается полным SCAN * — как в
+        # registry — но в план попадают только лиговые префиксы. scan_redis_state
+        # привязан к SCAN_PATTERNS ядра и лиговые ключи верхнего уровня (если
+        # когда-нибудь появятся) может не видеть. Поля хэша полны и так (HGETALL).
+        try:
+            full_keys, dbsize_before = _full_key_scan()
+        except Exception as e:
+            print(f"   ❌ Сбой полного SCAN *: {e}")
+            sys.exit(1)
+        league_extra = sorted(k for k in full_keys
+                              if (k.startswith("registry:league:")
+                                  or k == "registry:alias:league")
+                              and k not in scan_res["standalone_keys"])
+        scan_res["standalone_keys"] = sorted(
+            set(scan_res["standalone_keys"]) | set(league_extra))
+        print(f"   [LEAGUE-FLUSH] Полный SCAN *: {len(full_keys)} ключей всего | "
+              f"добрано лиговых ключей вне SCAN_PATTERNS: {len(league_extra)}")
+        to_h, to_s, desc = _build_plan(args.mode, scan_res)
     elif args.mode == "registry":
         # [10.3.0 REGISTRY] Дополнение поверхности ключей: scan_redis_state
         # привязан к SCAN_PATTERNS ядра и registry:* ключи верхнего уровня
@@ -474,7 +536,8 @@ def main():
         sys.exit(1)  # честный failure: ошибки удаления видны в логе и в статусе джоба
     if args.post_verify:
         _post_verify(purge_total=(args.mode == "purge"),
-                     registry_mode=(args.mode == "registry"))
+                     registry_mode=(args.mode == "registry"),
+                     league_mode=(args.mode == "league-flush"))
 
 
 if __name__ == "__main__":

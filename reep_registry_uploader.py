@@ -10,6 +10,19 @@ v0.4.2-selftest-isolation (исправление загрязнения про�
     реальный восстанавливается в finally + проба T19 на восстановление.
   - Проба T11a: фейк-хранилище реально использовано тестом.
 
+v0.4.3-alias-routing (исправление контрактного брака роутинга алиасов, прогон #16):
+  - split_global_scoped: ВСЕ алиасы команд уходят формой team_alias
+    (уникальные — в глобальный хэш registry:alias:team, двусмысленные с
+    гео — scoped-ключ). Прежняя отсылка формы team попадала в team-ветку
+    хаба: сверка canonical_name, которого у алиаса нет, — фантомный
+    конфликт (прогон #16: 36579 конфликтов, записи отброшены) и медленный
+    поштучный чтение-путь (~0.1 c/запись -> таймаут #16).
+  - алиасы соревнований уходят формой competition с полями alias + slug +
+    canonical_name (канон лиги-цели): хаб v9.6.9.3 пишет их только в карту
+    registry:alias:league, тело лиги не трогает.
+  - P0: ключ лиг canonical -> canonical_name (хаб читает canonical_name;
+    прежде канон деградировал в slug — тела лиг без имён).
+
 v0.4-registry-delegation (Шаг 9.4, памятка v1.10.0, §14.1/§14.4; вердикты владельца от 12.11):
   - Локальные _HOMOGLYPH/_CYR_LAT/_fold_mixed/normalize/translit/slugify УДАЛЕНЫ:
     вторая копия словаря исключена, делегация в team_registry — строгий импорт,
@@ -56,7 +69,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "0.4.2-selftest-isolation"
+VERSION = "0.4.3-alias-routing"
 REEP_BASE = "https://reep.football"
 POINTER_URL = REEP_BASE + "/data/latest.json"
 DOWNLOAD_URL = REEP_BASE + "/downloads/csv/{table}"
@@ -476,8 +489,19 @@ def parse_aliases(path, ents, rmap):
     return aliases, ext_bridges, orphans, skipped_empty
 
 
-def split_global_scoped(aliases):
-    """§4 шаг 3: алиас, ведущий к slug'ам разных команд, в глобальный индекс не пишется."""
+def split_global_scoped(aliases, comp_canon=None):
+    """§4 шаг 3: алиас, ведущий к slug'ам разных команд, в глобальный индекс не пишется.
+
+    [v0.4.3] Роутинг по формам хаба: ЛЮБОЙ алиас команды уходит формой
+    team_alias — уникальный глобально (хэш registry:alias:team), двусмысленный
+    с гео — scoped-ключом. Прежняя отсылка уникальных алиасов формой team
+    (v0.4.2) попадала в team-ветку хаба: сверка canonical_name у алиаса —
+    фантомный конфликт, запись отбрасывалась (прогон #16: 36579 конфликтов,
+    алиасы не записаны; см. docstring версии).
+    Алиас соревнования уходит формой competition с полями alias + slug +
+    canonical_name: хаб v9.6.9.3 пишет его только в карту
+    registry:alias:league ({alias: канон}), тело лиги не создаёт."""
+    comp_canon = comp_canon or {}
     by_norm = {}
     for etype, norm, slug, cc, prov in aliases:
         if etype == "team":
@@ -491,9 +515,13 @@ def split_global_scoped(aliases):
                 continue
             key = ("scoped", norm, slug, cc)
             rec = {"entity_type": "team_alias", "alias": norm, "slug": slug, "country": cc}
+        elif etype == "team":
+            key = (etype, norm, slug)
+            rec = {"entity_type": "team_alias", "alias": norm, "slug": slug}
         else:
             key = (etype, norm, slug)
-            rec = {"entity_type": etype, "alias": norm, "slug": slug}
+            rec = {"entity_type": etype, "alias": norm, "slug": slug,
+                   "canonical_name": comp_canon.get(slug, "")}
         if key in seen:
             continue
         seen.add(key)
@@ -535,7 +563,7 @@ def build_parties(ents, alias_recs, ext_bridges):
     recs = build_country_records(ents)
     for rid in sorted(ents.comps):
         recs.append({"entity_type": "competition", "reep_id": rid,
-                     "slug": ents.comps[rid], "canonical": ents.meta[rid]["name"]})
+                     "slug": ents.comps[rid], "canonical_name": ents.meta[rid]["name"]})
     for rid in sorted(ents.comps):
         recs.append({"entity_type": "reep_bridge", "reep_id": rid, "slug": ents.comps[rid]})
     parties.append({"id": "P0", "records": recs})
@@ -709,7 +737,9 @@ def run(args):
     print("[info] разбор provider_aliases...")
     aliases, ext_bridges, orphans, skip_empty = parse_aliases(
         os.path.join(tag_dir, "provider_aliases.csv.gz"), ents, rmap)
-    alias_recs, ambiguous = split_global_scoped(aliases)
+    comp_canon = {slug: (ents.meta.get(rid) or {}).get("name", "")
+                  for rid, slug in ents.comps.items()}
+    alias_recs, ambiguous = split_global_scoped(aliases, comp_canon)
     parties = build_parties(ents, alias_recs, ext_bridges)
     wanted = [p for p in parties if p["id"] in set(x.strip() for x in args.parties.split(","))] \
         if args.parties != "ALL" else parties
@@ -821,14 +851,17 @@ def selftest():
         "fotmob,1,t5,Tula Twin\n"
         "fotmob,2,t2,Tula\n"
         "fotmob,3,t3,Tula\n"
-        "fotmob,4,t8,Tula\n"))
+        "fotmob,4,t8,Tula\n"
+        "opta,55,e1,EPL\n"))
     rd_csv = gz("redirects.csv.gz", "old_id,reep_id\nt5,t3\nx,x\n")
 
     rmap = parse_redirects(rd_csv)
     ents = parse_entities(ents_csv, rmap)
     state = build_slugs(ents)
     aliases, ext_bridges, orphans, skip_empty = parse_aliases(al_csv, ents, rmap)
-    alias_recs, ambiguous = split_global_scoped(aliases)
+    comp_canon = {slug: (ents.meta.get(rid) or {}).get("name", "")
+                  for rid, slug in ents.comps.items()}
+    alias_recs, ambiguous = split_global_scoped(aliases, comp_canon)
     parties = build_parties(ents, alias_recs, ext_bridges)
 
     check("T1 redirect resolution", ents.teams.get("t3") == "arsenal_tula_ru", ents.teams)
@@ -842,6 +875,22 @@ def selftest():
     check("T7 ext bridge captured", any(r[0] == "team" for r in ext_bridges), ext_bridges[:2])
     check("T8 parties contain P0 and P1", parties[0]["id"] == "P0" and any(p["id"].startswith("P1:") for p in parties), [p["id"] for p in parties[:3]])
     check("T9 comp records", ents.comps.get("e1") == "fa_premier_league", ents.comps)
+    # [v0.4.3 ALIAS-ROUTING] контракт форм алиасов (прогон #16: 36579 фантомных конфликтов)
+    _team_form = [r for r in alias_recs if r.get("entity_type") == "team"]
+    _ta_recs = [r for r in alias_recs if r.get("entity_type") == "team_alias"]
+    _ca_recs = [r for r in alias_recs
+                if r.get("entity_type") == "competition" and r.get("alias")]
+    check("T20 alias never in body forms", not _team_form, _team_form[:3])
+    check("T21 global team alias as team_alias",
+          any(r.get("alias") == "arsenal" and r.get("slug") == "arsenal"
+              and "country" not in r for r in _ta_recs), _ta_recs[:3])
+    check("T22 comp alias carries canonical_name",
+          any(r.get("alias") == "epl" and r.get("canonical_name") == "FA Premier League"
+              for r in _ca_recs), _ca_recs[:2])
+    check("T23 P0 comp canon key",
+          any(r.get("canonical_name") == "FA Premier League"
+              for p in parties if p["id"] == "P0"
+              for r in p["records"] if r.get("entity_type") == "competition"), "P0")
 
     try:
         bad = gz("bad.csv.gz", "foo,bar\n1,2\n")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # gatekeeper_hub.py
 """
-Единый хаб Gatekeeper-AI v9.6.9-registry (Схема v710 / Гейт 28).
+Единый хаб Gatekeeper-AI v9.6.9.3-alias-contract (Схема v710 / Гейт 28).
 Все операции с данными матчей проходят только через этот модуль.
 
 Обновления v9.6.8-patched:
@@ -54,6 +54,17 @@
   - update_history_indexes: Root-индексы ZADD/SADD/RPUSH (R-5, R-7/13-G3)
   - get_history_by_league: чтение по Root-ZSET + get_history_match
   - Экспорт UPSTREAM_MAP и is_shutdown_requested() (13-H4); run_id в run_initialization
+
+Обновления v9.6.9.3-alias-contract (контракт алиасов, прогон #16):
+  - ветка team_alias: размер чтения PipelineBatch поднят до max(100, len(plan)+1):
+    авто-flush на сотой add() терял результаты чтения — свёртка считала записи
+    новыми, телеметрия §6.1 лгала. Теперь весь план чтения уходит одним
+    пайплайном: одна пачка = один REST-вызов, результаты честные
+  - ветка team_alias: гашение global_alias_no_geo агрегировано — один HINCRBY
+    на вызов upsert_registry вместо одного на запись
+  - ветка competition: записи с полем alias (алиасы соревнований от uploader
+    v0.4.3) пишутся ТОЛЬКО в карту registry:alias:league ({alias: канон});
+    тело registry:league:<slug> не создаётся, лжеконфликтов нет
 """
 import os
 import json
@@ -273,6 +284,22 @@ def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> 
             if not slug:
                 tally["orphans"] += 1
                 continue
+            # [v9.6.9.3] Алиас соревнования (uploader v0.4.3): пишется ТОЛЬКО в
+            # карту registry:alias:league ({alias: канон}), тело лиги не
+            # трогается — иначе alias-запись порождала лжеконфликт сверки
+            # canonical_name и фантомное тело registry:league:<alias>.
+            alias_key = str(rec.get("alias") or "").strip().lower()
+            if entity_type == "competition" and alias_key:
+                canon = str(rec.get("canonical_name") or rec.get("name") or "").strip() or slug
+                if alias_key in lmap_existing_raw:
+                    if str(lmap_existing_raw.get(alias_key) or "") != canon:
+                        tally["conflicts"] += 1
+                    lmap_new[alias_key] = lmap_existing_raw[alias_key]  # старое удержано (§6.1)
+                    tally["skipped_exists"] += 1
+                else:
+                    lmap_new[alias_key] = canon
+                    tally["written"] += 1
+                continue
             if entity_type == "competition":
                 canon = str(rec.get("canonical_name") or rec.get("name") or "").strip() or slug
                 if slug in lmap_existing_raw:
@@ -307,6 +334,7 @@ def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> 
     # Формы HASH: HGET-сверка батчем + атомарный HSETNX батчем (§13.4)
     from redis_hub import redis_command as _rc
     plan: List[Tuple[str, str, str, str]] = []  # (key, field, value, form)
+    no_geo = 0  # [v9.6.9.3] агрегатор телеметрии гашения
     for rec in records:
         if not isinstance(rec, dict):
             tally["invalid"] += 1
@@ -338,10 +366,18 @@ def upsert_registry(entity_type: str, records: List[dict], source: str = "") -> 
             plan.append((key, alias, slug, "team_alias"))
             # Глобальный двусмысленный алиас без гео — гашение §4-3
             if not country:
-                _registry_health_update("registry:alias", "global_alias_no_geo", 1)
+                no_geo += 1
+
+    if no_geo:
+        # [v9.6.9.3] телеметрия гашения агрегирована: один HINCRBY на вызов (§13.4)
+        _registry_health_update("registry:alias", "global_alias_no_geo", no_geo)
 
     if plan:
-        batch = PipelineBatch(max_batch=100)
+        # [v9.6.9.3 FIX] max_batch >= len(plan)+1: авто-flush на сотой add()
+        # терял результаты чтения — свёртка считала все записи новыми и
+        # телеметрия §6.1 лгала. Теперь весь план чтения уходит одним
+        # пайплайном: одна пачка = один REST-вызов, результаты честные.
+        batch = PipelineBatch(max_batch=max(100, len(plan) + 1))
         for key, field, _val, _form in plan:
             batch.add("HGET", key, field)
         # [v9.6.9.2 FIX] HGET-сверка батчем: flush() возвращает ЧИСЛО
