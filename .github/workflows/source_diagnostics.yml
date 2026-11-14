@@ -126,11 +126,7 @@ jobs:
           import json
           import redis_hub as rh
 
-          H = 'GatekeeperAI'
-          fields = rh.get_all_fields(H)
-          if not isinstance(fields, dict):
-              fields = {f: rh.get_from_cache(f) for f in (fields or [])}
-
+          fields = rh.get_all_fields()
           reg = [f for f in fields if f.startswith('registry:')]
           league = [f for f in reg if f.startswith('registry:league:')]
           print('=== REGISTRY FIELD AUDIT ===')
@@ -142,22 +138,21 @@ jobs:
 
           for probe in ('registry:map:country_code', 'registry:system:health', 'telemetry'):
               raw = fields.get(probe)
-              if not raw:
+              if raw is None:
                   print(probe, '-> NOT FOUND in hash')
                   continue
-              try:
-                  d = json.loads(raw)
-                  if isinstance(d, dict):
-                      print(probe, '-> JSON dict,', len(d), 'keys')
-                      for k in ('TUR', 'KOR', 'CHI', 'CHN', 'CAM', 'MON', 'SOU', 'MD', 'ZA'):
-                          if k in d:
-                              print('   ', k, '->', d[k])
-                  else:
-                      print(probe, '-> JSON', type(d).__name__)
-              except Exception:
-                  print(probe, '-> raw,', len(raw), 'bytes:', str(raw)[:120])
+              if isinstance(raw, dict):
+                  print(probe, '-> dict,', len(raw), 'keys')
+                  for k in ('TUR', 'KOR', 'CHI', 'CHN', 'CAM', 'MON', 'SOU', 'MD', 'ZA'):
+                      if k in raw:
+                          print('   ', k, '->', raw[k])
+              else:
+                  try:
+                      d = json.loads(raw)
+                      print(probe, '-> JSON', type(d).__name__, (len(d) if isinstance(d, dict) else ''))
+                  except Exception:
+                      print(probe, '-> raw,', len(str(raw)), 'bytes:', str(raw)[:120])
 
-          # верхний уровень: обособленные registry-ключи (ожидание после фикса хаба)
           try:
               keys = rh.scan_keys('registry:*')
               print('top-level registry:* keys:', sorted(keys)[:20], '| total:', len(keys))
@@ -178,4 +173,3 @@ jobs:
             -d chat_id="${TELEGRAM_GROUP_ID}" \
             -d text="${MSG}" \
             -d parse_mode="HTML"
-            
