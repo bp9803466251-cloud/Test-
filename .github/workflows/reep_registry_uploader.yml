@@ -30,7 +30,9 @@ on:
         default: '10000'
 
 env:
-  PYTHON_VERSION: '3.12'
+  # [10.0.0 §1.10] Единый интерпретатор — 3.11 (канон экосистемы, см. Redis Flush):
+  # у загрузчика был 3.12 — расхождение с каноном снято
+  PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: "1"
   # [8.16] Прямая мапа без фоллбека-выражения: в GH-выражениях строка "0"
   # кастуется в число и считается falsy, поэтому прежний маппинг мог поглотить
@@ -89,7 +91,9 @@ jobs:
             exit 1
           }
 
-      # Гейт самотеста: поломка парсера не доходит до Redis
+      # Гейт самотеста: поломка парсера не доходит до Redis.
+      # [v0.4.2] Селфтест изолирован от прод-транспорта (T11/T12 на ин-мемори
+      # фейке) — гейт безопасен при живых секретах.
       - name: Selftest gate
         run: |
           python -u reep_registry_uploader.py --selftest
@@ -160,18 +164,33 @@ jobs:
           dbsize = cmd('DBSIZE')
           print(f'DBSIZE: {dbsize}')
 
-          for key in ('registry:system:health', 'registry:upload:checkpoint'):
-              raw = cmd('GET', key)
-              if raw:
-                  try:
-                      obj = json.loads(raw) if isinstance(raw, str) else {}
-                      print(f'--- {key} ---')
-                      for k, v in obj.items():
-                          print(f'  {k}: {v}')
-                  except (json.JSONDecodeError, TypeError):
-                      print(f'WARN: {key} damaged or not JSON')
-              else:
-                  print(f'INFO: {key} not found')
+          # [v9.6.9.2] registry:system:health — обособленный ключ-хэш (HINCRBY,
+          # контракт читателя team_registry §14.4): GET вернул бы None при живой
+          # телеметрии. Читаем HGETALL с обрезкой до 20 полей.
+          health = cmd('HGETALL', 'registry:system:health')
+          if isinstance(health, dict) and health:
+              print('--- registry:system:health (hash, первые 20 полей) ---')
+              for k, v in list(health.items())[:20]:
+                  print(f'  {k}: {v}')
+              if len(health) > 20:
+                  print(f'  ... всего полей: {len(health)}')
+          elif health:
+              print(f'WARN: registry:system:health неожиданный формат: {type(health).__name__}')
+          else:
+              print('INFO: registry:system:health not found')
+
+          # Чекпоинт — строковый ключ (v0.4.1 FIX №6): SET/GET JSON.
+          raw = cmd('GET', 'registry:upload:checkpoint')
+          if raw:
+              try:
+                  obj = json.loads(raw) if isinstance(raw, str) else {}
+                  print('--- registry:upload:checkpoint ---')
+                  for k, v in obj.items():
+                      print(f'  {k}: {v}')
+              except (json.JSONDecodeError, TypeError):
+                  print('WARN: registry:upload:checkpoint damaged or not JSON')
+          else:
+              print('INFO: registry:upload:checkpoint not found')
           print('=== Verify Done ===')
           "
 
