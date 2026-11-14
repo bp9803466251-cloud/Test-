@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Режим: history-only, soft, hard, purge (TOTAL WIPE — все ключи + все поля хэша), reset-breaker, registry (точечная чистка реестра §14)'
+        description: 'Режим: history-only, soft, hard, purge (TOTAL WIPE), reset-breaker, registry (весь реестр), league-flush (только лиги: registry:league:* + registry:alias:league)'
         required: true
         type: choice
         options:
@@ -17,6 +17,7 @@ on:
           - purge
           - reset-breaker
           - registry
+          - league-flush
         default: history-only
       confirm:
         description: 'Подтверждение'
@@ -50,8 +51,6 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # Дефолты для контекстов env.* в if-условиях: линтер видит переменную,
-      # а GITHUB_ENV-записи шага "Set mode" переопределяют их на рантайме
       FLUSH_MODE: 'history-only'
       FLUSH_CONFIRM: 'no'
       FLUSH_DRY_RUN: 'false'
