@@ -30,8 +30,7 @@ on:
         default: '10000'
 
 env:
-  # [10.0.0 §1.10] Единый интерпретатор — 3.11 (канон экосистемы, см. Redis Flush):
-  # у загрузчика был 3.12 — расхождение с каноном снято
+  # [VERIFY FIX] §1.10: канон экосистемы — 3.11, как в Redis Flush.
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: "1"
   # [8.16] Прямая мапа без фоллбека-выражения: в GH-выражениях строка "0"
@@ -91,9 +90,7 @@ jobs:
             exit 1
           }
 
-      # Гейт самотеста: поломка парсера не доходит до Redis.
-      # [v0.4.2] Селфтест изолирован от прод-транспорта (T11/T12 на ин-мемори
-      # фейке) — гейт безопасен при живых секретах.
+      # Гейт самотеста: поломка парсера не доходит до Redis (изоляция v0.4.2)
       - name: Selftest gate
         run: |
           python -u reep_registry_uploader.py --selftest
@@ -125,6 +122,10 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      # [VERIFY FIX] registry:system:health — обособленный ключ-хэш (контракт
+      # читателя): читается HGETALL, а не GET. Upstash REST отдаёт на HGETALL
+      # плоский список [поле, знач, ...] — разворачивается попарно; dict
+      # принимается как есть; нечётная длина — честный WARN по целым парам.
       - name: Verify registry state
         if: always()
         timeout-minutes: 5
@@ -158,32 +159,53 @@ jobs:
                   print(f'  [CMD ERROR] {args[0]}: {e}')
                   return None
 
+          def as_mapping(raw):
+              if isinstance(raw, dict):
+                  return {k: (v.decode('utf-8', 'replace') if isinstance(v, bytes) else v)
+                          for k, v in raw.items()}
+              if isinstance(raw, list):
+                  if len(raw) % 2 != 0:
+                      print(f'  WARN: нечётная длина списка ({len(raw)}) — последний элемент отброшен')
+                      raw = raw[:-1]
+                  out = {}
+                  for i in range(0, len(raw), 2):
+                      k, v = raw[i], raw[i + 1]
+                      if isinstance(k, bytes):
+                          k = k.decode('utf-8', 'replace')
+                      if isinstance(v, bytes):
+                          v = v.decode('utf-8', 'replace')
+                      out[k] = v
+                  return out
+              return None
+
           print('=== Registry Verify ===')
           if os.environ.get('DRY_RUN_INPUT') == 'true':
               print('INFO: dry-run не пишет в Redis — сверка по отчёту в артефактах')
           dbsize = cmd('DBSIZE')
           print(f'DBSIZE: {dbsize}')
 
-          # [v9.6.9.2] registry:system:health — обособленный ключ-хэш (HINCRBY,
-          # контракт читателя team_registry §14.4): GET вернул бы None при живой
-          # телеметрии. Читаем HGETALL с обрезкой до 20 полей.
-          health = cmd('HGETALL', 'registry:system:health')
-          if isinstance(health, dict) and health:
-              print('--- registry:system:health (hash, первые 20 полей) ---')
-              for k, v in list(health.items())[:20]:
+          # registry:system:health — обособленный ключ-хэш (HINCRBY, контракт читателя)
+          exists = cmd('EXISTS', 'registry:system:health')
+          health = as_mapping(cmd('HGETALL', 'registry:system:health')) if exists else None
+          if health:
+              print('--- registry:system:health (hash) ---')
+              items = sorted(health.items())
+              for k, v in items[:20]:
                   print(f'  {k}: {v}')
-              if len(health) > 20:
-                  print(f'  ... всего полей: {len(health)}')
-          elif health:
-              print(f'WARN: registry:system:health неожиданный формат: {type(health).__name__}')
-          else:
+              if len(items) > 20:
+                  print(f'  ... ещё {len(items) - 20} полей')
+          elif not exists:
               print('INFO: registry:system:health not found')
+          else:
+              print('WARN: registry:system:health: ключ есть, но ответ HGETALL неожиданный')
 
-          # Чекпоинт — строковый ключ (v0.4.1 FIX №6): SET/GET JSON.
+          # registry:upload:checkpoint — строковый ключ (GET + JSON)
           raw = cmd('GET', 'registry:upload:checkpoint')
           if raw:
               try:
-                  obj = json.loads(raw) if isinstance(raw, str) else {}
+                  if isinstance(raw, bytes):
+                      raw = raw.decode('utf-8')
+                  obj = json.loads(raw)
                   print('--- registry:upload:checkpoint ---')
                   for k, v in obj.items():
                       print(f'  {k}: {v}')
