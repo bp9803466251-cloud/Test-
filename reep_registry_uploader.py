@@ -668,7 +668,7 @@ def is_shutdown_requested():
 def write_delta(tag_dir, party_id, records):
     d = os.path.join(tag_dir, "deltas")
     os.makedirs(d, exist_ok=True)
-    safe = re.sub(r"[^A-Za-z0-9_.:-]", "_", party_id)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", party_id)
     path = os.path.join(d, safe + ".jsonl")
     with open(path, "w", encoding="utf-8") as f:
         for rec in records:
